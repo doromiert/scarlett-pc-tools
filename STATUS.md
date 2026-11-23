@@ -246,3 +246,36 @@ remains black.
 The independent [XCL source recipe](XCL_INTEGRATION.md) now reproduces the
 setup-tested source tree from 14 attributed patches. Its GPL-2.0-only licensing
 is explicit and separate from the Leonida implementation.
+
+## Account-picker input and subsequent device loss
+
+A further actual run of the same setup-tested binary captured the account picker
+at host time 43.708 seconds, registered A at 45.000 seconds, then changed to a
+uniform green frame at 45.941 seconds and continued loading data. It did not
+reproduce the earlier stream assertion before its later failure. This establishes
+a reaction to input, not a working menu or gameplay scene.
+
+The run reported 135 failed DirectStorage requests after rejecting BCPack mode 7
+(51,012 compressed bytes to 65,536 BC7 block bytes), plus a separate destination
+access violation. That latter input file exists; the code is not a missing-file
+error. The blank source name on format refusal is a diagnostic metadata gap.
+
+The run subsequently lost its D3D12 device during a shared AMD GPU reset, which
+interrupted the desktop session. The kernel names the compositor's timed-out
+queue, while RADV calls Wine's context innocent; the ultimate trigger remains
+unproved. The runtime terminated itself on device loss. No agent-issued stop
+was used.
+
+XCL's presenter is already windowed. Its separate title popup requests DWM
+cloaking, but the installed Wine 11 implementation returns success without
+cloaking. A separate private 1600x900 Wine virtual desktop is prepared to contain
+both windows. It has not been launched or established GPU stability; it still
+shares the GPU and does not reduce the title's internal 4K rendering. Further
+work is currently offline analysis/builds.
+
+Offline inspection uniquely matched the rejected 51,012-byte request to an
+immutable local file range. All 16 BC7 entropy lanes validated to 8,192 symbols
+each and consumed exactly the source length. Strict reconstruction refused an
+unknown built-in endpoint-history entry (17). No provisional table entries or
+zero-filled substitutes were accepted. This narrows a real loading blocker;
+it does not establish correct texture output or rule out unrelated failures.

@@ -1,7 +1,9 @@
 # XCL setup bring-up on Linux
 
 This experimental source recipe reached the setup/account-picker UI and then
-self-crashed on a guest bounded-stream assertion. It is not a playable port.
+self-crashed on a guest bounded-stream assertion. Continuing with A reached
+loading failures and a shared GPU reset that interrupted the desktop session.
+This recipe is not stable or playable.
 See [STATUS.md](STATUS.md) for the actual-run evidence and remaining blocker.
 
 ## Source and license
@@ -87,3 +89,12 @@ XCL HLE parts do not establish full task-queue, dialog, or networking support.
 No Xbox firmware was used. The guest overflow is unresolved; this recipe contains
 no capacity increase, assertion bypass, frame-rate unlock, or gyro implementation.
 Keep dumps, overlay data, shader caches, captures and logs private.
+
+## Presentation limitation discovered during continuation
+
+The tested Wine 11 DWM cloaking call is a no-op, so XCL's separate title popup
+is not hidden by that API. Its visible presenter already runs windowed; shrinking
+that window does not change internal 4K rendering. A private Wine virtual desktop
+can contain both windows, but it still shares the GPU. That configuration is
+prepared locally and has not yet been run or verified to prevent the reset.
+Do not interpret it as a proven stability fix. See the latest STATUS entry.
