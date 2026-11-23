@@ -65,6 +65,25 @@ The last real run did not reach a draw, present, menu or playable scene. Upstrea
 but currently substitutes a null SRV without implementing its raw GPU-address
 semantics. It is not included in this snapshot. Assertions were not skipped.
 
+## XCL comparison
+
+Also built and launched the actual executable with
+[XCL](https://github.com/ivall/xcl) at `66e8e974601791dee66bb60adfbeb4852ba88a25`,
+Rust 1.100.0, Wine 11.0, VKD3D-Proton 3.1 and DXC 1.9.2609.
+The release dependencies matched their GitHub asset SHA-256 digests.
+
+The unmodified build entered the title and opened game archives, but the initial
+Wine configuration had no working D3D12 backend or DXC. Adding the private runtime
+DLLs enabled the real backend. That run then blocked in a CRT assertion dialog.
+A local diagnostic directed assertions to stderr and exposed VKD3D's heap-vtable
+identity check. Keeping objects created for XCL's own PC-side work on their native
+vtables cleared that heap stop. The next real stop was VKD3D's shared-fence-vtable
+identity assertion. No draws or presents were observed. The timed observation
+exit is not a successful game exit.
+
+Those two XCL diagnostic changes remain in the separate local checkout. No XCL
+code is mixed into the Leonida patch series. XCL is GPL-2.0-only; Leonida is GPLv3.
+
 ## Not verified
 
 Rendered output, translated game shaders, a playable scene, simulation speed at
