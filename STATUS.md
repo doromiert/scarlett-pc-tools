@@ -84,8 +84,55 @@ exit is not a successful game exit.
 Those two XCL diagnostic changes remain in the separate local checkout. No XCL
 code is mixed into the Leonida patch series. XCL is GPL-2.0-only; Leonida is GPLv3.
 
+## Experimental frontier comparison
+
+A separate local worktree of Pipodi's public `boot-integration` fork at
+`b2e6066202bd684e74963ae761863804f687da75` was built and launched with additional
+upstream startup fixes. This experiment is **not** the 33-patch integration above.
+The fork contains explicit local stand-ins, including raw-SRV and placed-resource
+paths. It does not establish correct GPU memory sharing.
+
+The actual package supplied the private shader cache: all 26,503 programs carved
+from the shader pack translated and passed SPIR-V validation. All 52 embedded BVH
+programs and all 10 executable-embedded programs also translated. Of 42 native
+payloads captured during execution, 38 translated; four are refused for the
+unimplemented compute thread-group-size SGPR. Separately, 18 of 29 FidelityFX
+upscaler programs translated; 11 hit undecodable fall-through words. These game
+derivatives remain outside this repository.
+
+On the same Wine/RADV machine, the title reached render-target creation and
+command-signature creation with guest assertion skipping disabled. The resource
+accounting lease needed the console tile footprint, rather than RADV's larger
+native allocation size, to fit the title's fixed arena. Full native GPU backing
+was retained. This adapts the bookkeeping of
+[PR 7235](https://github.com/ItsNotRexed/Leonida/pull/7235) and the console footprint
+of [PR 7078](https://github.com/ItsNotRexed/Leonida/pull/7078); it does not verify
+rendering or the assumed console metadata accounting.
+
+The next unsupported call was Xbox device slot 74, incorrectly forwarded to PC
+ShaderCacheControl. An explicitly enabled, token-only diagnostic matching the
+upstream boot report allowed later failures to be inspected. It does **not**
+implement GPU page-pool registration. With that diagnostic and the full private
+shader cache, one run reached 1,734 graphics calls, then a guest assertion after
+36 seconds. A later run with all 38 supported native payloads translated and
+command-list unwrapping restored still reached 1,734 calls, including successful
+pipeline-state creation, and stopped on a resource-allocation-size assertion
+after 31 seconds. The four remaining native payloads were still refused.
+The next allocation diagnostic identified a 2560 x 1440, single-sample
+`R32G8X24_TYPELESS` texture with both `ALLOW_DEPTH_STENCIL` and
+`ALLOW_UNORDERED_ACCESS`. The PC allocation query returns `UINT64_MAX`; the title
+asserts that the returned size fits in 32 bits. Supporting that console usage
+requires a real texture compatibility path. Dropping the requested UAV capability
+would not establish correct behavior.
+
+No presented frame or audible output was verified here.
+
+The Discord screenshot's black-screen/brief-audio claim contains no build revision.
+It has not been reproduced locally. The normal launcher clears both known guest
+assertion-skip environment variables; a diagnostic bypass is not a successful boot.
+
 ## Not verified
 
-Rendered output, translated game shaders, a playable scene, simulation speed at
+Rendered output, audio output, a playable scene, simulation speed at
 different render rates, or gyro aiming. The last two remain requirements in
 ROADMAP.md. No timing or input patches are applied to the game.

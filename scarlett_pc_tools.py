@@ -193,6 +193,7 @@ def leonida_run(target, loader, output, timeout, wine=None):
     attempt = Path(tempfile.mkdtemp(prefix="leonida-", dir=output))
     env = {**os.environ, "LEONIDA_UNIMPLEMENTED": "stop", "LEONIDA_D3D12": "vulkan"}
     env.pop("LEONIDA_SKIP_INT3", None)
+    env.pop("LEONIDA_SKIP_ASSERTS", None)
     command = [str(loader), "--run", str(exe), "--game-dir", str(exe.parent),
                "--overlay", str(attempt / "overlay"), "--trace", str(attempt / "startup.jsonl"), "--trace-d3d12"]
     if os.name != "nt":
