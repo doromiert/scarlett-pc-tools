@@ -1,0 +1,186 @@
+From 47cbc750f9c266625fe17ce7202cbe6b1c26820c Mon Sep 17 00:00:00 2001
+From: tf <t@t>
+Date: Mon, 23 Nov 2026 20:32:03 +0100
+Subject: [PATCH 11/13] d3d12: take console subobject types 24/23 as VS/HS in
+ streams without MS
+
+Slot 86 pipeline streams carry the console VS as subobject type 24 and
+the HS as 23 (read statically by TreXito, Leonida#8186). parse_pipeline_stream
+took 24 as an amplification shader and refused 23 as an unknown type, so
+create_graphics refused those PSOs.
+
+A stream with no MS subobject has no mesh stage, so there 24 is taken as
+the VS and 23 as the HS, when those slots are empty. A stream with MS keeps
+the mesh path unchanged: 24 stays an AS (refused), 23 is an unknown type.
+The remap is logged once.
+
+The HS is not built yet, so a stream with 23 is E_NOTIMPL, not created.
+
+Tests: d3d12_mesh covers 24 alone (created), 24+23 and 23 with a VS
+(E_NOTIMPL), and 24 with a real VS (not remapped, E_NOTIMPL).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01LwHrL5Lxc1rum25b6tnpo8
+---
+ runtime/shims/d3d12_vulkan_device.cpp | 62 +++++++++++++++++++++++++--
+ runtime/test/d3d12_mesh_test.cpp      | 36 +++++++++++++++-
+ 2 files changed, 93 insertions(+), 5 deletions(-)
+
+diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
+index c1e0aa8b9..728b4146d 100644
+--- a/runtime/shims/d3d12_vulkan_device.cpp
++++ b/runtime/shims/d3d12_vulkan_device.cpp
+@@ -3046,10 +3046,51 @@ struct PipelineStream {
+     D3D12_COMPUTE_PIPELINE_STATE_DESC compute{};
+     D3D12_SHADER_BYTECODE ms{};
+     D3D12_SHADER_BYTECODE as{};
++    D3D12_SHADER_BYTECODE console_hs{};  // subobject type 23, see map_console_stages
+     bool has_cs = false;
+     bool has_graphics_stage = false;  // VS, PS, DS, HS, GS, AS or MS
++    bool has_ms = false;
++    bool has_as = false;
++    bool has_console_hs = false;
+ };
+ 
++constexpr unsigned kConsoleHsSubobjectType = 23;
++
++// Subobject types 24 and 23 are not PC D3D12 types for the VS and HS: 24 is the amplification shader and 23 is no
++// type at all. The console's slot 86 streams carry the console VS as 24 and the HS as 23 (TreXito's static reading
++// of the retail title, Leonida#8186). A stream with no MS subobject has no mesh stage, so there they are the VS and
++// the HS. A stream with MS keeps the mesh path: 24 stays an amplification shader (refused by create_graphics), and
++// 23 is an unknown type. A slot already taken by a real VS or HS keeps the old behaviour too.
++HRESULT map_console_stages(PipelineStream& out) {
++    if (!out.has_as && !out.has_console_hs) return S_OK;
++    if (out.has_ms) {
++        if (!out.has_console_hs) return S_OK;
++        log_once("unknown pipeline state stream subobject type:", 23);
++        return E_INVALIDARG;
++    }
++    D3D12_GRAPHICS_PIPELINE_STATE_DESC& g = out.graphics;
++    const auto absent = [](const D3D12_SHADER_BYTECODE& code) { return !code.pShaderBytecode && !code.BytecodeLength; };
++    const bool take_vs = out.has_as && absent(g.VS);
++    const bool take_hs = out.has_console_hs && absent(g.HS);
++    if (out.has_console_hs && !take_hs) {
++        log_once("unknown pipeline state stream subobject type:", 23);
++        return E_INVALIDARG;
++    }
++    if (take_vs) {
++        g.VS = out.as;
++        out.as = {};
++        out.has_as = false;
++    }
++    if (take_hs) {
++        g.HS = out.console_hs;
++        out.console_hs = {};
++        out.has_console_hs = false;
++        out.has_graphics_stage = true;
++    }
++    if (take_vs || take_hs) log_once("console stream subobjects 24 and 23 remapped to VS and HS (no mesh subobject); once", 0);
++    return S_OK;
++}
++
+ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, PipelineStream& out) {
+     if (!desc.pPipelineStateSubobjectStream || !desc.SizeInBytes) return E_INVALIDARG;
+     D3D12_GRAPHICS_PIPELINE_STATE_DESC& g = out.graphics;
+@@ -3118,8 +3159,14 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
+         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DS: stage(g.DS); break;
+         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_HS: stage(g.HS); break;
+         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_GS: stage(g.GS); break;
+-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS: stage(out.as); break;
+-        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS: stage(out.ms); break;
++        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS:
++            stage(out.as);
++            out.has_as = true;
++            break;
++        case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS:
++            stage(out.ms);
++            out.has_ms = true;
++            break;
+         case D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS:
+             take(out.compute.CS);
+             out.has_cs = true;
+@@ -3220,11 +3267,18 @@ HRESULT parse_pipeline_stream(const D3D12_PIPELINE_STATE_STREAM_DESC& desc, Pipe
+             break;
+         }
+         default:
+-            log_once("unknown pipeline state stream subobject type:", int(type));
+-            return E_INVALIDARG;
++            // 23 is not a D3D12 type: the console's HS, kept apart until map_console_stages knows whether there is MS.
++            if (unsigned(type) != kConsoleHsSubobjectType) {
++                log_once("unknown pipeline state stream subobject type:", int(type));
++                return E_INVALIDARG;
++            }
++            take(out.console_hs);
++            out.has_console_hs = true;
++            break;
+         }
+         if (!ok) return E_INVALIDARG;
+     }
++    if (const HRESULT hr = map_console_stages(out); FAILED(hr)) return hr;
+     if (out.has_cs && out.has_graphics_stage) return E_INVALIDARG;  // a compute stage with graphics stages
+     if (!out.has_cs && !out.has_graphics_stage) return E_INVALIDARG;
+     return S_OK;
+diff --git a/runtime/test/d3d12_mesh_test.cpp b/runtime/test/d3d12_mesh_test.cpp
+index 590d3507b..d2ddd0c21 100644
+--- a/runtime/test/d3d12_mesh_test.cpp
++++ b/runtime/test/d3d12_mesh_test.cpp
+@@ -50,6 +50,9 @@ using PsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS, D3D12_SHAD
+ using CsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_CS, D3D12_SHADER_BYTECODE>;
+ using AsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS, D3D12_SHADER_BYTECODE>;
+ using MsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS, D3D12_SHADER_BYTECODE>;
++// The console's VS and HS in streams without MS: subobject types 24 and 23, which the PC runtime does not define.
++using ConsoleVsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(24), D3D12_SHADER_BYTECODE>;
++using ConsoleHsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(23), D3D12_SHADER_BYTECODE>;
+ using TopologySubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY, D3D12_PRIMITIVE_TOPOLOGY_TYPE>;
+ using TargetsSubobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS, D3D12_RT_FORMAT_ARRAY>;
+ using DepthStencil1Subobject = Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL1, D3D12_DEPTH_STENCIL_DESC1>;
+@@ -190,6 +193,37 @@ int main() {
+         root.reset();
+         EXPECT(rt::d3d12_xs::device_proxy_ref_count(device.p) == 1);
+     }
++    // Console streams without a mesh subobject (slot 86; TreXito's static reading of the retail title, Leonida#8186):
++    // the VS is subobject 24 and the HS is 23. Without MS, 24 is the VS and 23 the HS, and the HS is not built yet, so
++    // a stream with it is E_NOTIMPL. No mesh extension needed.
++    {
++        Ref<ID3D12Device> device;
++        Ref<ID3D12RootSignature> root;
++        EXPECT(make_device(false, device));
++        EXPECT(root_signature(device.p, root));
++        Stream console;
++        console.add(RootSubobject{.inner = root.p}).add(ConsoleVsSubobject{.inner = vs}).add(PsSubobject{.inner = ps});
++        console.add(TopologySubobject{.inner = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE});
++        console.add(TargetsSubobject{.inner = one_target()});
++        Ref<ID3D12PipelineState> console_pso;
++        EXPECT(SUCCEEDED(create(device.p, console, console_pso)) && console_pso.p);
++
++        Stream with_hs = console;
++        with_hs.add(ConsoleHsSubobject{.inner = ps});
++        Ref<ID3D12PipelineState> refused;
++        EXPECT(create(device.p, with_hs, refused) == E_NOTIMPL && !refused.p);
++
++        Stream hs_only;
++        hs_only.add(RootSubobject{.inner = root.p}).add(VsSubobject{.inner = vs});
++        hs_only.add(ConsoleHsSubobject{.inner = vs}).add(PsSubobject{.inner = ps});
++        hs_only.add(TargetsSubobject{.inner = one_target()});
++        EXPECT(create(device.p, hs_only, refused) == E_NOTIMPL && !refused.p);
++
++        // With a real VS, 24 is not remapped: it stays an amplification shader, which is refused.
++        Stream real_vs = console;
++        real_vs.add(VsSubobject{.inner = vs});
++        EXPECT(create(device.p, real_vs, refused) == E_NOTIMPL && !refused.p);
++    }
+     if (!d.mesh_shader) {
+         std::filesystem::remove_all(library);
+         std::printf("no VK_EXT_mesh_shader on this device: only the refusal without it was checked\n");
+@@ -230,7 +264,7 @@ int main() {
+         EXPECT(create(device.p, bad, refused) == E_INVALIDARG && !refused.p);
+         EXPECT(create(device.p, mesh_stream, refused, 4) == E_INVALIDARG && !refused.p);  // truncated
+         bad = mesh_stream;
+-        bad.add(Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(23), UINT>{.inner = 0});  // 23 is no subobject type
++        bad.add(Subobject<D3D12_PIPELINE_STATE_SUBOBJECT_TYPE(23), UINT>{.inner = 0});  // 23 with MS: no subobject type
+         EXPECT(create(device.p, bad, refused) == E_INVALIDARG && !refused.p);
+         Stream empty;
+         EXPECT(create(device.p, empty.add(MaskSubobject{.inner = UINT_MAX}), refused) == E_INVALIDARG && !refused.p);
+-- 
+2.54.0
+

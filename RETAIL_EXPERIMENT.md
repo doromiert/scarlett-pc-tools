@@ -1,14 +1,15 @@
 # Experimental retail startup integration
 
-This source snapshot is for continuing runtime bring-up. It is not a playable
+This earlier snapshot is preserved for comparison; use
+[FORGE_INTEGRATION.md](FORGE_INTEGRATION.md) for the current runtime. It is not a playable
 port. All game inputs, translated shaders, runtime binaries and traces remain
 outside this repository.
 
 The base is ramenbellic/Leonida `boot/retail-stack` at
-`8443d34c14a5ec1e98d2a076d4c10f7bcbfa37e7`. The ten patches in
+`8443d34c14a5ec1e98d2a076d4c10f7bcbfa37e7`. The thirteen patches in
 `patches/leonida/retail/` add console texture accounting, DirectStorage zlib,
 command-list CPU handle translation, console list reset slot 139, the measured
-APU heap implementation, presentation result tracing, opt-in frame-content statistics, and monitor-fit windows with a separate message pump. These preserve the
+APU heap implementation, presentation result tracing, opt-in frame-content statistics, and monitor-fit windows with a separate message pump, console stream-stage mapping, and bounded loading/pixel progress diagnostics. These preserve the
 upstream authors. This series is separate from the earlier clean integration.
 
 With `TOOLS` set to this checkout, apply it in a new source checkout:
@@ -28,7 +29,7 @@ an external private shader cache in `LEONIDA_SHADERS`. The launcher disables
 networking, keeps writes external, retains guest assertions, and can recover
 missing Linux desktop display variables from the user's systemd session.
 
-The seven source patches in `patches/leonida/native-shaders/` apply separately to
+The fifteen source patches in `patches/leonida/native-shaders/` apply separately to
 shader tools at `07d04de54eb69ea3f485d4f8f0353910d381267e`. They integrate upstream
 [PR 6446](https://github.com/ItsNotRexed/Leonida/pull/6446) (compute thread-group SGPR),
 [PR 6813](https://github.com/ItsNotRexed/Leonida/pull/6813) (library parsing),
@@ -37,6 +38,13 @@ shader tools at `07d04de54eb69ea3f485d4f8f0353910d381267e`. They integrate upstr
 [PR 7529](https://github.com/ItsNotRexed/Leonida/pull/7529) (library compute programs
 and their exact dispatch-state sidecars). Conflict resolutions preserve the NONE
 field guard and defer output publication until disassembly succeeds.
+
+The later patches include upstream LDS append/consume and EXEC bit replication,
+a wave64-only subset of PR8842, plus local extensions for leading-bit scans of
+lane masks, full native no-op prefixes, compare swizzles, and wave32 scalar VCC
+pointer loads. These were exercised on requested programs and validated as SPIR-V;
+rendered output equivalence is not established. Partial compare destination masks remain refused. Later patches integrate
+PR8330 and materialize scalar VCC memory-address words in either wave size.
 
 ```sh
 git switch -c local/scarlett-shaders 07d04de54eb69ea3f485d4f8f0353910d381267e
@@ -68,8 +76,11 @@ presented pixel black. The oversized title window now fits a 1080p monitor.
 
 The first static-library pass translated and validated 1,860 of 2,684 compute
 programs. Restoring their exact dispatch-state keys reduced observed missing
-programs to 40 early in the next run; 138 had appeared by its 180-second limit. The expanded translator pass is
-still being measured; neither count establishes a playable result.
+programs to 40 early in the next run; 138 had appeared by its 180-second limit. Subsequent fixes produced a private cache of 2,642 validated library modules.
+The runtime continues requesting programs well after its first frames, so a
+short interval understates the missing count. The current observation records
+native-pipeline completion progress and periodic actual presented-pixel statistics.
+Neither successful creation nor validation establishes a playable result.
 
 Limits remain in the public base: several console operations are stand-ins,
 textures do not share the title's tiled CPU memory, and the audio hardware object

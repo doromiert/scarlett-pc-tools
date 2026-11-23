@@ -1,7 +1,7 @@
 From 7383f8bc7185ba790431a4622c1e9893e4453fc6 Mon Sep 17 00:00:00 2001
 From: Vadson159 <vad.sofr@gmail.com>
 Date: Mon, 23 Nov 2026 19:44:55 +0100
-Subject: [PATCH 4/7] rdna2spirv, lane_masks: support null/exec/wave32-vcc_hi
+Subject: [PATCH 04/15] rdna2spirv, lane_masks: support null/exec/wave32-vcc_hi
  compare SDSTs and wave32 vcc_hi masks
 
 ---

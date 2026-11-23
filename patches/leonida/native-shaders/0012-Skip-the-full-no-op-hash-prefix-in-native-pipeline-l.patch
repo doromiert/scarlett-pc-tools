@@ -1,0 +1,46 @@
+From a929427a75d25905e5cc09cd9d3955d065b3bdf4 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 20:55:09 +0100
+Subject: [PATCH 12/15] Skip the full no-op hash prefix in native
+ pipeline-library programs
+
+---
+ docs/fspx.md         | 7 +++++++
+ tools/fspx_unpack.py | 6 +++++-
+ 2 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/docs/fspx.md b/docs/fspx.md
+index 2dd8b8d50..433b90038 100644
+--- a/docs/fspx.md
++++ b/docs/fspx.md
+@@ -259,3 +259,10 @@ it is now refused (`fall-through into undecodable words`): programs 04, 05, 06,
+ - The exact layout of the kind-7 records.
+ - What the prologue does on the GPU.
+ - Whether the game itself ships FSPX programs. Its shaders measured so far are `FSSM`.
++
++Local pipeline-library extraction note: the leading hash-carrying no-op sequence
++can contain two 12-byte VOP3 words (24 bytes), as well as the known three-word
++sequence (36 bytes). `code_range` skips the full leading sequence before looking
++for the end marker. The measured compute library contains 50 of the former and
++2,634 of the latter. LLVM listings that start at 0 incorrectly expose ignored
++literal words as instructions; successful validation alone cannot detect that.
+diff --git a/tools/fspx_unpack.py b/tools/fspx_unpack.py
+index 5cb94813e..c495ce504 100644
+--- a/tools/fspx_unpack.py
++++ b/tools/fspx_unpack.py
+@@ -144,7 +144,11 @@ def code_range(code: bytes):
+     """(start, end) of the instructions in a kind-6 program: after the 36-byte prologue when it is there, through
+     the first s_endpgm. end is None when the program has no s_endpgm."""
+     words = struct.unpack_from(f"<{len(code) // 4}I", code)
+-    start = PROLOGUE_SIZE if len(words) > 8 and all(words[k] >> 16 == 0xD580 for k in PROLOGUE_WORDS) else 0
++    # Native pipeline-library programs have two or three hash-carrying 12-byte VOP3 no-ops. LLVM decodes only
++    # eight bytes of each and treats the ignored literal as another instruction; skip the complete prefix.
++    start = 0
++    while start + 12 <= len(code) and words[start // 4] >> 16 == 0xD580:
++        start += 12
+     pos = code.find(ENDPGM, start)
+     while pos >= 0 and pos % 4:
+         pos = code.find(ENDPGM, pos + 1)
+-- 
+2.54.0
+

@@ -1,7 +1,7 @@
 From 35a35670227aeaae2ca9f352de2707a25a2f0dce Mon Sep 17 00:00:00 2001
 From: FIocker <4461558+FIocker@users.noreply.github.com>
 Date: Mon, 23 Nov 2026 16:10:47 +0100
-Subject: [PATCH 3/7] shader_library: fix the #4343 review findings; recount
+Subject: [PATCH 03/15] shader_library: fix the #4343 review findings; recount
  with llvm-mc 21 and 23
 
 Review findings on #4343 (@tupacfan04):

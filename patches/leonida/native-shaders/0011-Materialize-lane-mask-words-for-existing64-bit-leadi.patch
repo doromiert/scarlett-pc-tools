@@ -1,0 +1,47 @@
+From b4bad53c918982da52e3b79d9aacab2195d41fef Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 20:55:09 +0100
+Subject: [PATCH 11/15] Materialize lane-mask words for existing64-bit
+ leading-bit scans
+
+Reuse wave_mask as s_ff1_i32_b64 does, then retain the existing scalar two-word scan. Five actual requested programs (including the prior wave64 VCC change) now translate and pass SPIR-V validation; rendered output is not verified.
+---
+ docs/design.md      | 5 +++++
+ tools/rdna2spirv.py | 6 +++---
+ 2 files changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/docs/design.md b/docs/design.md
+index ac1d5563c..2e76d1900 100644
+--- a/docs/design.md
++++ b/docs/design.md
+@@ -662,3 +662,8 @@ Local integration note: the wave64 VCC destination of `s_bitreplicate_b64_b32` i
+ lowered with the per-lane rule from PR 8842 (Andreev Kirill Andreevich), while
+ keeping the dispatch state's wave size authoritative and refusing wave32 VCC.
+ This subset does not infer wave64 from the opcode's 64-bit destination alone.
++
++Local integration note: `s_flbit_i32_b64/i64` reads a lane-mask source through
++`wave_mask`, as `s_ff1_i32_b64` already does, then uses the existing two-word
++leading-bit calculation. This is a translation extension; SPIR-V validation
++of actual requested programs does not verify their rendered output.
+diff --git a/tools/rdna2spirv.py b/tools/rdna2spirv.py
+index 1a63e7de4..f2ae225dd 100644
+--- a/tools/rdna2spirv.py
++++ b/tools/rdna2spirv.py
+@@ -7634,11 +7634,11 @@ class Gen:
+             # Leading-bit count of a 64-bit value, from bit 63 down: b64 counts the zeros before the first 1; i64
+             # counts the bits before the first one that differs from the sign bit (b64 of ~S0 when S0 < 0). -1 when
+             # there is none (0, and for i64 also -1). SCC is not written. The pair is 64-bit data (as for
+-            # s_lshl_b64); a lane-mask source stays Unsupported (#210).
++            # s_lshl_b64). Materialize both words of a lane mask before applying the same scalar scan, as ff1 does.
+             x = a[1]
+             if self.holds_lane_mask(x):
+-                raise Unsupported(op + " of a lane mask")
+-            if x["k"] == "sgpr" and x.get("n") == 2:
++                lo, hi = self.wave_mask(x)
++            elif x["k"] == "sgpr" and x.get("n") == 2:
+                 lo, hi = self.load_reg("sgpr", x["r"]), self.load_reg("sgpr", x["r"] + 1)
+             elif x["k"] == "imm":
+                 v = x["v"] & 0xFFFFFFFFFFFFFFFF
+-- 
+2.54.0
+

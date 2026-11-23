@@ -1,7 +1,7 @@
 From 9a77e6df7f362940f5c08f39fdd04bd8cf18493c Mon Sep 17 00:00:00 2001
 From: Nolan Cotter <186326284+NolanCotter@users.noreply.github.com>
 Date: Mon, 23 Nov 2026 10:14:43 -0700
-Subject: [PATCH 04/10] d3d12_xs: route console list slot 139 (Reset) to PC
+Subject: [PATCH 04/13] d3d12_xs: route console list slot 139 (Reset) to PC
  slot 10
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8

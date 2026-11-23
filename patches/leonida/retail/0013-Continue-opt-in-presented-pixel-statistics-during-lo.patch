@@ -1,0 +1,26 @@
+From b88bf59c466fa421927ee2a1e23cc7ce3d041ec6 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 21:05:31 +0100
+Subject: [PATCH 13/13] Continue opt-in presented-pixel statistics during long
+ native boot observations
+
+---
+ runtime/shims/d3d12_vulkan_device.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
+index 728b4146d..e3835cb07 100644
+--- a/runtime/shims/d3d12_vulkan_device.cpp
++++ b/runtime/shims/d3d12_vulkan_device.cpp
+@@ -9072,7 +9072,7 @@ float WindowPresenter::display_sdr_white_nits() const {
+ void WindowPresenter::report_capture() {
+     if (!capture_stats_) return;
+     const auto attempt = ++capture_attempts_;
+-    if (attempt != 1 && attempt != 120 && attempt != 600) return;
++    if (attempt != 1 && attempt != 120 && attempt != 600 && attempt % 6000 != 0) return;
+     std::vector<std::uint8_t> pixels;
+     VkExtent2D size{};
+     VkFormat format{};
+-- 
+2.54.0
+

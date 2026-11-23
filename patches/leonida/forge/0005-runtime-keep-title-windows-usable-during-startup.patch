@@ -1,0 +1,316 @@
+From 6db1168e4fd18fb228f26bb2d3d0f5222f5f9f7f Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 20:28:53 +0100
+Subject: [PATCH 05/19] runtime: keep title windows usable during startup
+
+---
+ runtime/CMakeLists.txt            |   1 +
+ runtime/shims/d3d12_xs_device.cpp | 160 ++++++++++++++++++++++--------
+ runtime/shims/title_window.cpp    |  56 +++++++++++
+ 3 files changed, 177 insertions(+), 40 deletions(-)
+ create mode 100644 runtime/shims/title_window.cpp
+
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index 44402929f..9e85f9351 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -122,6 +122,7 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
+     shims/xbox_bvh_builder.cpp
+     shims/library_loader.cpp
+     shims/process.cpp
++    shims/title_window.cpp
+     shims/dstorage.cpp
+     shims/host_stall.cpp
+   )
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index f033084da..7dfcbcf5d 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -42,6 +42,7 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <condition_variable>
+ #include <functional>
+ #include <cerrno>
+ #include <cstddef>
+@@ -56,6 +57,8 @@
+ #include <new>
+ #include <utility>
+ #include <vector>
++#include <thread>
++#include <system_error>
+ 
+ #include "d3d12_xs_command_list_iid.h"
+ 
+@@ -1374,30 +1377,39 @@ std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_
+ #ifdef LEONIDA_VULKAN_DEVICE
+ 
+ struct PresentState {
+-    ~PresentState() {
+-        xbox.reset();  // release the surface before its HWND
+-        if (!window) return;
+-        const HWND owned_window = window;
+-        window = nullptr;
+-        SetWindowLongPtrW(owned_window, GWLP_USERDATA, 0);
+-        if (GetWindowThreadProcessId(owned_window, nullptr) == GetCurrentThreadId())
+-            DestroyWindow(owned_window);
+-        else
+-            PostMessageW(owned_window, WM_CLOSE, 0, 0);
+-    }
++    static constexpr UINT kDestroyWindowMessage = WM_APP + 1;
++
++    ~PresentState();
+     HWND window = nullptr;
+     std::unique_ptr<rt::d3d12::XboxPresentation> xbox;
+     bool tried = false;  // creation is attempted once; a null xbox means this device cannot present
+-
+-    void pump_messages() {
+-        MSG message{};
+-        while (window && PeekMessageW(&message, window, 0, 0, PM_REMOVE)) {
+-            TranslateMessage(&message);
+-            DispatchMessageW(&message);
+-        }
+-    }
++    std::thread window_thread;
++    std::mutex window_mutex;
++    std::condition_variable window_ready;
++    bool window_started = false;
++    std::atomic<bool> close_requested{false};
++
++    void post_destroy_window();
++    void finish_close();
+ };
+ 
++void PresentState::post_destroy_window() {
++    std::lock_guard lock(window_mutex);
++    if (window) PostMessageW(window, kDestroyWindowMessage, 0, 0);
++}
++
++PresentState::~PresentState() {
++    xbox.reset();  // release the Vulkan surface before asking its owner thread to destroy the HWND
++    post_destroy_window();
++    if (window_thread.joinable()) window_thread.join();
++}
++
++void PresentState::finish_close() {
++    if (!close_requested.exchange(false)) return;
++    xbox.reset();
++    post_destroy_window();
++}
++
+ void destroy_present_state(void* present_state) {
+     delete static_cast<PresentState*>(present_state);
+ }
+@@ -1409,19 +1421,91 @@ LRESULT CALLBACK present_window_proc(HWND window, UINT message, WPARAM wparam, L
+         SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+     } else if (message == WM_CLOSE) {
+         if (state) {
+-            state->xbox.reset();  // the Vulkan surface must die before the HWND
+-            state->window = nullptr;
+-            SetWindowLongPtrW(window, GWLP_USERDATA, 0);
++            ShowWindow(window, SW_HIDE);  // visible feedback now; the render thread releases the surface before destroy
++            state->close_requested.store(true);
++        } else {
++            DestroyWindow(window);
+         }
++        return 0;
++    } else if (message == PresentState::kDestroyWindowMessage) {
+         DestroyWindow(window);
+         return 0;
+     } else if (message == WM_NCDESTROY && state) {
+-        state->window = nullptr;
++        {
++            std::lock_guard lock(state->window_mutex);
++            state->window = nullptr;
++        }
+         SetWindowLongPtrW(window, GWLP_USERDATA, 0);
++        PostQuitMessage(0);
+     }
+     return DefWindowProcW(window, message, wparam, lparam);
+ }
+ 
++void present_window_thread(PresentState* state) {
++    WNDCLASSW window_class{};
++    window_class.lpfnWndProc = present_window_proc;
++    window_class.hInstance = GetModuleHandleW(nullptr);
++    window_class.lpszClassName = L"LeonidaPresentX";
++    if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
++        std::fprintf(stderr, "[rt] d3d12_xs: PresentX window class failed (error %lu)\n", GetLastError());
++        {
++            std::lock_guard lock(state->window_mutex);
++            state->window_started = true;
++        }
++        state->window_ready.notify_one();
++        return;
++    }
++
++    RECT work_area{0, 0, GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)};
++    POINT cursor{};
++    MONITORINFO monitor_info{};
++    monitor_info.cbSize = sizeof(monitor_info);
++    if (GetCursorPos(&cursor) &&
++        GetMonitorInfoW(MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY), &monitor_info))
++        work_area = monitor_info.rcWork;
++
++    constexpr LONG target_width = 1280;
++    constexpr LONG target_height = 720;
++    constexpr DWORD style = WS_OVERLAPPEDWINDOW | WS_VISIBLE;
++    RECT target_outer{0, 0, target_width, target_height};
++    AdjustWindowRectEx(&target_outer, style, FALSE, 0);
++    const LONG border_width = target_outer.right - target_outer.left - target_width;
++    const LONG border_height = target_outer.bottom - target_outer.top - target_height;
++    const LONG available_width = (std::max)(1L, work_area.right - work_area.left - border_width);
++    const LONG available_height = (std::max)(1L, work_area.bottom - work_area.top - border_height);
++    LONG client_width = (std::min)(target_width, available_width);
++    LONG client_height = client_width * 9 / 16;
++    if (client_height > available_height) {
++        client_height = (std::min)(target_height, available_height);
++        client_width = (std::max)(1L, client_height * 16 / 9);
++    }
++
++    RECT outer{0, 0, client_width, client_height};
++    AdjustWindowRectEx(&outer, style, FALSE, 0);
++    const LONG outer_width = outer.right - outer.left;
++    const LONG outer_height = outer.bottom - outer.top;
++    const int x = work_area.left + (work_area.right - work_area.left - outer_width) / 2;
++    const int y = work_area.top + (work_area.bottom - work_area.top - outer_height) / 2;
++    HWND window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", style, x, y, outer_width, outer_height,
++                                  nullptr, nullptr, window_class.hInstance, state);
++    if (!window)
++        std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
++    {
++        std::lock_guard lock(state->window_mutex);
++        state->window = window;
++        state->window_started = true;
++    }
++    state->window_ready.notify_one();
++    if (!window) return;
++
++    UpdateWindow(window);
++    MSG message{};
++    while (GetMessageW(&message, nullptr, 0, 0) > 0) {
++        TranslateMessage(&message);
++        DispatchMessageW(&message);
++    }
++}
++
+ // Lazily builds the window, presenter and XboxPresentation a console PresentX needs, once per device. Returns the
+ // state even when `xbox` stays null (no presentation support): the failure is logged once, not retried.
+ PresentState* present_state_for(DeviceProxy* device) {
+@@ -1430,37 +1514,33 @@ PresentState* present_state_for(DeviceProxy* device) {
+     if (!state) return nullptr;
+     device->present_state = state;
+     state->tried = true;
+-    WNDCLASSW window_class{};
+-    window_class.lpfnWndProc = present_window_proc;
+-    window_class.hInstance = GetModuleHandleW(nullptr);
+-    window_class.lpszClassName = L"LeonidaPresentX";
+-    if (!RegisterClassW(&window_class) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+-        std::fprintf(stderr, "[rt] d3d12_xs: PresentX window class failed (error %lu)\n", GetLastError());
++    try {
++        state->window_thread = std::thread(present_window_thread, state);
++    } catch (const std::system_error&) {
++        std::fprintf(stderr, "[rt] d3d12_xs: PresentX window thread failed\n");
+         return state;
+     }
+-    state->window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+-                                  CW_USEDEFAULT,
+-                                  CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr,
+-                                  window_class.hInstance, state);
+-    if (!state->window) {
+-        std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
+-        return state;
++    HWND window = nullptr;
++    {
++        std::unique_lock lock(state->window_mutex);
++        state->window_ready.wait(lock, [state] { return state->window_started; });
++        window = state->window;
+     }
+-    UpdateWindow(state->window);
+-    auto presenter = rt::d3d12::create_window_presenter(device->real, state->window);
++    if (!window) return state;
++    auto presenter = rt::d3d12::create_window_presenter(device->real, window);
+     if (!presenter) {
+         std::fprintf(stderr, "[rt] d3d12_xs: no window presenter on this device; PresentX is a no-op\n");
+         return state;
+     }
+     state->xbox = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter));
+-    std::fprintf(stderr, "[rt] d3d12_xs: PresentX ready (window %p)\n", static_cast<void*>(state->window));
++    std::fprintf(stderr, "[rt] d3d12_xs: PresentX ready (window %p)\n", static_cast<void*>(window));
+     return state;
+ }
+ 
+ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::uint64_t planes,
+                               std::uint64_t params) {
+     PresentState* state = self->device ? present_state_for(self->device) : nullptr;
+-    if (state) state->pump_messages();
++    if (state) state->finish_close();
+     if (!state || !state->xbox) return hr_to_u64(S_OK);  // a title still runs with nothing presented
+     const HRESULT result = state->xbox->PresentX(
+         static_cast<UINT>(plane_count),
+diff --git a/runtime/shims/title_window.cpp b/runtime/shims/title_window.cpp
+new file mode 100644
+index 000000000..8b28c1266
+--- /dev/null
++++ b/runtime/shims/title_window.cpp
+@@ -0,0 +1,56 @@
++// Keeps explicitly sized title windows usable on the monitor they target. The mapped title imports this API-set
++// entry through the shim registry; the runtime's own windows still call user32 directly.
++#include "shims.h"
++
++#include <windows.h>
++
++#include <algorithm>
++#include <cstdint>
++#include <cstdio>
++
++namespace {
++
++HWND WINAPI create_window_ex_a(DWORD ex_style, LPCSTR class_name, LPCSTR window_name, DWORD style, int x, int y,
++                               int width, int height, HWND parent, HMENU menu, HINSTANCE instance, LPVOID param) {
++    const bool uses_default = x == CW_USEDEFAULT || y == CW_USEDEFAULT || width == CW_USEDEFAULT ||
++                              height == CW_USEDEFAULT;
++    if ((style & WS_CHILD) || parent == HWND_MESSAGE || uses_default || width <= 0 || height <= 0)
++        return CreateWindowExA(ex_style, class_name, window_name, style, x, y, width, height, parent, menu, instance,
++                               param);
++
++    RECT requested{x, y, x + width, y + height};
++    MONITORINFO monitor{};
++    monitor.cbSize = sizeof(monitor);
++    if (!GetMonitorInfoW(MonitorFromRect(&requested, MONITOR_DEFAULTTONEAREST), &monitor))
++        return CreateWindowExA(ex_style, class_name, window_name, style, x, y, width, height, parent, menu, instance,
++                               param);
++
++    const int work_width = monitor.rcWork.right - monitor.rcWork.left;
++    const int work_height = monitor.rcWork.bottom - monitor.rcWork.top;
++    if (width <= work_width && height <= work_height)
++        return CreateWindowExA(ex_style, class_name, window_name, style, x, y, width, height, parent, menu, instance,
++                               param);
++
++    // CreateWindowEx dimensions already include the non-client border: scale the complete outer window to fit.
++    std::int64_t scale_num = work_width;
++    std::int64_t scale_den = width;
++    if (std::int64_t(height) * scale_num > std::int64_t(work_height) * scale_den) {
++        scale_num = work_height;
++        scale_den = height;
++    }
++    const int fitted_width = (std::max)(1, static_cast<int>(std::int64_t(width) * scale_num / scale_den));
++    const int fitted_height = (std::max)(1, static_cast<int>(std::int64_t(height) * scale_num / scale_den));
++    const int fitted_x = monitor.rcWork.left + (work_width - fitted_width) / 2;
++    const int fitted_y = monitor.rcWork.top + (work_height - fitted_height) / 2;
++    std::fprintf(stderr, "[rt] window: fit oversized title window %dx%d to %dx%d at %d,%d\n", width, height,
++                 fitted_width, fitted_height, fitted_x, fitted_y);
++    return CreateWindowExA(ex_style, class_name, window_name, style, fitted_x, fitted_y, fitted_width, fitted_height,
++                           parent, menu, instance, param);
++}
++
++}  // namespace
++
++SHIM_TABLE(title_window,
++    {"ext-ms-win-rtcore-ntuser-window-ansi-l1-1-0.dll", "CreateWindowExA",
++     reinterpret_cast<void*>(&create_window_ex_a)},
++);
+-- 
+2.54.0
+

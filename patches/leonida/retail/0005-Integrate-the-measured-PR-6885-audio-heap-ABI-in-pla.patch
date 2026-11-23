@@ -1,7 +1,7 @@
 From c594f22454f28c763d7a476e098196b93cb2eed7 Mon Sep 17 00:00:00 2001
 From: Jadiac <jadiac@web.de>
 Date: Mon, 23 Nov 2026 20:09:16 +0100
-Subject: [PATCH 05/10] Integrate the measured PR 6885 audio heap ABI in place
+Subject: [PATCH 05/13] Integrate the measured PR 6885 audio heap ABI in place
  of the older audio stand-in
 
 Source: ItsNotRexed/Leonida PR #6885 at 3b7c9f42454a408d7bed2c84a22ee462f1508593 (GPL-3.0), including the shape-context and message-poll corrections. The actual title passes ApuAlloc flags 2; the older #7009 implementation rejects it and leaves its output null.

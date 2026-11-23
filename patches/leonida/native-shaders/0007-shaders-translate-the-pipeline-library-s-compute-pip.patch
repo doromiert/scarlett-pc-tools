@@ -1,7 +1,7 @@
 From a8797ebfa355f7b099f1e2256580b41f119cdc05 Mon Sep 17 00:00:00 2001
 From: gookie <gookie@online-fix.me>
 Date: Mon, 23 Nov 2026 17:46:54 +0100
-Subject: [PATCH 7/7] shaders: translate the pipeline library's compute
+Subject: [PATCH 07/15] shaders: translate the pipeline library's compute
  pipelines, which the executable creates with slot 67 (RT-5)
 
 The retail executable calls Xbox device slot 67 (DeserializeComputePipelineStateX) itself during boot, and every

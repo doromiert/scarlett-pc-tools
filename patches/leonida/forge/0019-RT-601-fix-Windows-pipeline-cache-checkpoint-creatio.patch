@@ -1,0 +1,80 @@
+From cf2a30c0596f8e0331b2131061c53ffaa45afce2 Mon Sep 17 00:00:00 2001
+From: melon0918 <77735556+melon0918@users.noreply.github.com>
+Date: Tue, 24 Nov 2026 02:04:55 +0800
+Subject: [PATCH 19/19] RT-601: fix Windows pipeline cache checkpoint creation
+
+---
+ runtime/CMakeLists.txt            |  4 ++++
+ runtime/src/pipeline_cache_file.h | 26 +++++++++++++++++++++++---
+ 2 files changed, 27 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index bceef07a1..e2a96d2a8 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -537,6 +537,10 @@ if(BUILD_TESTING)
+   add_test(NAME xbox_present_readback_size COMMAND xbox_present_readback_size_test)
+ 
+   add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
++  if(MSVC)
++    # Use the same static CRT as vk_pipeline_check when testing checkpoint creation.
++    set_property(TARGET pipeline_cache_file_test PROPERTY MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
++  endif()
+   add_test(NAME pipeline_cache_file COMMAND pipeline_cache_file_test)
+ 
+   # D3D-704's session-cache limit and header check: pure stdlib, no Vulkan headers.
+diff --git a/runtime/src/pipeline_cache_file.h b/runtime/src/pipeline_cache_file.h
+index 95afbd10a..e373a153b 100644
+--- a/runtime/src/pipeline_cache_file.h
++++ b/runtime/src/pipeline_cache_file.h
+@@ -13,6 +13,10 @@
+ #include <system_error>
+ 
+ #ifdef _WIN32
++#include <fcntl.h>
++#include <io.h>
++#include <share.h>
++#include <sys/stat.h>
+ #include <thread>
+ #include <windows.h>
+ #endif
+@@ -23,17 +27,33 @@ inline std::error_code write_pipeline_cache_file(const std::filesystem::path& de
+     const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+     fs::path staged;
+     std::FILE* file = nullptr;
++    int open_error = 0;
+     for (int attempt = 0; attempt < 8; ++attempt) {
+         staged = destination;
+         staged += ".tmp." + std::to_string(stamp) + "." + std::to_string(attempt);
+ #ifdef _WIN32
+-        file = _wfopen(staged.c_str(), L"wbx");
++        // The checker's static Windows CRT can terminate on the fopen "x" mode.
++        // Open exclusively through the CRT descriptor API, then attach a binary stream.
++        int fd = -1;
++        open_error = _wsopen_s(&fd, staged.c_str(), _O_WRONLY | _O_CREAT | _O_EXCL | _O_BINARY,
++                               _SH_DENYNO, _S_IREAD | _S_IWRITE);
++        if (!open_error) {
++            file = _wfdopen(fd, L"wb");
++            if (!file) {
++                const std::error_code error{errno ? errno : EIO, std::generic_category()};
++                _close(fd);
++                std::error_code ignored;
++                fs::remove(staged, ignored);
++                return error;
++            }
++        }
+ #else
+         file = std::fopen(staged.c_str(), "wbx");
++        open_error = file ? 0 : errno;
+ #endif
+-        if (file || errno != EEXIST) break;
++        if (file || open_error != EEXIST) break;
+     }
+-    if (!file) return {errno, std::generic_category()};
++    if (!file) return {open_error, std::generic_category()};
+ 
+     std::error_code error;
+     // Keep individual CRT writes small even when the cache is several GiB.
+-- 
+2.54.0
+

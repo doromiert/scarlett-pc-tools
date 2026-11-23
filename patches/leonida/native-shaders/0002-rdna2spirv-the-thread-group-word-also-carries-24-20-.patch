@@ -1,7 +1,7 @@
 From 28c7dc43d527bcd9179c6bbd80f83a4bf96e94c9 Mon Sep 17 00:00:00 2001
 From: FIocker <4461558+FIocker@users.noreply.github.com>
 Date: Mon, 23 Nov 2026 16:35:47 +0100
-Subject: [PATCH 2/7] rdna2spirv: the thread-group word also carries [24:20]
+Subject: [PATCH 02/15] rdna2spirv: the thread-group word also carries [24:20]
  and the first-wave bit (gfx1036 measurement)
 
 @wasonidas measured the TG_SIZE_EN SGPR on gfx1036 through tools/hw_oracle (#6446): the low 12

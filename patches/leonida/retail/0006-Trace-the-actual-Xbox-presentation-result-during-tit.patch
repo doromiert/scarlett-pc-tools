@@ -1,7 +1,7 @@
 From 82dbafe192c10e63e039135e2d74305a13016826 Mon Sep 17 00:00:00 2001
 From: doromiert <doromiert@gmail.com>
 Date: Mon, 23 Nov 2026 20:12:38 +0100
-Subject: [PATCH 06/10] Trace the actual Xbox presentation result during title
+Subject: [PATCH 06/13] Trace the actual Xbox presentation result during title
  execution
 
 ---

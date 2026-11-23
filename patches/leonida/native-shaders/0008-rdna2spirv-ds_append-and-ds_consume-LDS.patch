@@ -1,0 +1,523 @@
+From b9263596c5d8c29d7675c65d87d7d66efee60910 Mon Sep 17 00:00:00 2001
+From: Vonsek <45567075+Vonsek@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 23:44:51 +0100
+Subject: [PATCH 08/15] rdna2spirv: ds_append and ds_consume (LDS)
+
+One add / subtract of the wave's active-lane count at the offset address,
+done by the first active lane; the old value to every active lane by a
+subgroup shuffle (an exchange round under --wave64-emulate). Measured
+natively on gfx1036: the offset alone is the address, M0 does not move it.
+The gds form stays Unsupported. GPU fixtures cs_w32/w64_ds_append, semantic
+test test_ds_append.py, design.md row.
+
+AI-assisted.
+---
+ docs/design.md                                |  1 +
+ runtime/test/shaders/check.py                 |  5 +-
+ runtime/test/shaders/cs_w32_ds_append.asm     | 63 ++++++++++++++
+ runtime/test/shaders/cs_w64_ds_append.asm     | 64 ++++++++++++++
+ scripts/run_gpu_tests.py                      |  7 +-
+ .../fixtures/disasm/cs_w32_ds_append.s        | 46 ++++++++++
+ .../fixtures/disasm/cs_w64_ds_append.s        | 48 +++++++++++
+ tests/semantic/regen_fixtures.py              |  1 +
+ tests/semantic/test_ds_append.py              | 85 +++++++++++++++++++
+ tools/rdna2spirv.py                           | 56 ++++++++++++
+ 10 files changed, 373 insertions(+), 3 deletions(-)
+ create mode 100644 runtime/test/shaders/cs_w32_ds_append.asm
+ create mode 100644 runtime/test/shaders/cs_w64_ds_append.asm
+ create mode 100644 tests/semantic/fixtures/disasm/cs_w32_ds_append.s
+ create mode 100644 tests/semantic/fixtures/disasm/cs_w64_ds_append.s
+ create mode 100644 tests/semantic/test_ds_append.py
+
+diff --git a/docs/design.md b/docs/design.md
+index c1cc4bc5e..c49c3363c 100644
+--- a/docs/design.md
++++ b/docs/design.md
+@@ -394,6 +394,7 @@ How the generated SPIR-V expects the runtime to work:
+ | Workgroup barriers | `s_barrier` (cs/ms) is one `OpControlBarrier` (workgroup scope, workgroup memory). On RDNA every `s_barrier` counts against the same workgroup barrier and a wave that has ended no longer counts, while Vulkan requires a barrier to be reached by every invocation in uniform control flow. Under `--wave64-emulate` the round loop keeps a single barrier at the top level, so this holds. **Native wave32 compute shaders run in barrier rounds** when an `s_barrier` sits anywhere but a top-level block of the structured tree (one every invocation runs): under a guard, in a loop, or in the dispatch loop (`needs_barrier_rounds`, `bar_scheduler`). That is the emulated loop without its cross-lane part: `s_barrier` ends a segment, each invocation runs its blocks until its next `s_barrier` or the end, then the whole workgroup meets at one `OpControlBarrier` (the same workgroup/acquire-release/workgroup-memory semantics) at the end of the round. A wave that is done no longer holds the others, and a per-round count of the invocations not done (three `Workgroup` words, by round mod 3) ends the loop. A wave that is done no longer holds the others, and a per-round count of the invocations not done (three `Workgroup` words, by round mod 3, or a borrowed LDS word with a large LDS: "Barrier-round count in LDS (SHADER-579)") ends the loop. Cross-lane operations stay subgroup operations, as in the dispatch loop, since a wave's lanes run the same segment. A barrier in a top-level block keeps the single `OpControlBarrier` in place. In the 1.0.2.1 corpus 43 of the 55 wave32 cs shaders with `s_barrier` have one nested (SHADER-91's count), so those 43 now run in rounds. Why: an Intel GPU does not survive the nested form. `cs_barrier_divergent.asm` (two barrier sites in different branches), `cs_barrier_early_end.asm` (the other waves end without a barrier) and `cs_barrier_loop.asm` (a barrier in a loop whose trip count differs per wave) each lose the device (`vkQueueWaitIdle` → `VK_ERROR_DEVICE_LOST`) on an Intel Arrow Lake Xe-LPG iGPU (Windows 32.0.101.8132), and `cs_barrier_divergent` hangs or writes nothing on a UHD 770 (101.6129, #634). With barrier rounds all three pass there and on an RTX 5070 Ti Laptop (617.42). NVIDIA passed them before too (RTX 4070 Ti on 610.88 and 621.24, RTX 5090 on Linux 595.99, RTX 5070 Ti). **Still not proven on the native wave64 path** (wave64 cs and every ms, run natively only on AMD's 64-wide subgroups): there the barrier stays where `s_barrier` is, inside a selection or loop construct in every ms and most wave64 cs shaders of the corpus. Branches are scalar, so whole waves take the same path, and RDNA's own barrier counts the way the shader expects. |
+ | Barrier-round count in LDS (SHADER-579) | Barrier rounds (see "Workgroup barriers") count the invocations not done in `%x_buf`, three `Workgroup` dwords (#930). On a full 32 KiB LDS that made 32,780 B, 12 bytes over the 32,768 B `maxComputeSharedMemorySize` of the AMD Windows (RX 9070 XT) and Intel (UHD 770) drivers, so the runtime refused those pipelines (2 native wave32 cs in towade's 1.0.2.1 corpus, [finding](https://github.com/ItsNotRexed/Leonida/pull/1882#issuecomment-7084298032)). Rule (`bar_counts_in_lds`): when the shader uses its LDS and the LDS array plus 12 bytes is over 16,384 B (the Vulkan minimum limit, so in practice an array of 16, 32 or 64 KiB), there is no `%x_buf`. The count borrows LDS word 0 at the end of each round (`bar_scheduler_tail`): after the round's barrier every invocation is done or waits at `s_barrier`, so no shader code runs; invocation 0 saves the word in a Function variable and clears it, barrier, every invocation not done adds 1 atomically, barrier, all read the count, barrier, invocation 0 stores the saved word back, barrier. The shader sees its LDS bit for bit as before, and the four extra barriers sit where the whole workgroup already waits, so `s_barrier`'s semantics are unchanged; the cost is four more `OpControlBarrier`s per round in those shaders only. Below the threshold `%x_buf` stays (12 bytes fit every device) with one barrier per round; a shader that never touches its LDS also keeps it (no array to borrow from, 12 B in all). A 32 KiB LDS is now exactly 32,768 B and a 64 KiB one 65,536 B (before: 65,548 B, refused or shrunk to its allocation). Not chosen: putting the count in LDS the shader never touches (unprovable with dynamic addresses), or deciding per device (the translator runs offline). Pinned by `tests/semantic/test_cs_barrier_counts_lds.py` (Workgroup bytes from the emitted SPIR-V and `lds_bytes` for 32 KiB, 64 KiB and small LDS, under a 32 KiB `--max-shared-memory`; ring shifts across 10 barriers that read word 0 and an early-ending wave in the workgroup interpreter, whose LDS starts as 0xDEADBEEF, in both wave orders). Confirmed by those CPU tests only; GPU runs on the 32 KiB devices are pending. |
+ | LDS | A `Workgroup` uint array sized from LDS_SIZE, rounded up to a power of two that also covers every constant offset (15 of 486 shaders index past LDS_SIZE). Covers `ds_read/write_b32..b128`, `read2/write2` (+`st64`), `u16`/`i16`/`u8`/`i8` reads (also `ds_read_u16_d16`/`_d16_hi` and, since SHADER-85, `ds_read_u8_d16`/`_d16_hi` and `ds_read_i8_d16`/`_d16_hi`: the byte is zero- or sign-extended 8→16 into one half of the destination VGPR and the other half is kept, per the RDNA2 ISA DS opcode descriptions (opcodes 162–165) and as for the u16 d16 reads; GPU-checked with `cs_w32_lds_u8_d16.asm`, byte values 0x80/0xFF/0x7F with a non-zero `offset:`), `b16`/`b8` writes (atomic and/or, so neighbouring lanes don't race; a 16-bit read or write at byte 3 of a dword also reads or writes byte 0 of the next dword, as llc-15 `-mcpu=gfx1030 -mattr=+unaligned-access-mode` emits one `ds_read_u16`/`ds_write_b16 ... offset:3` for an align-1 halfword; until 2026-11-22 the reads extracted 16 bits at bit 24, undefined in SPIR-V, and the writes kept only byte 3; `tests/semantic/test_lds_u16_cross_dword.py`), the add/sub/min/max/and/or/xor atomics with and without return, `wrxchg`, `cmpst` (`OpAtomicCompareExchange` with DATA as comparator and DATA2 as value), and `ds_bpermute_b32` as a subgroup shuffle. GPU-checked with `cs_w32_lds_u8_d16.asm`, byte values 0x80/0xFF/0x7F with a non-zero `offset:`), `b16`/`b8` writes (atomic and/or, so neighbouring lanes don't race), the add/sub/min/max/and/or/xor atomics with and without return, `wrxchg`, `cmpst` (`OpAtomicCompareExchange` with DATA as comparator and DATA2 as value), and `ds_bpermute_b32` as a subgroup shuffle. `ds_permute_b32`, its forward (scatter) form, has no Vulkan equivalent: each source lane that is on in EXEC publishes `((vAddr + offset) >> 2) mod 32` and each destination lane scans the 32 sources of its half and keeps the last one that targets it (a shuffle of target and data per source lane; under `--wave64-emulate` two buffer rounds and a Function variable instead). Per the ISA pseudocode (`tmp[0..63] = 0`; `next if !EXEC[i]` on the source; `VGPR[VDST][i] = tmp[i]` only `if EXEC[i]`): a destination lane nobody targets gets 0, an off source sends nothing, an off destination keeps its VDST, and the half rule above applies as for `ds_bpermute_b32`. When several sources target one lane the ISA leaves the winner unpredictable ("the value from one of the writers"; its pseudocode says the highest-numbered); the translator takes the highest, and nothing may depend on it. Confirmed by the GPU tests `cs_w32_permute.asm` and, per half of a wave64, `cs_w64x_permute.asm` (SHADER-90: rotation, offset, unwritten lane = 0, off destination keeps its value, off source does not win) and `tests/semantic/test_ds_permute.py`. **Hardware-verified on RDNA2 (`gfx1036`, AMD Ryzen 7 9800X3D iGPU, Linux AMDGPU DRM via `tools/hw_oracle`, wave32 and wave64, SHADER-133)** with `tools/ds_permute_probe.py` (9/9 cases exact in both wave sizes): unaddressed active lanes get 0, off destinations keep VDST, off sources send nothing, 2-/4-/32-way collisions deterministically take the highest-numbered active lane in the 32-lane half (matching the translator), `vAddr + offset` carries from the low 2 bits before `>> 2` mod 32, wave64 runs as two independent 32-lane halves (`+32` wraps within each half), and missing lanes of a partial wave (20 threads in wave32, 40 in wave64) send nothing. A source lane that is off in EXEC reads 0 and an off destination lane keeps its value (RDNA ISA §10.4.4), in wave32 as in wave64. In wave64 the permute also runs as two wave32s: each half reads lanes of its own half. Until 2026-11-21 lanes 32–63 of a 64-wide subgroup read the low half and inactive sources kept their value (`cs_w64x_bpermute`, AMD Radeon 880M); the wave32 path shuffled the raw value until the same day (`cs_bpermute32`: wave32, EXEC without lanes 8–15, so lane 6 reads 0; GPU-checked on RTX 5070 and Radeon 880M). A source lane that doesn't exist, in the missing lanes of a partial wave, also reads 0: the shuffle result is kept only where a ballot of the running invocations has the source lane, since SPIR-V leaves a shuffle from an invocation that isn't running undefined. Before this, RADV returned stale register values that changed between runs (`cs_w64x_partial`, a 40-thread group, native wave64 on AMD RX 6700 XT, RADV Mesa 26.3.1). Writes and atomics run only in active lanes. Indices wrap at the array size, where hardware would return 0 for out-of-range reads. `s_barrier` = `OpControlBarrier` Workgroup/Workgroup, AcquireRelease + WorkgroupMemory. |
++| `ds_append`, `ds_consume` (LDS) | One LDS add (append) or subtract (consume) of the number of lanes on in EXEC, for the whole wave, at the byte address in the offset field; every active lane gets the value before the op, inactive lanes keep vD (`Gen.ds_append`). Measured natively on RDNA2 `gfx1036` (Radeon iGPU of a Ryzen 9 9950X3D, driver 26.10.1, `tools/hw_oracle` raw kernels, wave32 and wave64 with EXEC in both halves): EXEC 0xf0 appends 4 and returns the old value to lanes 4-7 only; lanes 0, 32 and 63 of a wave64 append 3; M0 (0x4, 0x100, 0x10000, 0x40000, 0x80000) does not move the address, the offset alone is it (RDNA1 not measured). The add is done once, by the first active lane (the wave's EXEC gathered as for `s_bcnt1`); the old value reaches the other lanes by a subgroup shuffle from that lane, or an exchange round under `--wave64-emulate`; a wave64 on 32-wide subgroups without emulation is right only in the half of the first active lane (the known cross-half approximation). The `gds` form stays `Unsupported`. **Until 2026-11-22 both raised `Unsupported`.** GPU-checked with `runtime/test/shaders/cs_w32_ds_append.asm` and `cs_w64_ds_append.asm` (words derived in their headers) on that Radeon (wave64 on a native 64-wide subgroup) and an NVIDIA GeForce RTX 5080 (driver 616.92; wave64 with `LEONIDA_W64_EMULATE=1`); done by every active lane instead, both fail (the first append leaves 164 instead of 108). `tests/semantic/test_ds_append.py` checks the count, the performing lane and the returned values (its interpreter keeps one LDS copy per invocation). |
+ | `ds_cmpst_b32` | The non-returning compare-and-store: `M = (M == data0) ? data1 : M`, the same `OpAtomicCompareExchange` as `ds_cmpst_rtn_b32` with the old value dropped (operands vaddr, data0, data1). Source: RDNA2 ISA DS_CMPST_B32. CPU-checked by `tests/semantic/test_lds_atomics_values.py`; GPU-checked by `runtime/test/shaders/cs_lds_b64_cmpst.asm` (hit and miss on an RTX 3070, driver 621.01, Windows 11), and measured on native gfx1100 through `tools/hw_oracle` (hit, miss and hit-to-zero), where GFX11 spells it `ds_cmpstore_b32` with the store value before the compare value. **Not GPU-verified.** GPU-checked by `runtime/test/shaders/cs_lds_b64_cmpst.asm` (hit and miss on an RTX 3070, driver 621.01, Windows 11). |
+ | `ds_cmpst_f32`/`_rtn_f32`, `global_atomic_fcmpswap`, `buffer_atomic_fcmpswap` | `tmp = M; M = (tmp == CMP as binary32) ? DATA : tmp`, and the returning forms give `tmp` (RDNA2 ISA). The compare is a float compare (`OpFOrdEqual`): −0 matches +0, and a NaN never matches, not even the same bits. `OpAtomicCompareExchange` compares bits, so this is a loop (`Gen.float_cmpswap_loop`): read M, pick DATA or M by the float compare, and swap that in if M still holds what was read. Exact under contention. Operands: `ds_cmpst_f32` takes CMP then DATA, as `ds_cmpst_b32`; the global and buffer forms take `vdata` as {DATA, CMP}, as `cmpswap`. Inactive lanes, bounds and `glc` are as for their integer siblings. **Not measured:** subnormal inputs; the interpreter compares them exactly. `_x2` forms stay `Unsupported`; the image form is #2653's. Until 2026-11-22 all four raised `Unsupported`. CPU-checked by `tests/semantic/test_float_cmpswap.py` (±0, NaN, ∞, a subnormal, no `glc`, buffer bounds, 32 lanes on one dword). **Not GPU-verified.** |
+ | LDS ADDTID (`ds_read_addtid_b32`, `ds_write_addtid_b32`) | The LDS forms address one dword at `M0[15:0] + offset + 4 * lane`, where `offset` is an unsigned 16-bit byte offset and `lane` is the invocation index within the RDNA wave. The Workgroup array supplies LDS_BASE. The compute/mesh path uses the ordinary LDS addressing and EXEC guard. The GDS form raises `Unsupported`. Source: RDNA2 ISA §10.4 and §12.13 (opcodes 176/177), LLVM GFX1030 assembly syntax. `tests/semantic/test_lds_addtid.py` compares the two forms with ordinary LDS reads/writes over two waves, including partial EXEC and emulated wave64. |
+diff --git a/runtime/test/shaders/check.py b/runtime/test/shaders/check.py
+index 9be55b366..35eaee302 100644
+--- a/runtime/test/shaders/check.py
++++ b/runtime/test/shaders/check.py
+@@ -106,7 +106,7 @@ SIGNED_ZERO_NAN = [0x80000000, 0x80000000, 0x80008000, 0x00008000, 1, 1, 1, 0x00
+ WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
+                 "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop", "cs_w32_lds_u8_d16", "cs_bpermute32",
+                 "cs_w32_lds_subdword", "cs_w32_lds_wide",
+-                "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
++                "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext", "cs_w32_ds_append",
+                 "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst", "cs_w32_andn2_exec",
+                 "cs_mask_vgpr_exec", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi")
+ # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
+@@ -162,6 +162,9 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
+             # not bit 0 for every lane; word = set lanes | lowest lane << 8 (derivations in each .asm header)
+             ("cs_w32_mask_imm", [2056, 20, 2, 6152, 2050, 4112, 258, 32]),
+             ("cs_w64_mask_imm", [2056, 1084, 828, 2052, 319, 2104, 516, 2064]),
++            # ds_append / ds_consume (derivations in cs_w32/w64_ds_append.asm)
++            ("cs_w32_ds_append", [100, 0xDEAD, 200, 0xDEAD, 108, 197, 108, 140]),
++            ("cs_w64_ds_append", [100, 100, 0xDEAD, 103, 200, 199, 103, 167]),
+             # SHADER-99: -0 and NaN survive translation (SignedZeroInfNanPreserve); words 0, 2, 3 on Apple: see below
+             ("cs_signed_zero_nan", SIGNED_ZERO_NAN),
+             # s_andn2_saveexec_b32 / s_andn2_wrexec_b32: EXEC = S0 & ~EXEC, D old / new EXEC, SCC (cs_w32_andn2_exec.asm)
+diff --git a/runtime/test/shaders/cs_w32_ds_append.asm b/runtime/test/shaders/cs_w32_ds_append.asm
+new file mode 100644
+index 000000000..3ef9dc704
+--- /dev/null
++++ b/runtime/test/shaders/cs_w32_ds_append.asm
+@@ -0,0 +1,63 @@
++; ds_append / ds_consume (LDS): one add (append) or subtract (consume) of the number of lanes on in EXEC, for the whole
++; wave, at the byte address in the offset field; every active lane gets the value before the op, inactive lanes keep
++; vD. Measured natively on RDNA2 gfx1036 (tools/hw_oracle raw kernels): EXEC 0xf0 appends 4 and returns the old 100
++; to lanes 4-7 only; M0 (0x4, 0x100, 0x10000, 0x40000, 0x80000) does not move the address. Until this change both
++; raised Unsupported.
++; LDS words: [0] = 100, [2] (byte 8) = 200, written by every lane first.
++;   EXEC = 0xf0f0 (8 lanes):  ds_append v8          -> v8 = 100 in lanes 4-7, 12-15; LDS[0] = 108
++;   EXEC = 0x7 (3 lanes):     ds_consume v9 offset:8 -> v9 = 200 in lanes 0-2;      LDS[2] = 197
++;   EXEC = all (32 lanes):    ds_append v10          -> v10 = 108 everywhere;       LDS[0] = 140
++; Lane 0 stores:
++;   out[0] v8 of lane 4 = 100       out[1] v8 of lane 0 (off) = 0xdead   out[2] v9 of lane 2 = 200
++;   out[3] v9 of lane 3 (off) = 0xdead   out[4] LDS[0] read by lane 4 after its append = 108
++;   out[5] LDS[2] read by lane 0 after its consume = 197   out[6] v10 of lane 31 = 108   out[7] LDS[0] = 140
++; Done once per lane instead of once per wave, the first append alone would leave 100 + 8 * 8.
++; rsrc2: 0x40088
++; group: 32,1,1
++; Run: vk_compute_test cs_w32_ds_append.spv 1 dump -> out[0..7] = 100 57005 200 57005 108 197 108 140
++; mattr: +wavefrontsize32,-wavefrontsize64
++v_mov_b32_e32 v8, 0xdead
++v_mov_b32_e32 v9, 0xdead
++v_mov_b32_e32 v1, 0
++v_mov_b32_e32 v2, 100
++v_mov_b32_e32 v3, 200
++ds_write_b32 v1, v2
++ds_write_b32 v1, v3 offset:8
++s_waitcnt lgkmcnt(0)
++s_mov_b32 exec_lo, 0xf0f0
++ds_append v8
++s_waitcnt lgkmcnt(0)
++ds_read_b32 v11, v1
++s_waitcnt lgkmcnt(0)
++s_mov_b32 exec_lo, 7
++ds_consume v9 offset:8
++s_waitcnt lgkmcnt(0)
++ds_read_b32 v12, v1 offset:8
++s_waitcnt lgkmcnt(0)
++s_mov_b32 exec_lo, -1
++ds_append v10
++s_waitcnt lgkmcnt(0)
++ds_read_b32 v13, v1
++s_waitcnt lgkmcnt(0)
++v_readlane_b32 s20, v8, 4
++v_readlane_b32 s21, v8, 0
++v_readlane_b32 s22, v9, 2
++v_readlane_b32 s23, v9, 3
++v_readlane_b32 s24, v11, 4
++v_readlane_b32 s25, v12, 0
++v_readlane_b32 s26, v10, 31
++v_readlane_b32 s27, v13, 0
++v_mov_b32_e32 v14, s20
++v_mov_b32_e32 v15, s21
++v_mov_b32_e32 v16, s22
++v_mov_b32_e32 v17, s23
++v_mov_b32_e32 v18, s24
++v_mov_b32_e32 v19, s25
++v_mov_b32_e32 v20, s26
++v_mov_b32_e32 v21, s27
++v_cmpx_eq_u32_e32 0, v0
++v_mov_b32_e32 v22, 0
++buffer_store_dwordx4 v[14:17], v22, s[0:3], 0 offen
++v_mov_b32_e32 v22, 16
++buffer_store_dwordx4 v[18:21], v22, s[0:3], 0 offen
++s_endpgm
+diff --git a/runtime/test/shaders/cs_w64_ds_append.asm b/runtime/test/shaders/cs_w64_ds_append.asm
+new file mode 100644
+index 000000000..ce986774c
+--- /dev/null
++++ b/runtime/test/shaders/cs_w64_ds_append.asm
+@@ -0,0 +1,64 @@
++; ds_append / ds_consume (LDS) in a wave64: one add / subtract of the wave's active-lane count (both halves) at the
++; offset address, the old value to every active lane. Measured natively on RDNA2 gfx1036 (tools/hw_oracle raw
++; kernels): EXEC = lanes 0, 32 and 63 appends 3 and returns 100 to those three lanes. The translator has the first
++; active lane do it and sends the old value to the others (a subgroup shuffle on a 64-wide subgroup, an exchange
++; round under --wave64-emulate). Until this change both raised Unsupported.
++; LDS words: [0] = 100, [2] (byte 8) = 200, written by every lane first.
++;   EXEC = lanes 0, 32, 63:   ds_append v8          -> v8 = 100 in those lanes;       LDS[0] = 103
++;   EXEC = lane 33:           ds_consume v9 offset:8 -> v9 = 200 in lane 33;          LDS[2] = 199
++;   EXEC = all (64 lanes):    ds_append v10          -> v10 = 103 everywhere;         LDS[0] = 167
++; Lane 0 stores:
++;   out[0] v8 of lane 63 = 100     out[1] v8 of lane 32 = 100     out[2] v8 of lane 1 (off) = 0xdead
++;   out[3] LDS[0] read by lane 0 after its append = 103   out[4] v9 of lane 33 = 200
++;   out[5] LDS[2] read by lane 33 after its consume = 199   out[6] v10 of lane 40 = 103   out[7] LDS[0] = 167
++; rsrc2: 0x40088
++; Run: VKC_SUBGROUP_SIZE=64 vk_compute_test cs_w64_ds_append.spv 1 dump --require-wave64
++;   (or translated with --wave64-emulate, on any subgroup size) -> out[0..7] = 100 100 57005 103 200 199 103 167
++; mattr: +wavefrontsize64,-wavefrontsize32
++v_mov_b32_e32 v8, 0xdead
++v_mov_b32_e32 v9, 0xdead
++v_mov_b32_e32 v1, 0
++v_mov_b32_e32 v2, 100
++v_mov_b32_e32 v3, 200
++ds_write_b32 v1, v2
++ds_write_b32 v1, v3 offset:8
++s_waitcnt lgkmcnt(0)
++s_mov_b32 exec_lo, 1
++s_mov_b32 exec_hi, 0x80000001
++ds_append v8
++s_waitcnt lgkmcnt(0)
++ds_read_b32 v11, v1
++s_waitcnt lgkmcnt(0)
++s_mov_b32 exec_lo, 0
++s_mov_b32 exec_hi, 2
++ds_consume v9 offset:8
++s_waitcnt lgkmcnt(0)
++ds_read_b32 v12, v1 offset:8
++s_waitcnt lgkmcnt(0)
++s_mov_b64 exec, -1
++ds_append v10
++s_waitcnt lgkmcnt(0)
++ds_read_b32 v13, v1
++s_waitcnt lgkmcnt(0)
++v_readlane_b32 s20, v8, 63
++v_readlane_b32 s21, v8, 32
++v_readlane_b32 s22, v8, 1
++v_readlane_b32 s23, v11, 0
++v_readlane_b32 s24, v9, 33
++v_readlane_b32 s25, v12, 33
++v_readlane_b32 s26, v10, 40
++v_readlane_b32 s27, v13, 0
++v_mov_b32_e32 v14, s20
++v_mov_b32_e32 v15, s21
++v_mov_b32_e32 v16, s22
++v_mov_b32_e32 v17, s23
++v_mov_b32_e32 v18, s24
++v_mov_b32_e32 v19, s25
++v_mov_b32_e32 v20, s26
++v_mov_b32_e32 v21, s27
++v_cmpx_eq_u32_e32 0, v0
++v_mov_b32_e32 v22, 0
++buffer_store_dwordx4 v[14:17], v22, s[0:3], 0 offen
++v_mov_b32_e32 v22, 16
++buffer_store_dwordx4 v[18:21], v22, s[0:3], 0 offen
++s_endpgm
+diff --git a/scripts/run_gpu_tests.py b/scripts/run_gpu_tests.py
+index b766f2a78..cecd2c54a 100644
+--- a/scripts/run_gpu_tests.py
++++ b/scripts/run_gpu_tests.py
+@@ -1133,7 +1133,7 @@ def run_suite(a, work: str) -> int:
+             # Whole-wave mask test, as in check.py: needs a 64-wide subgroup, skipped where the device has none.
+             # With LEONIDA_W64_EMULATE=1 it was translated with --wave64-emulate and runs on any subgroup size.
+             results.append((name,) + wavemask_check(vk_compute, spv, cs_env, w64_emulated()))
+-        elif name in ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_w32_sincos", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi", "cs_exec_const", "cs_w32_mask_imm", "cs_w64_mask_imm", "cs_w32_lds_u8_d16", "cs_w32_lds_subdword", "cs_w32_lds_wide", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
++        elif name in ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute", "cs_w32_sincos", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi", "cs_exec_const", "cs_w32_ds_append", "cs_w64_ds_append", "cs_w32_mask_imm", "cs_w64_mask_imm", "cs_w32_lds_u8_d16", "cs_w32_lds_subdword", "cs_w32_lds_wide", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_wave64_ballot", "cs_wm_half_ops", "cs_wm_half_cmp", "cs_wm_bfm64", "cs_wm_scc_rfl", "cs_wqm_w64", "cs_wqm_w32", "cs_wqm_w64_half",
+                       "cs_dpp", "cs_dpp_row", "cs_dpp_mask", "cs_dpp8", "cs_dpp_ops", "cs_dpp_bank", "cs_dpp_fi",
+                       "cs_dpp_bound", "cs_dpp_w64",
+                       "cs_w64_mask_detect",
+@@ -1182,6 +1182,9 @@ def run_suite(a, work: str) -> int:
+                 # constant lane masks: lane L takes bit L (cs_w32_mask_imm.asm / cs_w64_mask_imm.asm headers)
+                 "cs_w32_mask_imm": [2056, 20, 2, 6152, 2050, 4112, 258, 32],
+                 "cs_w64_mask_imm": [2056, 1084, 828, 2052, 319, 2104, 516, 2064],
++                # ds_append / ds_consume (cs_w32/w64_ds_append.asm)
++                "cs_w32_ds_append": [100, 0xDEAD, 200, 0xDEAD, 108, 197, 108, 140],
++                "cs_w64_ds_append": [100, 100, 0xDEAD, 103, 200, 199, 103, 167],
+                 "cs_dpp": [1, 0, 3, 2, 5, 4, 7, 6],
+                 "cs_dpp_row": [0, 0, 1, 2, 3, 4, 5, 6],
+                 "cs_dpp_mask": [1, 0, 3, 2, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE, 0xEEEEEEEE],
+@@ -1253,7 +1256,7 @@ def run_suite(a, work: str) -> int:
+             partial = name in ("cs_w64x_partial", "cs_w64x_partial_scmp")
+             wave64 = name not in ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2",
+                                   "cs_w32_permute", "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop",
+-                                  "cs_w32_lds_u8_d16", "cs_w32_int_ext", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops",
++                                  "cs_w32_lds_u8_d16", "cs_w32_int_ext", "cs_w32_ds_append", "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops",
+                                   "cs_w32_lds_subdword", "cs_w32_lds_wide",
+                                   "cs_bpermute32", "cs_w32_partial_scmp", "cs_w32_permlane_fi", "cs_w32_sincos", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap",
+                                   "cs_lds_b64_cmpst", "cs_exec_const", "cs_w32_mask_imm", "cs_mask_vgpr_exec",
+diff --git a/tests/semantic/fixtures/disasm/cs_w32_ds_append.s b/tests/semantic/fixtures/disasm/cs_w32_ds_append.s
+new file mode 100644
+index 000000000..42ddb2b56
+--- /dev/null
++++ b/tests/semantic/fixtures/disasm/cs_w32_ds_append.s
+@@ -0,0 +1,46 @@
++; cs_w32_ds_append  test fixture generated by tests/semantic/regen_fixtures.py from runtime/test/shaders/cs_w32_ds_append.asm
++	v_mov_b32_e32 v8, 0xdead
++	v_mov_b32_e32 v9, 0xdead
++	v_mov_b32_e32 v1, 0
++	v_mov_b32_e32 v2, 100
++	v_mov_b32_e32 v3, 200
++	ds_write_b32 v1, v2
++	ds_write_b32 v1, v3 offset:8
++	s_waitcnt lgkmcnt(0)
++	s_mov_b32 exec_lo, 0xf0f0
++	ds_append v8
++	s_waitcnt lgkmcnt(0)
++	ds_read_b32 v11, v1
++	s_waitcnt lgkmcnt(0)
++	s_mov_b32 exec_lo, 7
++	ds_consume v9 offset:8
++	s_waitcnt lgkmcnt(0)
++	ds_read_b32 v12, v1 offset:8
++	s_waitcnt lgkmcnt(0)
++	s_mov_b32 exec_lo, -1
++	ds_append v10
++	s_waitcnt lgkmcnt(0)
++	ds_read_b32 v13, v1
++	s_waitcnt lgkmcnt(0)
++	v_readlane_b32 s20, v8, 4
++	v_readlane_b32 s21, v8, 0
++	v_readlane_b32 s22, v9, 2
++	v_readlane_b32 s23, v9, 3
++	v_readlane_b32 s24, v11, 4
++	v_readlane_b32 s25, v12, 0
++	v_readlane_b32 s26, v10, 31
++	v_readlane_b32 s27, v13, 0
++	v_mov_b32_e32 v14, s20
++	v_mov_b32_e32 v15, s21
++	v_mov_b32_e32 v16, s22
++	v_mov_b32_e32 v17, s23
++	v_mov_b32_e32 v18, s24
++	v_mov_b32_e32 v19, s25
++	v_mov_b32_e32 v20, s26
++	v_mov_b32_e32 v21, s27
++	v_cmpx_eq_u32_e32 0, v0
++	v_mov_b32_e32 v22, 0
++	buffer_store_dwordx4 v[14:17], v22, s[0:3], 0 offen
++	v_mov_b32_e32 v22, 16
++	buffer_store_dwordx4 v[18:21], v22, s[0:3], 0 offen
++	s_endpgm
+diff --git a/tests/semantic/fixtures/disasm/cs_w64_ds_append.s b/tests/semantic/fixtures/disasm/cs_w64_ds_append.s
+new file mode 100644
+index 000000000..3ceca942f
+--- /dev/null
++++ b/tests/semantic/fixtures/disasm/cs_w64_ds_append.s
+@@ -0,0 +1,48 @@
++; cs_w64_ds_append  test fixture generated by tests/semantic/regen_fixtures.py from runtime/test/shaders/cs_w64_ds_append.asm
++	v_mov_b32_e32 v8, 0xdead
++	v_mov_b32_e32 v9, 0xdead
++	v_mov_b32_e32 v1, 0
++	v_mov_b32_e32 v2, 100
++	v_mov_b32_e32 v3, 200
++	ds_write_b32 v1, v2
++	ds_write_b32 v1, v3 offset:8
++	s_waitcnt lgkmcnt(0)
++	s_mov_b32 exec_lo, 1
++	s_mov_b32 exec_hi, 0x80000001
++	ds_append v8
++	s_waitcnt lgkmcnt(0)
++	ds_read_b32 v11, v1
++	s_waitcnt lgkmcnt(0)
++	s_mov_b32 exec_lo, 0
++	s_mov_b32 exec_hi, 2
++	ds_consume v9 offset:8
++	s_waitcnt lgkmcnt(0)
++	ds_read_b32 v12, v1 offset:8
++	s_waitcnt lgkmcnt(0)
++	s_mov_b64 exec, -1
++	ds_append v10
++	s_waitcnt lgkmcnt(0)
++	ds_read_b32 v13, v1
++	s_waitcnt lgkmcnt(0)
++	v_readlane_b32 s20, v8, 63
++	v_readlane_b32 s21, v8, 32
++	v_readlane_b32 s22, v8, 1
++	v_readlane_b32 s23, v11, 0
++	v_readlane_b32 s24, v9, 33
++	v_readlane_b32 s25, v12, 33
++	v_readlane_b32 s26, v10, 40
++	v_readlane_b32 s27, v13, 0
++	v_mov_b32_e32 v14, s20
++	v_mov_b32_e32 v15, s21
++	v_mov_b32_e32 v16, s22
++	v_mov_b32_e32 v17, s23
++	v_mov_b32_e32 v18, s24
++	v_mov_b32_e32 v19, s25
++	v_mov_b32_e32 v20, s26
++	v_mov_b32_e32 v21, s27
++	v_cmpx_eq_u32_e32 0, v0
++	v_mov_b32_e32 v22, 0
++	buffer_store_dwordx4 v[14:17], v22, s[0:3], 0 offen
++	v_mov_b32_e32 v22, 16
++	buffer_store_dwordx4 v[18:21], v22, s[0:3], 0 offen
++	s_endpgm
+diff --git a/tests/semantic/regen_fixtures.py b/tests/semantic/regen_fixtures.py
+index 6dd8726d1..6758c2d5b 100644
+--- a/tests/semantic/regen_fixtures.py
++++ b/tests/semantic/regen_fixtures.py
+@@ -28,6 +28,7 @@ SHADERS = ("cs_smem_bounds", "cs_smem_stride_align", "cs_smem_sload_neg", "cs_sm
+            "ps_f32_mods", "ps_f64_mods", "ps_sff_imm", "cs_w32_lds_u8_d16", "cs_w32_lane_wrap", "ps_bary",
+            "cs_w32_lds_subdword", "cs_w32_lds_wide",
+            "cs_oob_select", "cs_oob_tail", "cs_global_mem_ext", "cs_w32_mask_imm", "cs_w64_mask_imm",
++           "cs_w32_ds_append", "cs_w64_ds_append",   # ds_append / ds_consume (test_ds_append.py)
+            "cs_buf_swizzle",   # swizzled MUBUF / ADD_TID (test_buffer_swizzle.py)
+            "cs_tbuffer_store",                 # tbuffer_store_format_*, words measured natively on a Radeon 680M
+            # TEST-175: GPU fixtures for the docs/design.md rules that were checked on the CPU only
+diff --git a/tests/semantic/test_ds_append.py b/tests/semantic/test_ds_append.py
+new file mode 100644
+index 000000000..844114833
+--- /dev/null
++++ b/tests/semantic/test_ds_append.py
+@@ -0,0 +1,85 @@
++"""ds_append / ds_consume (runtime/test/shaders/cs_w32_ds_append.asm, cs_w64_ds_append.asm; docs/design.md).
++
++One LDS add / subtract of the wave's active-lane count at the offset address, done by the first active lane; every
++active lane gets the old value, inactive lanes keep vD. tests/semantic/spirv_mini_interp.py gives every invocation
++its own LDS (run_workgroup does not share Workgroup memory), so these tests check the parts that do not need shared
++LDS: the count, which lane performs the op (only its LDS copy changes), the returned value in every active lane, and
++the inactive lanes. The shared-LDS words are the GPU fixtures' (both GPUs, wave64 native and emulated). Before, both
++raised Unsupported.
++"""
++import os
++import sys
++import unittest
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++if HERE not in sys.path:
++    sys.path.insert(0, HERE)
++
++import support  # noqa: E402
++import spirv_mini_interp as si  # noqa: E402
++import rdna2spirv  # noqa: E402
++
++SHADERS = os.path.join(support.ROOT, "runtime", "test", "shaders")
++VSHARP = [0, 0, 0xFFFFFFFF, 0x31016FAC]
++
++
++def header(name):
++    sys.path.insert(0, SHADERS)
++    from compute_fixture import compute_header
++    return bytes(compute_header(os.path.join(SHADERS, name + ".asm")))
++
++
++def run(wave, exec_words, op="ds_append", off=0):
++    """LDS word [off] = 100 in every invocation's copy; EXEC = exec_words; `op` v8; every lane stores
++    (v8, its LDS word) at 8 * lane. Returns [(v8, lds) per lane]."""
++    lines = ["v_mov_b32 v8, 0xdead", "v_mov_b32 v1, 0", "v_mov_b32 v2, 100", f"ds_write_b32 v1, v2 offset:{off}"]
++    lines += [f"s_mov_b32 exec_lo, {exec_words[0]:#x}"] + ([f"s_mov_b32 exec_hi, {exec_words[1]:#x}"] if wave == 64 else [])
++    lines += [f"{op} v8 offset:{off}" if off else f"{op} v8",
++              "s_mov_b64 exec, -1" if wave == 64 else "s_mov_b32 exec_lo, -1",
++              f"ds_read_b32 v9, v1 offset:{off}", "v_lshlrev_b32 v21, 3, v0",
++              "buffer_store_dwordx2 v[8:9], v21, s[0:3], 0 offen", "s_endpgm"]
++    hdr = bytearray(header("cs_w64_ds_append" if wave == 64 else "cs_w32_ds_append"))
++    spv = support.translate_lines(f"cs_dsapp{wave}", lines, fssm=bytes(hdr))
++    memory = {}
++    si.run_workgroup(spv, wave, wave, inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i},
++                     push_constants=VSHARP + [0] * 28, memory=memory)
++    return [(memory[8 * l], memory[8 * l + 4]) for l in range(wave)]
++
++
++def expect(wave, exec_bits, op):
++    """Plain-Python reference (shared LDS seen from the performing lane): the first active lane's LDS changes by the
++    active count, every active lane returns the old value, inactive lanes keep 0xdead."""
++    act = [l for l in range(wave) if exec_bits >> l & 1]
++    cnt = len(act)
++    out = []
++    for l in range(wave):
++        ret = 100 if l in act else 0xDEAD
++        lds = (100 + cnt if op == "ds_append" else 100 - cnt) & 0xFFFFFFFF if act and l == act[0] else 100
++        out.append((ret, lds))
++    return out
++
++
++class DsAppend(unittest.TestCase):
++    def test_wave32(self):
++        for bits, op in ((0xF0F0, "ds_append"), (0x7, "ds_consume"), (0xFFFFFFFF, "ds_append"), (0x80000000, "ds_consume")):
++            with self.subTest(exec=hex(bits), op=op):
++                self.assertEqual(run(32, (bits,), op), expect(32, bits, op))
++
++    def test_wave64_both_halves(self):
++        for bits, op in (((1 << 63) | (1 << 32) | 1, "ds_append"), (1 << 33, "ds_consume")):
++            with self.subTest(exec=hex(bits), op=op):
++                self.assertEqual(run(64, (bits & 0xFFFFFFFF, bits >> 32), op), expect(64, bits, op))
++
++    def test_offset_is_the_address(self):
++        self.assertEqual(run(32, (0x3,), "ds_append", off=8), expect(32, 0x3, "ds_append"))
++
++    def test_fixtures_translate_and_gds_is_refused(self):
++        for name in ("cs_w32_ds_append", "cs_w64_ds_append"):
++            with self.subTest(fixture=name):
++                self.assertIn("OpAtomicIAdd", support.translate_fixture(name, fssm=header(name)))
++        with self.assertRaisesRegex(rdna2spirv.Unsupported, "ds_append gds"):
++            support.translate_lines("cs_dsapp_gds", ["ds_append v8 gds", "s_endpgm"], fssm=header("cs_w32_ds_append"))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tools/rdna2spirv.py b/tools/rdna2spirv.py
+index 13c2e12d5..7d7193392 100644
+--- a/tools/rdna2spirv.py
++++ b/tools/rdna2spirv.py
+@@ -4521,6 +4521,60 @@ class Gen:
+             return v
+         return self.lds_access(addr, byte_off, f)
+ 
++    def ds_append(self, op, a, mods):
++        """ds_append / ds_consume vD [offset:N]: one LDS add (append) or subtract (consume) of the number of lanes on in
++        EXEC, for the whole wave, at the byte address N; every active lane gets the value before the op, inactive lanes
++        keep vD. Measured natively on RDNA2 gfx1036 (hunt6 hw_append.py, wave32 and wave64 with EXEC across both
++        halves): the address is the offset field alone, M0 (0x4, 0x100, 0x10000, 0x40000, 0x80000) does not move it.
++        The add is done once, by the first active lane of the wave (the wave's EXEC gathered as for s_bcnt1); the old
++        value reaches the other lanes by a subgroup shuffle from that lane, or an exchange round under
++        --wave64-emulate (a wave64 on 32-wide subgroups without it: right in the half of the first active lane only,
++        the known cross-half approximation). The gds form is refused."""
++        if "gds" in mods:
++            raise Unsupported(op + " gds")
++        if not a or a[0]["k"] != "vgpr":
++            raise Unsupported(op + " operands")
++        off = self.mod_int(mods, "offset", 0)
++        lo, hi = self.wave_mask({"k": "special", "t": "exec"})
++        cl, ch, cnt, lz, hz, l, h, h32, fh, first, lane, me, act, do = (self.tmp() for _ in range(14))
++        self.emit(f"{cl} = OpBitCount %uint {lo}")
++        self.emit(f"{ch} = OpBitCount %uint {hi}")
++        self.emit(f"{cnt} = OpIAdd %uint {cl} {ch}")
++        self.emit(f"{lz} = OpINotEqual %bool {lo} {self.cu(0)}")
++        self.emit(f"{hz} = OpINotEqual %bool {hi} {self.cu(0)}")
++        self.emit(f"{l} = OpExtInst %uint %glsl FindILsb {lo}")
++        self.emit(f"{h} = OpExtInst %uint %glsl FindILsb {hi}")
++        self.emit(f"{h32} = OpIAdd %uint {h} {self.cu(32)}")
++        self.emit(f"{fh} = OpSelect %uint {hz} {h32} {self.cu(64)}")      # no lane on: 64, nobody's lane
++        self.emit(f"{first} = OpSelect %uint {lz} {l} {fh}")
++        self.emit(f"{lane} = OpCopyObject %uint {self.wave_lane()}")
++        self.emit(f"{me} = OpIEqual %bool {lane} {first}")
++        self.emit(f"{act} = OpCopyObject %bool {self.active_b()}")
++        self.emit(f"{do} = OpLogicalAnd %bool {me} {act}")
++        lbl_do, lbl_end = self.tmp() + "_do", self.tmp() + "_end"
++        pre = self.current_label_placeholder()
++        self.emit(f"OpSelectionMerge {lbl_end} None")
++        self.emit(f"OpBranchConditional {do} {lbl_do} {lbl_end}")
++        self.emit(f"{lbl_do} = OpLabel")
++        spv = "OpAtomicIAdd" if op == "ds_append" else "OpAtomicISub"
++        r = self.lds_atomic(self.cu(0), off, f"{spv} %uint {{p}} {self.cu(2)} {self.cu(0)} {cnt}")
++        done = self.current_label_placeholder()
++        self.emit(f"OpBranch {lbl_end}")
++        self.emit(f"{lbl_end} = OpLabel")
++        old = self.tmp()
++        self.emit(f"{old} = OpPhi %uint {r} {done} {self.cu(0)} {pre}")
++        if self.emulate:
++            read, _ = self.x_round(data=old)
++            fi = self.tmp()
++            self.emit(f"{fi} = OpBitwiseAnd %uint {first} {self.cu(63)}")
++            val = read(fi)
++        else:
++            self.uses_subgroup = self.uses_ballot = True
++            fi, val = self.tmp(), self.tmp()
++            self.emit(f"{fi} = OpBitwiseAnd %uint {first} {self.cu(63 if self.wave64 else 31)}")
++            self.emit(f"{val} = OpGroupNonUniformShuffle %uint {self.cu(3)} {old} {fi}")
++        self.dst(a[0], val)
++
+     def lds_op(self, op, a, mods):
+         """LDS (GFX10 DS encoding). Addresses are bytes. offset:N is bytes; read2/write2 offset0/offset1 count
+         data-size units (x64 for st64). Writes and atomics run only in active lanes; results land in VGPRs through
+@@ -4528,6 +4582,8 @@ class Gen:
+         if self.stage not in ("cs", "ms"):
+             raise Unsupported(op + " outside compute")
+         self.uses_lds = True
++        if op in ("ds_append", "ds_consume"):
++            return self.ds_append(op, a, mods)          # wave-wide: before the per-lane EXEC selection below
+         rtn = "_rtn_" in op
+         name = op if op == "ds_wrxchg_rtn_b32" else op.replace("_rtn_", "_")
+         act = self.active_b()
+-- 
+2.54.0
+

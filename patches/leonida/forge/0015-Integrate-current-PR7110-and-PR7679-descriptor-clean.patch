@@ -1,0 +1,61 @@
+From ebfdfff5e5d389b27ae597aab3b131ccd38a006c Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 21:31:55 +0100
+Subject: [PATCH 15/19] Integrate current PR7110 and PR7679 descriptor cleaning
+ while retaining clang-compatible layout constants
+
+Reuse NiiRoZz descriptor cleaner from7c1dc142e42d1a964033e8fd1be478a2438f4277. Depth-stencil UAV capability remains an explicitly incomplete compatibility path; layout0x102/0x105 now normalizes consistently.
+---
+ runtime/shims/d3d12_xs_desc_clean.h | 31 +++++++++++++++++++++++++++--
+ 1 file changed, 29 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/shims/d3d12_xs_desc_clean.h b/runtime/shims/d3d12_xs_desc_clean.h
+index 63fdb8a44..2b7a3a715 100644
+--- a/runtime/shims/d3d12_xs_desc_clean.h
++++ b/runtime/shims/d3d12_xs_desc_clean.h
+@@ -42,13 +42,40 @@ inline std::uint32_t pc_resource_flags(D3D12_RESOURCE_DIMENSION dimension, std::
+ }
+ 
+ // Strip Xbox-only flags and translate the Xbox tiled layout. Preserve all other layouts so the host can validate them.
++inline bool is_depth_resource_format(DXGI_FORMAT format) {
++    switch (format) {
++        case DXGI_FORMAT_D16_UNORM:
++        case DXGI_FORMAT_D24_UNORM_S8_UINT:
++        case DXGI_FORMAT_D32_FLOAT:
++        case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
++        case DXGI_FORMAT_R16_TYPELESS:
++        case DXGI_FORMAT_R24G8_TYPELESS:
++        case DXGI_FORMAT_R32_TYPELESS:
++        case DXGI_FORMAT_R32G8X24_TYPELESS:
++            return true;
++        default:
++            return false;
++    }
++}
++
++// Strip Xbox-only flags and preserve the three supported PC layouts. In addition to 0x101, zebraso measured
++// layout words 0x102 and 0x105 reaching slot 25 during a retail boot.
+ inline D3D12_RESOURCE_DESC pc_resource_desc(const D3D12_RESOURCE_DESC& xbox) {
+     D3D12_RESOURCE_DESC pc = xbox;
+-    if (static_cast<std::uint32_t>(pc.Layout) == kXboxTiledResourceLayout) {
++    if (pc.Layout != D3D12_TEXTURE_LAYOUT_UNKNOWN &&
++        pc.Layout != D3D12_TEXTURE_LAYOUT_ROW_MAJOR &&
++        pc.Layout != D3D12_TEXTURE_LAYOUT_64KB_STANDARD_SWIZZLE) {
+         pc.Layout = pc.Dimension == D3D12_RESOURCE_DIMENSION_BUFFER ? D3D12_TEXTURE_LAYOUT_ROW_MAJOR
+                                                                    : D3D12_TEXTURE_LAYOUT_UNKNOWN;
+     }
+-    pc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(pc_resource_flags(xbox.Dimension, static_cast<std::uint32_t>(xbox.Flags)));
++    std::uint32_t flags = static_cast<std::uint32_t>(xbox.Flags) & kPcResourceFlagsMask;
++    // zebraso measured slot 25 rejecting B5G5R5A1 render targets with UAV on an RTX 5080 without
++    // storage-image support for that format. Depth-stencil resources also cannot be UAVs on PC.
++    if (pc.Format == DXGI_FORMAT_B5G5R5A1_UNORM ||
++        ((flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) && is_depth_resource_format(pc.Format))) {
++        flags &= ~static_cast<std::uint32_t>(D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
++    }
++    pc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(flags);
+     return pc;
+ }
+ 
+-- 
+2.54.0
+

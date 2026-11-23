@@ -1,0 +1,25 @@
+From 89f69c321ee3f2d7dc2eb4371dccab5c2e65efcf Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 21:23:21 +0100
+Subject: [PATCH 11/19] Feed actual native pipeline completions to the
+ loading-window status
+
+---
+ runtime/shims/d3d12_xs_device.cpp | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index 82b485383..7b54ce681 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -3182,6 +3182,7 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const
+     const HRESULT hr = self->real->CreateComputePipelineState(&pc_desc, *riid, out);
+     static std::atomic<std::uint64_t> completed{0};
+     const std::uint64_t done = completed.fetch_add(1, std::memory_order_relaxed) + 1;
++    if (done == 1 || done % 128 == 0) report_native_pipeline_progress(done);
+     if (done == 1 || done % 128 == 0)
+         std::fprintf(stderr, "[rt] native compute progress: completed=%llu last_call=%llu result=0x%08lx duration_ms=%llu\n",
+                      static_cast<unsigned long long>(done), static_cast<unsigned long long>(call),
+-- 
+2.54.0
+

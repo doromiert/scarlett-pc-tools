@@ -1,7 +1,7 @@
 From fb5806d848dfc4890556df10fa53700272af4dad Mon Sep 17 00:00:00 2001
 From: doromiert <doromiert@gmail.com>
 Date: Mon, 23 Nov 2026 20:19:41 +0100
-Subject: [PATCH 07/10] Add opt-in GPU frame readback statistics for actual
+Subject: [PATCH 07/13] Add opt-in GPU frame readback statistics for actual
  presentation diagnosis
 
 ---

@@ -1,7 +1,7 @@
 From f1acd36b4961524ce3a94511a205b43ecd370293 Mon Sep 17 00:00:00 2001
 From: Kelebek <berkantkelebek2@gmail.com>
 Date: Mon, 23 Nov 2026 19:06:16 +0300
-Subject: [PATCH 02/10] DirectStorage: inflate zlib requests (file and memory
+Subject: [PATCH 02/13] DirectStorage: inflate zlib requests (file and memory
  sources)
 
 A request with ZlibDecompress alone now reads SourceSize bytes of the file or of memory into a staging buffer,

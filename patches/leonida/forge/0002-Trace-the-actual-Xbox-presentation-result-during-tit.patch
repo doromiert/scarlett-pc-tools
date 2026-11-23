@@ -1,0 +1,36 @@
+From 450425788238d92079e6649cc65644e26ba318b0 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 20:12:38 +0100
+Subject: [PATCH 02/19] Trace the actual Xbox presentation result during title
+ execution
+
+---
+ runtime/shims/d3d12_xs_device.cpp | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index 4d895161c..18359fee1 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -1427,10 +1427,16 @@ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::
+                               std::uint64_t params) {
+     PresentState* state = self->device ? present_state_for(self->device) : nullptr;
+     if (!state || !state->xbox) return hr_to_u64(S_OK);  // a title still runs with nothing presented
+-    return hr_to_u64(state->xbox->PresentX(
++    const HRESULT result = state->xbox->PresentX(
+         static_cast<UINT>(plane_count),
+         reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(planes),
+-        reinterpret_cast<const rt::d3d12::XboxPresentParameters*>(params)));
++        reinterpret_cast<const rt::d3d12::XboxPresentParameters*>(params));
++    d3d12_trace::result("XboxID3D12CommandQueue::PresentX", result);
++    static std::atomic<bool> logged{false};
++    if (!logged.exchange(true))
++        std::fprintf(stderr, "[rt] PresentX first result 0x%08lx, planes=%llu\n",
++                     static_cast<unsigned long>(result), static_cast<unsigned long long>(plane_count));
++    return hr_to_u64(result);
+ }
+ 
+ #else  // !LEONIDA_VULKAN_DEVICE: this translation unit stands alone (mock and COM tests)
+-- 
+2.54.0
+

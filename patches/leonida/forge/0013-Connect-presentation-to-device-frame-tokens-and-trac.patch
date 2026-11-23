@@ -1,0 +1,40 @@
+From 568c7928f03bc4659795d37b05788b324773480e Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 21:26:26 +0100
+Subject: [PATCH 13/19] Connect presentation to device frame tokens and trace
+ actual allocation refusals
+
+---
+ runtime/shims/d3d12_xs_device.cpp | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index 3ef838711..baf3b45ba 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -1558,7 +1558,7 @@ PresentState* present_state_for(DeviceProxy* device) {
+         std::fprintf(stderr, "[rt] d3d12_xs: no window presenter on this device; PresentX is a no-op\n");
+         return state;
+     }
+-    state->xbox = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter));
++    state->xbox = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter), nullptr, device->frame_tokens);
+     std::fprintf(stderr, "[rt] d3d12_xs: PresentX ready (window %p)\n", static_cast<void*>(window));
+     return state;
+ }
+@@ -4073,6 +4073,13 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t
+     }
+     const UINT mask = static_cast<UINT>(visible_mask);
+     D3D12_RESOURCE_ALLOCATION_INFO info = real->GetResourceAllocationInfo(mask, desc_count, descs);
++    if (info.SizeInBytes == UINT64_MAX && descs && desc_count) {
++        const auto& d = descs[0];
++        std::fprintf(stderr, "[rt] allocation refusal: count=%u dim=%u width=%llu height=%u depth=%u format=%u flags=0x%x layout=0x%x\n",
++                     desc_count, static_cast<unsigned>(d.Dimension), static_cast<unsigned long long>(d.Width),
++                     d.Height, static_cast<unsigned>(d.DepthOrArraySize), static_cast<unsigned>(d.Format),
++                     static_cast<unsigned>(d.Flags), static_cast<unsigned>(d.Layout));
++    }
+     apply_console_placement(descs, desc_count, info, nullptr,
+                             [&](UINT i) { return real->GetResourceAllocationInfo(mask, 1, &descs[i]); }, 25);
+     *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = info;
+-- 
+2.54.0
+

@@ -1,7 +1,7 @@
 From ef02a6c35da593151cf2ecaeccfdb73e14a96680 Mon Sep 17 00:00:00 2001
 From: doromiert <doromiert@gmail.com>
 Date: Mon, 23 Nov 2026 19:58:02 +0100
-Subject: [PATCH 01/10] Use console texture footprints for bookkeeping while
+Subject: [PATCH 01/13] Use console texture footprints for bookkeeping while
  preserving native buffer backing
 
 ---

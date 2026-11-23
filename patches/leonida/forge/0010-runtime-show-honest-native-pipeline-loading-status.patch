@@ -1,0 +1,135 @@
+From b480a9640ef0395b0c8897f9722ee29cbae281f3 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 21:16:02 +0100
+Subject: [PATCH 10/19] runtime: show honest native pipeline loading status
+
+---
+ runtime/shims/d3d12_xs_device.cpp | 29 +++++++++++++++++++++++++++--
+ runtime/shims/title_boot_status.h | 10 ++++++++++
+ runtime/shims/title_window.cpp    |  4 ++--
+ 3 files changed, 39 insertions(+), 4 deletions(-)
+ create mode 100644 runtime/shims/title_boot_status.h
+
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index 8b465d0ba..82b485383 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -29,6 +29,7 @@
+ #include "d3d12_xs_desc_clean.h"
+ #include "d3d12_xs_pso_stream.h"
+ #include "d3d12_xs_native_pso.h"
++#include "title_boot_status.h"
+ #include "../src/shader_library.h"  // leonida::fspx_payload_from_parts for slot 67
+ 
+ #ifdef LEONIDA_VULKAN_DEVICE
+@@ -49,6 +50,7 @@
+ #include <cstdint>
+ #include <cstdio>
+ #include <cstdlib>
++#include <cwchar>
+ #include <cstring>
+ #include <iterator>
+ #include <limits>
+@@ -63,6 +65,15 @@
+ #include "d3d12_xs_command_list_iid.h"
+ 
+ namespace rt::d3d12_xs {
++
++static std::atomic<std::uint64_t> g_native_pipeline_progress{0};
++
++void report_native_pipeline_progress(std::uint64_t completed) {
++    std::uint64_t current = g_native_pipeline_progress.load(std::memory_order_relaxed);
++    while (current < completed &&
++           !g_native_pipeline_progress.compare_exchange_weak(current, completed, std::memory_order_relaxed)) {}
++}
++
+ namespace {
+ 
+ // The retail title calls device slots well past ID3D12Device14 (slot 133 at least); every slot past the PC device's
+@@ -1378,6 +1389,7 @@ std::uint64_t queue_execute_command_lists(ChildProxy* self, std::uint64_t count_
+ 
+ struct PresentState {
+     static constexpr UINT kDestroyWindowMessage = WM_APP + 1;
++    static constexpr UINT_PTR kProgressTimer = 1;
+ 
+     ~PresentState();
+     HWND window = nullptr;
+@@ -1388,6 +1400,7 @@ struct PresentState {
+     std::condition_variable window_ready;
+     bool window_started = false;
+     std::atomic<bool> close_requested{false};
++    std::uint64_t caption_progress = 0;
+ 
+     void post_destroy_window();
+     void finish_close();
+@@ -1419,6 +1432,16 @@ LRESULT CALLBACK present_window_proc(HWND window, UINT message, WPARAM wparam, L
+     if (message == WM_NCCREATE) {
+         state = static_cast<PresentState*>(reinterpret_cast<CREATESTRUCTW*>(lparam)->lpCreateParams);
+         SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
++    } else if (message == WM_TIMER && state && wparam == PresentState::kProgressTimer) {
++        const std::uint64_t completed = g_native_pipeline_progress.load(std::memory_order_relaxed);
++        if (completed != state->caption_progress) {
++            state->caption_progress = completed;
++            wchar_t caption[96]{};
++            std::swprintf(caption, std::size(caption), L"Leonida — loading game; %llu native pipelines ready",
++                          static_cast<unsigned long long>(completed));
++            SetWindowTextW(window, caption);
++        }
++        return 0;
+     } else if (message == WM_CLOSE) {
+         if (state) {
+             ShowWindow(window, SW_HIDE);  // visible feedback now; the render thread releases the surface before destroy
+@@ -1486,8 +1509,8 @@ void present_window_thread(PresentState* state) {
+     const LONG outer_height = outer.bottom - outer.top;
+     const int x = work_area.left + (work_area.right - work_area.left - outer_width) / 2;
+     const int y = work_area.top + (work_area.bottom - work_area.top - outer_height) / 2;
+-    HWND window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", style, x, y, outer_width, outer_height,
+-                                  nullptr, nullptr, window_class.hInstance, state);
++    HWND window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida — starting game", style, x, y,
++                                  outer_width, outer_height, nullptr, nullptr, window_class.hInstance, state);
+     if (!window)
+         std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
+     {
+@@ -1499,6 +1522,8 @@ void present_window_thread(PresentState* state) {
+     if (!window) return;
+ 
+     UpdateWindow(window);
++    if (!SetTimer(window, PresentState::kProgressTimer, 200, nullptr))
++        std::fprintf(stderr, "[rt] d3d12_xs: PresentX loading-caption timer failed (error %lu)\n", GetLastError());
+     MSG message{};
+     while (GetMessageW(&message, nullptr, 0, 0) > 0) {
+         TranslateMessage(&message);
+diff --git a/runtime/shims/title_boot_status.h b/runtime/shims/title_boot_status.h
+new file mode 100644
+index 000000000..74a62c52c
+--- /dev/null
++++ b/runtime/shims/title_boot_status.h
+@@ -0,0 +1,10 @@
++#pragma once
++
++#include <cstdint>
++
++namespace rt::d3d12_xs {
++
++// Presentation-only status: the native pipeline path reports its real cumulative completion count.
++void report_native_pipeline_progress(std::uint64_t completed);
++
++}  // namespace rt::d3d12_xs
+diff --git a/runtime/shims/title_window.cpp b/runtime/shims/title_window.cpp
+index dd9dfe0b2..666651165 100644
+--- a/runtime/shims/title_window.cpp
++++ b/runtime/shims/title_window.cpp
+@@ -58,8 +58,8 @@ HWND WINAPI create_window_ex_a(DWORD ex_style, LPCSTR class_name, LPCSTR window_
+     const int fitted_y = monitor.rcWork.top + (work_height - fitted_height) / 2;
+     std::fprintf(stderr, "[rt] window: fit oversized title window %dx%d to %dx%d at %d,%d\n", width, height,
+                  fitted_width, fitted_height, fitted_x, fitted_y);
+-    return CreateWindowExA(ex_style, class_name, window_name, style, fitted_x, fitted_y, fitted_width, fitted_height,
+-                           parent, menu, instance, param);
++    return CreateWindowExA(ex_style, class_name, "Americas - starting game", style, fitted_x, fitted_y, fitted_width,
++                           fitted_height, parent, menu, instance, param);
+ }
+ 
+ }  // namespace
+-- 
+2.54.0
+

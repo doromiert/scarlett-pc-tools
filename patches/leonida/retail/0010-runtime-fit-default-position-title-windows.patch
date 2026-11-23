@@ -1,7 +1,7 @@
 From cc39adbbc59df49d2448bc4052b45d1f848c31f3 Mon Sep 17 00:00:00 2001
 From: doromiert <doromiert@gmail.com>
 Date: Mon, 23 Nov 2026 20:34:27 +0100
-Subject: [PATCH 10/10] runtime: fit default-position title windows
+Subject: [PATCH 10/13] runtime: fit default-position title windows
 
 ---
  runtime/shims/title_window.cpp | 24 +++++++++++++++++++-----

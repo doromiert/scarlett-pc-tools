@@ -1,0 +1,140 @@
+From e1f7a45d5b3ce74793d4208d2574c5d678cf30b6 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 21:02:03 +0100
+Subject: [PATCH 13/15] Translate requested native compare swizzles and wave32
+ scalar VCC pointer loads
+
+---
+ docs/design.md        | 15 +++++++++++++++
+ tools/rdna2_decode.py | 27 +++++++++++++++++++++++++++
+ tools/rdna2spirv.py   | 28 +++++++++++++++++++++++++---
+ 3 files changed, 67 insertions(+), 3 deletions(-)
+
+diff --git a/docs/design.md b/docs/design.md
+index 2e76d1900..1d86b3ff1 100644
+--- a/docs/design.md
++++ b/docs/design.md
+@@ -667,3 +667,18 @@ Local integration note: `s_flbit_i32_b64/i64` reads a lane-mask source through
+ `wave_mask`, as `s_ff1_i32_b64` already does, then uses the existing two-word
+ leading-bit calculation. This is a translation extension; SPIR-V validation
+ of actual requested programs does not verify their rendered output.
++
++Local integration note: the native decoder recognizes 32-bit VOPC DPP16/DPP8
++source selectors and consumes their extension word using the existing VOP2
++field layout. Compare lowering reuses the lane shuffle and accepts only full
++row/bank masks with zero-source behavior; partial destination masks and
++compare-X forms remain refused. Three requested library kernels now decode
++without invalid words and pass SPIR-V validation. Hardware output equivalence
++is not yet measured. ISA reference:
++https://www.amd.com/content/dam/amd/en/documents/radeon-tech-docs/instruction-set-architectures/rdna2-shader-instruction-set-architecture.pdf
++
++Wave32 scalar moves can preserve a data pointer in VCC_LO/VCC_HI, and scalar
++loads may use that pair as their base. The path refuses a base tracked as a lane
++mask; wave64 VCC pointer bases remain unsupported. Mask moves keep the existing
++per-lane representation. One requested kernel with this form translates and
++passes SPIR-V validation; pointer behavior still needs actual-runtime evidence.
+diff --git a/tools/rdna2_decode.py b/tools/rdna2_decode.py
+index 2fd27c44a..00dc10ab0 100644
+--- a/tools/rdna2_decode.py
++++ b/tools/rdna2_decode.py
+@@ -532,6 +532,33 @@ def _decode_one(code: bytes, pc: int, wave32: bool, mcpu: str) -> tuple[dict | N
+                 return None, 4
+             name, spec = entry
+             mods = []
++            if is_dpp16 or is_dpp8:
++                if name.startswith("v_cmpx_"):
++                    return None, 8
++                if not need(8):
++                    return None, 4
++                w1 = struct.unpack_from("<I", code, pc + 4)[0]
++                if any(_width(nr, wave32) != 1 for fn, nr, _ in spec if fn in ("SRC0", "VSRC1")):
++                    return None, 8
++                s0 = _vreg(w1 & 0xFF, 1)
++                s1 = _vreg(vsrc1, 1)
++                s0["neg"], s0["abs"] = bool((w1 >> 20) & 1), bool((w1 >> 21) & 1)
++                s1["neg"], s1["abs"] = bool((w1 >> 22) & 1), bool((w1 >> 23) & 1)
++                mods = [_format_dpp16_ctrl((w1 >> 8) & 0x1FF),
++                        f"row_mask:0x{(w1 >> 28) & 0xF:x}", f"bank_mask:0x{(w1 >> 24) & 0xF:x}"]
++                if (w1 >> 19) & 1:
++                    mods.append("bound_ctrl:1")
++                if (w1 >> 18) & 1:
++                    mods.append("fi:1")
++                if is_dpp8:
++                    s0["neg"] = s0["abs"] = s1["neg"] = s1["abs"] = False
++                    lanes = [(w1 >> (8 + 3 * i)) & 7 for i in range(8)]
++                    mods = [f"dpp8:[{','.join(str(x) for x in lanes)}]"]
++                    if src0 == 234:
++                        mods.append("fi:1")
++                args = [] if name.startswith("v_cmpx_") else [_vcc_operand(wave32)]
++                args.extend([s0, s1])
++                return finish(name + "_dpp", args, mods, 8)
+             if is_sdwa:
+                 if not need(8):
+                     return None, 4
+diff --git a/tools/rdna2spirv.py b/tools/rdna2spirv.py
+index f2ae225dd..2350c99d9 100644
+--- a/tools/rdna2spirv.py
++++ b/tools/rdna2spirv.py
+@@ -1655,6 +1655,13 @@ class Gen:
+         if d["k"] == "special" and d["t"] == "exec":
+             self.set_exec(self.mask_src(s))
+             return
++        if d["k"] == "special" and d["t"] == "vcc" and not self.wave64 and not self.holds_lane_mask(s) and s["k"] == "sgpr":
++            # In wave32, VCC is also a scalar pair. Preserve both pointer words rather than converting the low
++            # word to a per-lane mask bit. Mask-producing moves keep the existing path below.
++            lo, hi = self.src64_data(s, "s_mov_b64")
++            self.emit(f"OpStore %vcc {lo}")
++            self.emit(f"OpStore %vcc_hi {hi}")
++            return
+         if d["k"] == "special" and d["t"] in ("vcc", "vcc_lo"):
+             self.emit(f"OpStore %vcc {self.mask_src(s)}")
+             return
+@@ -1675,8 +1682,13 @@ class Gen:
+             lit_hi = (v >> 32) & 0xFFFFFFFF
+             lo, hi = self.cu(lit_lo), self.cu(lit_hi)
+         elif s["k"] == "special" and s["t"] == "vcc":
+-            lo = hi = self.tmp()            # this lane's bit in both halves, as for EXEC
++            lo = self.tmp()
+             self.emit(f"{lo} = OpLoad %uint %vcc")
++            if not self.wave64 and not self.holds_lane_mask(s):
++                hi = self.tmp()
++                self.emit(f"{hi} = OpLoad %uint %vcc_hi")
++            else:
++                hi = lo            # this lane's bit in both halves, as for EXEC
+         else:
+             raise Unsupported("s_mov_b64 source")
+         self.store_reg("sgpr", d["r"], lo)
+@@ -6532,10 +6544,18 @@ class Gen:
+         if not (0 <= row_mask <= 0xF and 0 <= bank_mask <= 0xF):
+             raise Unsupported("DPP mask")
+ 
++        if base_op(ins["op"]).startswith("v_cmpx_"):
++            raise Unsupported("DPP compare-X is not implemented")
+         args = [dict(a) for a in ins["args"]]
+         if len(args) < 2:
+             raise Unsupported("DPP operands")
+-        if args[0].get("k") != "vgpr" or args[0].get("n", 1) != 1:
++        compare_mask = (base_op(ins["op"]).startswith("v_cmp_") and args[0].get("t") in ("vcc", "vcc_lo"))
++        if compare_mask:
++            # The requested compare forms update every bank/row and replace an invalid source with zero. Other
++            # forms need explicit lane-mask destination preservation, which is not supplied by dpp_guard.
++            if row_mask != 0xF or bank_mask != 0xF or (not bound and dpp8 is None):
++                raise Unsupported("DPP compare without full masks and zero-source behavior")
++        elif args[0].get("k") != "vgpr" or args[0].get("n", 1) != 1:
+             raise Unsupported("DPP destination")
+         if args[1].get("n", 1) != 1:
+             raise Unsupported("DPP 64-bit source")
+@@ -11677,7 +11697,9 @@ class Gen:
+             (n == 2 and d["k"] == "special" and d["t"] == "vcc")
+         slist_dst = d["k"] == "slist" and len(d["r"]) == n
+         base_slots = (list(range(base["r"], base["r"] + base.get("n", 1))) if base["k"] == "sgpr"
+-                      else list(base["r"]) if base["k"] == "slist" else None)
++                      else list(base["r"]) if base["k"] == "slist"
++                      else ["vcc_lo", "vcc_hi"] if (not self.wave64 and base.get("t") == "vcc"
++                           and not self.holds_lane_mask(base) and "vcc_hi" not in self.cur_masks) else None)
+         if (d["k"] != "sgpr" and not single_special and not slist_dst) or base_slots is None:
+             raise Unsupported(f"{op} operands {d.get('t', d['k'])} {base.get('t', base['k'])}")
+ 
+-- 
+2.54.0
+

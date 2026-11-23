@@ -1,0 +1,32 @@
+From 08f0ee50775ac99153db6b9be2944e9fc5dc1072 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 21:04:09 +0100
+Subject: [PATCH 08/19] Trace bounded completion progress through native
+ compute pipeline loading
+
+---
+ runtime/shims/d3d12_xs_device.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index 7dfcbcf5d..8b465d0ba 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -3153,7 +3153,14 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const
+     // first call of a slot is announced, so a miss on a later program would otherwise read as the first call's.
+     static std::atomic<std::uint64_t> calls{0};
+     const std::uint64_t call = calls.fetch_add(1, std::memory_order_relaxed) + 1;
++    const ULONGLONG started = GetTickCount64();
+     const HRESULT hr = self->real->CreateComputePipelineState(&pc_desc, *riid, out);
++    static std::atomic<std::uint64_t> completed{0};
++    const std::uint64_t done = completed.fetch_add(1, std::memory_order_relaxed) + 1;
++    if (done == 1 || done % 128 == 0)
++        std::fprintf(stderr, "[rt] native compute progress: completed=%llu last_call=%llu result=0x%08lx duration_ms=%llu\n",
++                     static_cast<unsigned long long>(done), static_cast<unsigned long long>(call),
++                     static_cast<unsigned long>(hr), static_cast<unsigned long long>(GetTickCount64() - started));
+     if (FAILED(hr))
+         std::fprintf(stderr,
+                      "[rt] d3d12_xs: slot 67 call %llu failed with 0x%08lx (kind 0 %llu B, kind 1 %llu B, kind 6 %llu B, "
+-- 
+2.54.0
+

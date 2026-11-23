@@ -1,0 +1,39 @@
+From b7c8a2515ab1941df17883526f2a73086bd8e1da Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 21:37:18 +0100
+Subject: [PATCH 16/19] Expose the previously exercised local slot67 payload
+ capture for reproducible private shader builds
+
+---
+ runtime/shims/d3d12_xs_device.cpp | 15 +++++++++++++++
+ 1 file changed, 15 insertions(+)
+
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index 737927472..fd2056b03 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -3177,6 +3177,21 @@ HRESULT proxy_create_compute_pipeline_from_native_code(DeviceProxy* self, const
+     // first call of a slot is announced, so a miss on a later program would otherwise read as the first call's.
+     static std::atomic<std::uint64_t> calls{0};
+     const std::uint64_t call = calls.fetch_add(1, std::memory_order_relaxed) + 1;
++    // Opt-in local shader analysis. Payloads are game-derived data and must stay in an external private folder.
++    if (const char* dump = std::getenv("LEONIDA_DUMP_SLOT67"); dump && *dump && !payload.empty()) {
++        char path[512];
++        const int length = std::snprintf(path, sizeof(path), "%s\\slot67_%03llu.fspx", dump,
++                                         static_cast<unsigned long long>(call));
++        if (length > 0 && static_cast<std::size_t>(length) < sizeof(path)) {
++            if (FILE* file = std::fopen(path, "wb")) {
++                const std::size_t written = std::fwrite(payload.data(), 1, payload.size(), file);
++                if (written != payload.size()) std::fprintf(stderr, "[rt] native compute capture write failed\n");
++                std::fclose(file);
++            } else {
++                std::fprintf(stderr, "[rt] native compute capture file could not be opened\n");
++            }
++        }
++    }
+     const ULONGLONG started = GetTickCount64();
+     const HRESULT hr = self->real->CreateComputePipelineState(&pc_desc, *riid, out);
+     static std::atomic<std::uint64_t> completed{0};
+-- 
+2.54.0
+

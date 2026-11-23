@@ -1,0 +1,497 @@
+From 9d77112ccb074cf9d3dfceba247598f17fc0a2cf Mon Sep 17 00:00:00 2001
+From: Daiko <ramosespinosamarcos@gmail.com>
+Date: Mon, 23 Nov 2026 17:39:20 +0100
+Subject: [PATCH 17/19] d3d12: persist the pipeline cache across launches
+ (D3D-704)
+
+PSOs a session built were compiled again by the next one. The layer already read the `pipelines` stage's
+pipeline_cache.bin beside gta6rt.exe (#367), but never wrote anything back.
+
+Now the runtime keeps its own cache in pipeline_cache.session.bin beside it: vkGetPipelineCacheData on device
+teardown, then vkMergePipelineCaches into the cache at the next launch. Vulkan takes one blob per create, so the
+offline seed and the session file are two caches merged together rather than one file. They are deliberately
+separate files, so a run can never replace the multi-GB corpus cache with the handful of pipelines it compiled.
+
+The write is capped at 256 MiB (LEONIDA_PIPELINE_CACHE_BYTES=<bytes>, 0 turns it off): a cache seeded from the
+corpus comes back as the whole union, which is not worth rewriting at every exit; past the cap the previous
+session file is left alone. A foreign or truncated session file is ignored with one line, and so is a failed
+write (a read-only install directory).
+
+The header check moves to runtime/src/pipeline_cache_store.h, shared with the offline seed and tested without
+Vulkan (runtime/test/pipeline_cache_store_test.cpp: the limit parser and the 32-byte
+VkPipelineCacheHeaderVersionOne comparison). write_pipeline_cache_file moves from runtime/test to runtime/src so
+the runtime and vk_pipeline_check use the same staged write.
+
+Not run: this machine has neither MSVC nor the Windows SDK, so the shim itself is compiled by the Windows job.
+The portable test passes here (23/23 ctest on Linux). The end-to-end check needs a Vulkan GPU: run
+d3d12_vulkan_device_test twice and look for "wrote N bytes to pipeline_cache.session.bin", then "merged N bytes"
+on the second run.
+---
+ docs/d3d12_vulkan.md                        |   8 ++
+ runtime/CMakeLists.txt                      |   4 +
+ runtime/shims/d3d12_vulkan_device.cpp       | 130 ++++++++++++++++++--
+ runtime/{test => src}/pipeline_cache_file.h |   3 +
+ runtime/src/pipeline_cache_store.h          |  69 +++++++++++
+ runtime/src/vulkan_backend.h                |   2 +-
+ runtime/test/pipeline_cache_file_test.cpp   |   2 +-
+ runtime/test/pipeline_cache_store_test.cpp  |  93 ++++++++++++++
+ runtime/test/vk_pipeline_check.cpp          |   2 +-
+ 9 files changed, 298 insertions(+), 15 deletions(-)
+ rename runtime/{test => src}/pipeline_cache_file.h (90%)
+ create mode 100644 runtime/src/pipeline_cache_store.h
+ create mode 100644 runtime/test/pipeline_cache_store_test.cpp
+
+diff --git a/docs/d3d12_vulkan.md b/docs/d3d12_vulkan.md
+index ba5dc8593..0eb1ce102 100644
+--- a/docs/d3d12_vulkan.md
++++ b/docs/d3d12_vulkan.md
+@@ -2059,6 +2059,14 @@ Pipeline creation:
+   and pipeline-cache UUID. When the file is absent or incompatible, the runtime starts with an empty cache.
+   The offline checker matches the runtime's layout and subgroup request for compute shaders with no descriptor
+   bindings and the standard 144-byte push-constant range.
++  The runtime also keeps what it compiled itself: `pipeline_cache.session.bin`, written from
++  `vkGetPipelineCacheData` on device teardown and merged into the cache at the next launch with
++  `vkMergePipelineCaches` (the offline seed and the session file cannot be passed together as one
++  `VkPipelineCacheCreateInfo`). The two files are separate so a run never replaces the multi-GB corpus cache with
++  the handful of pipelines it happened to compile. The session write is capped at 256 MiB
++  (`LEONIDA_PIPELINE_CACHE_BYTES=<bytes>`, `0` turns it off): a cache seeded with the corpus file returns the whole
++  union, which is not worth rewriting at every exit. A session file from another device, driver or pipeline-cache
++  UUID is ignored with one line, and a write that fails (a read-only install directory) leaves the previous file.
+   `GetCachedBlob` records the vendor, device, driver version, `pipelineCacheUUID` and a SHA-256 of the description
+   without `Flags`, sealed by a checksum (`runtime/src/cached_pso.h`). The answers are the host's, measured on an
+   RTX 3060 and WARP: the same description is accepted; another
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index 9e85f9351..bceef07a1 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -539,6 +539,10 @@ if(BUILD_TESTING)
+   add_executable(pipeline_cache_file_test test/pipeline_cache_file_test.cpp)
+   add_test(NAME pipeline_cache_file COMMAND pipeline_cache_file_test)
+ 
++  # D3D-704's session-cache limit and header check: pure stdlib, no Vulkan headers.
++  add_executable(pipeline_cache_store_test test/pipeline_cache_store_test.cpp)
++  add_test(NAME pipeline_cache_store COMMAND pipeline_cache_store_test)
++
+   add_executable(xdxr_build_output_test test/xdxr_build_output_test.cpp)
+   add_test(NAME xdxr_build_output COMMAND xdxr_build_output_test)
+ 
+diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
+index 73c16e074..df1b5ec7a 100644
+--- a/runtime/shims/d3d12_vulkan_device.cpp
++++ b/runtime/shims/d3d12_vulkan_device.cpp
+@@ -25,6 +25,8 @@
+ #include "../src/vulkan_memory.h"
+ #include "../src/resource_tiling.h"
+ #include "../src/cached_pso.h"
++#include "../src/pipeline_cache_file.h"
++#include "../src/pipeline_cache_store.h"
+ #include "../src/conservative_raster.h"
+ #include "../src/resource_detile.h"
+ #include "../src/shader_library.h"
+@@ -52,6 +54,7 @@
+ #include <cstring>
+ #include <memory>
+ #include <mutex>
++#include <new>
+ #include <set>
+ #include <string>
+ #include <type_traits>
+@@ -68,6 +71,8 @@ constexpr UINT kDescriptorSize = descriptor_size;
+ // for unbound vertex and index buffers to read (D3D12 reads zeros there).
+ constexpr VkDeviceSize kArenaReserved = 64 * 1024;
+ static_assert(sizeof(leonida::TargetView) <= kDescriptorSize);
++// pipeline_cache_store.h reads this layout without vulkan.h (D3D-704); remember the two.
++static_assert(sizeof(VkPipelineCacheHeaderVersionOne) == leonida::pipeline_cache_store::header_bytes);
+ 
+ // The shader model and root signature version this layer can honour. Nothing in the runtime compiles DXIL: the
+ // game's shaders arrive as SPIR-V from the offline translator, and the only DXIL path (the BVH builder) is lowered
+@@ -169,6 +174,25 @@ std::filesystem::path pipeline_cache_path() {
+     return std::filesystem::path(path).parent_path() / L"pipeline_cache.bin";
+ }
+ 
++// What the runtime itself compiled, kept next to the offline seed and never written over it (D3D-704).
++std::filesystem::path pipeline_cache_session_path() {
++    std::filesystem::path path = pipeline_cache_path();
++    if (!path.empty()) path.replace_filename(L"pipeline_cache.session.bin");
++    return path;
++}
++
++// LEONIDA_PIPELINE_CACHE_BYTES, in bytes; 0 turns the session file off. One line for a value that is not a number.
++std::size_t pipeline_cache_save_limit() {
++    char text[32] = {};
++    size_t length = 0;
++    const bool present = getenv_s(&length, text, "LEONIDA_PIPELINE_CACHE_BYTES") == 0 && length > 1;
++    const auto limit = leonida::pipeline_cache_store::parse_save_limit(present ? text : "");
++    if (!limit.valid)
++        std::fprintf(stderr, "[rt] d3d12: LEONIDA_PIPELINE_CACHE_BYTES=%s is not a byte count; using %zu\n", text,
++                     limit.bytes);
++    return limit.bytes;
++}
++
+ // A corpus cache may be several GiB. Keep the read-only view alive through vkCreatePipelineCache
+ // and deny writers while the view is in use.
+ class PipelineCacheSeed {
+@@ -201,13 +225,7 @@ public:
+     std::size_t size() const { return size_; }
+ 
+     bool compatible(const leonida::cached_pso::Identity& identity) const {
+-        static_assert(sizeof(VkPipelineCacheHeaderVersionOne) == 32);
+-        VkPipelineCacheHeaderVersionOne header{};
+-        // The header is little-endian, like the host. The driver interprets the opaque payload.
+-        std::memcpy(&header, data_, sizeof(header));
+-        return header.headerSize == sizeof(header) && header.headerVersion == VK_PIPELINE_CACHE_HEADER_VERSION_ONE &&
+-               header.vendorID == identity.vendor && header.deviceID == identity.device &&
+-               std::memcmp(header.pipelineCacheUUID, identity.cache_uuid, VK_UUID_SIZE) == 0;
++        return leonida::pipeline_cache_store::header_matches(data_, size_, identity);
+     }
+ 
+ private:
+@@ -235,6 +253,90 @@ VkPipelineCache create_seeded_pipeline_cache(PFN_vkCreatePipelineCache create_ca
+     return cache;
+ }
+ 
++// D3D-704: merges what earlier launches compiled into the cache the pipelines are created against. The offline seed
++// and the session file cannot be handed over as one VkPipelineCacheCreateInfo -- Vulkan reads a single blob -- so the
++// session cache is created on its own and merged in. A missing, foreign or corrupt session file leaves the cache as
++// it was, and so does a driver that does not expose vkMergePipelineCaches.
++void merge_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDevice device, VkPipelineCache cache,
++                                  const leonida::cached_pso::Identity& identity) {
++    if (!cache || !vk.vkCreatePipelineCache || !vk.vkDestroyPipelineCache || !vk.vkMergePipelineCaches) return;
++    if (!pipeline_cache_save_limit()) return;  // LEONIDA_PIPELINE_CACHE_BYTES=0 turns the session file off
++    const PipelineCacheSeed seed(pipeline_cache_session_path());
++    if (!seed.data()) return;
++    if (!seed.compatible(identity)) {
++        std::fprintf(stderr, "[rt] d3d12: pipeline_cache.session.bin does not match this Vulkan device\n");
++        return;
++    }
++    const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO, nullptr, 0, seed.size(),
++                                           seed.data()};
++    VkPipelineCache session = VK_NULL_HANDLE;
++    if (vk.vkCreatePipelineCache(device, &create, nullptr, &session) != VK_SUCCESS) {
++        std::fprintf(stderr, "[rt] d3d12: Vulkan declined pipeline_cache.session.bin\n");
++        return;
++    }
++    const VkResult result = vk.vkMergePipelineCaches(device, cache, 1, &session);
++    vk.vkDestroyPipelineCache(device, session, nullptr);
++    if (result == VK_SUCCESS)
++        std::fprintf(stderr, "[rt] d3d12: merged %zu bytes from pipeline_cache.session.bin\n", seed.size());
++    else
++        std::fprintf(stderr, "[rt] d3d12: vkMergePipelineCaches on pipeline_cache.session.bin returned %d; ignored\n",
++                     static_cast<int>(result));
++}
++
++// Writes what this device compiled for the next launch (D3D-704). Called once the device is idle, before the cache
++// is destroyed. Past the cap nothing is written: the blob from an earlier, smaller session stays, which is better
++// than replacing it with one the next launch would keep refusing to save.
++void save_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDevice device, VkPipelineCache cache) {
++    if (!cache || !vk.vkGetPipelineCacheData) return;
++    const std::size_t limit = pipeline_cache_save_limit();
++    if (!limit) return;  // LEONIDA_PIPELINE_CACHE_BYTES=0 turns the session file off
++    const auto over_limit = [limit](std::size_t size) {
++        std::fprintf(stderr,
++                     "[rt] d3d12: pipeline cache is %zu bytes, over the %zu-byte session limit "
++                     "(LEONIDA_PIPELINE_CACHE_BYTES); pipeline_cache.session.bin left as it was\n",
++                     size, limit);
++    };
++    std::size_t size = 0;
++    if (vk.vkGetPipelineCacheData(device, cache, &size, nullptr) != VK_SUCCESS ||
++        size <= sizeof(VkPipelineCacheHeaderVersionOne))
++        return;
++    if (size > limit) {
++        over_limit(size);
++        return;
++    }
++    std::vector<char> data;
++    try {
++        // Room to spare in case the driver counts the blob short between the query and the read. Nothing creates
++        // pipelines while the device is torn down, so this is a belt-and-braces margin, not a retry loop.
++        data.resize(size + (size >> 4));
++    } catch (const std::bad_alloc&) {
++        std::fprintf(stderr,
++                     "[rt] d3d12: no memory for the %zu-byte pipeline cache; pipeline_cache.session.bin not "
++                     "written\n",
++                     size);
++        return;
++    }
++    std::size_t written = data.size();
++    const VkResult result = vk.vkGetPipelineCacheData(device, cache, &written, data.data());
++    if (result != VK_SUCCESS || written < sizeof(VkPipelineCacheHeaderVersionOne) || written > data.size()) {
++        std::fprintf(stderr,
++                     "[rt] d3d12: could not read the pipeline cache (%d); pipeline_cache.session.bin not written\n",
++                     static_cast<int>(result));
++        return;
++    }
++    if (written > limit) {
++        over_limit(written);
++        return;
++    }
++    const std::filesystem::path path = pipeline_cache_session_path();
++    if (path.empty()) return;
++    if (const std::error_code error = write_pipeline_cache_file(path, data.data(), written)) {
++        std::fprintf(stderr, "[rt] d3d12: pipeline_cache.session.bin not written: %s\n", error.message().c_str());
++        return;
++    }
++    std::fprintf(stderr, "[rt] d3d12: wrote %zu bytes to pipeline_cache.session.bin\n", written);
++}
++
+ // A shader whose subgroup size cannot be had runs at the device's: inexact if it crosses the halves of a wave64 (or,
+ // for a wave32 shader on a 64-wide default, reads lanes that are not its own). Logged once per stage with the first
+ // shader's name, then again at 10, 100, 1000... of that stage so a whole corpus stays readable.
+@@ -667,10 +769,12 @@ struct DeviceState {
+             const auto& vk = context->vk;
+             if (!vk.vkCreatePipelineCache || !vk.vkDestroyPipelineCache) return;
+             pipeline_cache_handle = create_seeded_pipeline_cache(vk.vkCreatePipelineCache, info.device, pso_identity);
+-            if (pipeline_cache_handle) return;
+-            const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
+-            if (vk.vkCreatePipelineCache(info.device, &create, nullptr, &pipeline_cache_handle) != VK_SUCCESS)
+-                pipeline_cache_handle = VK_NULL_HANDLE;
++            if (!pipeline_cache_handle) {
++                const VkPipelineCacheCreateInfo create{VK_STRUCTURE_TYPE_PIPELINE_CACHE_CREATE_INFO};
++                if (vk.vkCreatePipelineCache(info.device, &create, nullptr, &pipeline_cache_handle) != VK_SUCCESS)
++                    pipeline_cache_handle = VK_NULL_HANDLE;
++            }
++            merge_session_pipeline_cache(vk, info.device, pipeline_cache_handle, pso_identity);
+         });
+         // Without EXTERNALLY_SYNCHRONIZED_BIT the driver synchronizes concurrent pipeline creation using this cache.
+         return pipeline_cache_handle;
+@@ -5508,8 +5612,10 @@ public:
+             vk.vkDestroyBuffer(state_.info.device, state_.arena.buffer, nullptr);
+             if (state_.arena.memory) vk.vkFreeMemory(state_.info.device, state_.arena.memory, nullptr);
+         }
+-        if (state_.pipeline_cache_handle)
++        if (state_.pipeline_cache_handle) {
++            save_session_pipeline_cache(state_.context->vk, state_.info.device, state_.pipeline_cache_handle);
+             state_.context->vk.vkDestroyPipelineCache(state_.info.device, state_.pipeline_cache_handle, nullptr);
++        }
+         state_.context.reset();
+         if (owned_.device) owned_.destroy_device(owned_.device, nullptr);
+         if (owned_.instance) owned_.destroy_instance(owned_.instance, nullptr);
+diff --git a/runtime/test/pipeline_cache_file.h b/runtime/src/pipeline_cache_file.h
+similarity index 90%
+rename from runtime/test/pipeline_cache_file.h
+rename to runtime/src/pipeline_cache_file.h
+index 400138ef7..95afbd10a 100644
+--- a/runtime/test/pipeline_cache_file.h
++++ b/runtime/src/pipeline_cache_file.h
+@@ -1,4 +1,7 @@
+ // Publish a checkpoint only after every byte has reached a closed, same-directory staging file.
++//
++// Used by vk_pipeline_check (its corpus checkpoints) and by the runtime itself, which writes the session cache on
++// device teardown (pipeline_cache_store.h). A reader of the old file keeps it open until its rename completes.
+ #pragma once
+ 
+ #include <algorithm>
+diff --git a/runtime/src/pipeline_cache_store.h b/runtime/src/pipeline_cache_store.h
+new file mode 100644
+index 000000000..6d519d99b
+--- /dev/null
++++ b/runtime/src/pipeline_cache_store.h
+@@ -0,0 +1,69 @@
++// Persisting the runtime's VkPipelineCache across launches (D3D-704).
++//
++// Two files sit beside gta6rt.exe, and they are not interchangeable:
++//
++//   pipeline_cache.bin         the offline corpus seed the `pipelines` build stage writes (#367). Read only.
++//   pipeline_cache.session.bin what the runtime compiled last time. Written on device teardown.
++//
++// Keeping them apart means a run can never replace the multi-GB corpus cache with the handful of pipelines it
++// happened to compile. On the next launch both are loaded and merged, so the offline entries and the previous
++// session's entries are available together.
++//
++// This header is pure stdlib on purpose (it does not include vulkan.h): pipeline_cache_store_test builds on hosts
++// where CMake has no Vulkan headers. The byte layout below is VkPipelineCacheHeaderVersionOne, whose 32 bytes are
++// part of Vulkan's ABI, not something a driver chooses.
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <limits>
++
++#include "cached_pso.h"
++
++namespace leonida::pipeline_cache_store {
++
++// A session cache normally holds what one boot compiled (a few MB to a few hundred MB). The cap is what keeps a
++// cache seeded from the multi-GB corpus file -- whose data comes back as the whole union -- from being rewritten
++// at every exit. Past it the previous session file is left alone; raise the limit with
++// LEONIDA_PIPELINE_CACHE_BYTES when a session really compiles that much.
++inline constexpr std::size_t default_save_limit = std::size_t{256} << 20;  // 256 MiB
++
++struct SaveLimit {
++    std::size_t bytes = default_save_limit;
++    bool valid = true;  // false when the text was not a byte count; bytes then stays at the default
++};
++
++// LEONIDA_PIPELINE_CACHE_BYTES: a decimal byte count, 0 turning the session file off entirely. Empty or absent
++// means the default; stray text, a sign or an overflow is reported by the caller and the default is used.
++inline SaveLimit parse_save_limit(const char* text) {
++    if (!text || !*text) return {};
++    std::size_t value = 0;
++    for (const char* p = text; *p; ++p) {
++        if (*p < '0' || *p > '9') return {default_save_limit, false};
++        const std::size_t digit = static_cast<std::size_t>(*p - '0');
++        if (value > (std::numeric_limits<std::size_t>::max() - digit) / 10) return {default_save_limit, false};
++        value = value * 10 + digit;
++    }
++    return {value, true};
++}
++
++inline constexpr std::size_t header_bytes = 32;
++inline constexpr std::uint32_t header_version_one = 1;
++
++inline std::uint32_t read_u32(const std::uint8_t* p) {
++    return std::uint32_t(p[0]) | (std::uint32_t(p[1]) << 8) | (std::uint32_t(p[2]) << 16) |
++           (std::uint32_t(p[3]) << 24);
++}
++
++// True when the blob's header names this physical device and pipeline-cache UUID, which is what a driver requires
++// before it will read the opaque payload. The header is little-endian, like the host.
++inline bool header_matches(const void* data, std::size_t size, const cached_pso::Identity& identity) {
++    if (!data || size < header_bytes) return false;
++    const auto* bytes = static_cast<const std::uint8_t*>(data);
++    return read_u32(bytes) == header_bytes && read_u32(bytes + 4) == header_version_one &&
++           read_u32(bytes + 8) == identity.vendor && read_u32(bytes + 12) == identity.device &&
++           std::memcmp(bytes + 16, identity.cache_uuid, sizeof(identity.cache_uuid)) == 0;
++}
++
++}  // namespace leonida::pipeline_cache_store
+diff --git a/runtime/src/vulkan_backend.h b/runtime/src/vulkan_backend.h
+index 5977ebe8d..73d830ac1 100644
+--- a/runtime/src/vulkan_backend.h
++++ b/runtime/src/vulkan_backend.h
+@@ -95,7 +95,7 @@ struct VulkanDeviceFunctions {
+     X(vkCmdSetPrimitiveTopology) X(vkCmdSetPrimitiveRestartEnable) X(vkCmdSetStencilReference)                          \
+     X(vkCmdSetBlendConstants) X(vkCmdDraw)                                                                              \
+     X(vkCmdDrawIndexed) X(vkCreateGraphicsPipelines) X(vkQueueBindSparse) X(vkGetImageSparseMemoryRequirements)   \
+-    X(vkCreatePipelineCache) X(vkDestroyPipelineCache)                                                        \
++    X(vkCreatePipelineCache) X(vkDestroyPipelineCache) X(vkGetPipelineCacheData) X(vkMergePipelineCaches)   \
+     X(vkCreateEvent) X(vkDestroyEvent) X(vkResetEvent) X(vkCmdSetEvent) X(vkCmdWaitEvents) X(vkCmdDrawMeshTasksEXT) \
+     X(vkCreateRenderPass2) X(vkDestroyRenderPass) X(vkCreateFramebuffer) X(vkDestroyFramebuffer)               \
+     X(vkCmdBeginRenderPass) X(vkCmdEndRenderPass)
+diff --git a/runtime/test/pipeline_cache_file_test.cpp b/runtime/test/pipeline_cache_file_test.cpp
+index 73dad65de..f24694a56 100644
+--- a/runtime/test/pipeline_cache_file_test.cpp
++++ b/runtime/test/pipeline_cache_file_test.cpp
+@@ -1,5 +1,5 @@
+ // Exercise checkpoint replacement and real filesystem errors without a Vulkan device.
+-#include "pipeline_cache_file.h"
++#include "../src/pipeline_cache_file.h"
+ 
+ #include <chrono>
+ #include <cstdio>
+diff --git a/runtime/test/pipeline_cache_store_test.cpp b/runtime/test/pipeline_cache_store_test.cpp
+new file mode 100644
+index 000000000..dbf174768
+--- /dev/null
++++ b/runtime/test/pipeline_cache_store_test.cpp
+@@ -0,0 +1,93 @@
++// The two pure decisions behind D3D-704: how large a session cache may be (LEONIDA_PIPELINE_CACHE_BYTES) and
++// whether a blob's VkPipelineCacheHeaderVersionOne names this device. No Vulkan, no GPU, no files.
++#include "../src/pipeline_cache_store.h"
++
++#include <cstdint>
++#include <cstdio>
++#include <cstring>
++#include <limits>
++#include <string>
++
++#define CHECK(condition) do {                                        \
++    if (!(condition)) {                                              \
++        std::fprintf(stderr, "line %d: %s\n", __LINE__, #condition); \
++        return 1;                                                    \
++    }                                                                \
++} while (0)
++
++namespace store = leonida::pipeline_cache_store;
++
++static void put32(std::uint8_t* p, std::uint32_t value) {
++    for (int i = 0; i < 4; ++i) p[i] = static_cast<std::uint8_t>(value >> (8 * i));
++}
++
++static int test_limit() {
++    using store::default_save_limit;
++    // Absent, empty and the default knob.
++    CHECK(store::parse_save_limit(nullptr).bytes == default_save_limit);
++    CHECK(store::parse_save_limit(nullptr).valid);
++    CHECK(store::parse_save_limit("").bytes == default_save_limit);
++    // 0 is the documented "off", not a typo, and leading zeros are still a number.
++    CHECK(store::parse_save_limit("0").bytes == 0);
++    CHECK(store::parse_save_limit("0").valid);
++    CHECK(store::parse_save_limit("007").bytes == 7);
++    CHECK(store::parse_save_limit("1048576").bytes == 1048576);
++    const std::string largest = std::to_string(std::numeric_limits<std::size_t>::max());
++    CHECK(store::parse_save_limit(largest.c_str()).bytes == std::numeric_limits<std::size_t>::max());
++    // Anything that is not a plain byte count falls back to the default and says the value was rejected.
++    for (const char* text : {"-1", "+1", " 1", "1 ", "12x", "0x10", "1.5", "99999999999999999999999999"}) {
++        const auto limit = store::parse_save_limit(text);
++        CHECK(!limit.valid);
++        CHECK(limit.bytes == default_save_limit);
++    }
++    return 0;
++}
++
++static int test_header() {
++    leonida::cached_pso::Identity identity;
++    identity.vendor = 0x1002;
++    identity.device = 0x73ff;
++    identity.driver = 0x02000d0b;
++
++    std::uint8_t header[store::header_bytes] = {};
++    put32(header, store::header_bytes);
++    put32(header + 4, store::header_version_one);
++    put32(header + 8, identity.vendor);
++    put32(header + 12, identity.device);
++    for (int i = 0; i < 16; ++i) header[16 + i] = identity.cache_uuid[i] = static_cast<std::uint8_t>(i + 1);
++    CHECK(store::header_matches(header, sizeof(header), identity));
++    // Extra payload past the header does not matter: the driver reads the header and then its own data.
++    std::uint8_t blob[store::header_bytes + 8] = {};
++    std::memcpy(blob, header, sizeof(header));
++    CHECK(store::header_matches(blob, sizeof(blob), identity));
++
++    // Too short and null are "no cache", never a read past the end.
++    CHECK(!store::header_matches(header, store::header_bytes - 1, identity));
++    CHECK(!store::header_matches(nullptr, store::header_bytes, identity));
++
++    // The four fields a driver checks before trusting a blob from another device, driver or header version.
++    auto differs = [&](int offset, std::uint32_t value) {
++        std::uint8_t changed[store::header_bytes];
++        std::memcpy(changed, header, sizeof(changed));
++        put32(changed + offset, value);
++        return !store::header_matches(changed, sizeof(changed), identity);
++    };
++    CHECK(differs(0, store::header_bytes + 4));
++    CHECK(differs(4, store::header_version_one + 1));
++    CHECK(differs(8, identity.vendor + 1));
++    CHECK(differs(12, identity.device + 1));
++    std::uint8_t uuid[store::header_bytes];
++    std::memcpy(uuid, header, sizeof(uuid));
++    uuid[16] ^= 0xff;
++    CHECK(!store::header_matches(uuid, sizeof(uuid), identity));
++    // vendorID/deviceID are u32s little-endian; the same bytes read the other way name another device.
++    leonida::cached_pso::Identity swapped = identity;
++    swapped.vendor = 0x02100000;
++    CHECK(!store::header_matches(header, sizeof(header), swapped));
++    return 0;
++}
++
++int main() {
++    if (const int failed = test_limit()) return failed;
++    return test_header();
++}
+diff --git a/runtime/test/vk_pipeline_check.cpp b/runtime/test/vk_pipeline_check.cpp
+index 7b4f8d533..d16729ff7 100644
+--- a/runtime/test/vk_pipeline_check.cpp
++++ b/runtime/test/vk_pipeline_check.cpp
+@@ -47,7 +47,7 @@
+ //                 pipelines stage's retry.
+ #include "vulkan_loader.h"
+ #include "vk_device_pick.h"
+-#include "pipeline_cache_file.h"
++#include "../src/pipeline_cache_file.h"
+ #include "pipeline_cache_snapshot.h"
+ #include "large_module_gate.h"
+ #include "pipeline_summary.h"
+-- 
+2.54.0
+

@@ -1,0 +1,114 @@
+From cdeb352894ac98f9641d8bfed1cb7c19394fcc0d Mon Sep 17 00:00:00 2001
+From: enx <enx@noreply.localhost>
+Date: Mon, 23 Nov 2026 12:20:09 -0700
+Subject: [PATCH 14/15] Upstream PR #8330: translator: preserve 64-bit data in
+ Gen.mov64 to/from VCC (SHADER-1263)
+
+Squashed from ItsNotRexed/Leonida#8330 by HDFreitas, head e333418a1 (security scan PASS).
+
+Applied as the PR's own diff (gh pr diff); head matches the watcher's scan.
+---
+ tests/semantic/test_mov64_vcc_data.py | 44 +++++++++++++++++++++++++++
+ tools/rdna2spirv.py                   | 22 ++++++--------
+ 2 files changed, 54 insertions(+), 12 deletions(-)
+ create mode 100644 tests/semantic/test_mov64_vcc_data.py
+
+diff --git a/tests/semantic/test_mov64_vcc_data.py b/tests/semantic/test_mov64_vcc_data.py
+new file mode 100644
+index 000000000..328d404d6
+--- /dev/null
++++ b/tests/semantic/test_mov64_vcc_data.py
+@@ -0,0 +1,44 @@
++"""Regression tests for SHADER-1263: s_mov_b64 to/from VCC when VCC holds 64-bit scalar data."""
++import os
++import unittest
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++import sys
++sys.path.insert(0, HERE)
++
++from support import translate_lines  # noqa: E402
++
++
++class Mov64VccDataTests(unittest.TestCase):
++    def test_s_mov_b64_data_pair_through_vcc_preserves_both_halves(self):
++        lines = [
++            "s_mov_b32 s2, 0x11223344",
++            "s_mov_b32 s3, 0x55667788",
++            "s_mov_b64 vcc, s[2:3]",
++            "s_mov_b64 s[4:5], vcc",
++            "v_mov_b32 v0, s4",
++            "v_mov_b32 v1, s5",
++            "exp mrt0 v0, v1, v0, v1 done vm",
++            "s_endpgm",
++        ]
++        spv = translate_lines("ps_mov64_vcc_data", lines)
++        self.assertIn("OpStore %vcc_hi", spv)
++        self.assertIn("OpLoad %uint %vcc_hi", spv)
++        self.assertNotIn("OpShiftRightLogical", spv)
++
++    def test_s_mov_b64_lane_mask_through_vcc_keeps_mask_semantics(self):
++        lines = [
++            "v_cmp_lt_f32 vcc, v0, v1",
++            "s_mov_b64 s[2:3], vcc",
++            "s_mov_b64 vcc, s[2:3]",
++            "v_cndmask_b32 v2, v0, v1, vcc",
++            "exp mrt0 v2, v2, v2, v2 done vm",
++            "s_endpgm",
++        ]
++        spv = translate_lines("ps_mov64_vcc_mask", lines)
++        self.assertNotIn("OpStore %vcc_hi", spv)
++        self.assertNotIn("OpLoad %uint %vcc_hi", spv)
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tools/rdna2spirv.py b/tools/rdna2spirv.py
+index 2350c99d9..bc205637a 100644
+--- a/tools/rdna2spirv.py
++++ b/tools/rdna2spirv.py
+@@ -1655,17 +1655,11 @@ class Gen:
+         if d["k"] == "special" and d["t"] == "exec":
+             self.set_exec(self.mask_src(s))
+             return
+-        if d["k"] == "special" and d["t"] == "vcc" and not self.wave64 and not self.holds_lane_mask(s) and s["k"] == "sgpr":
+-            # In wave32, VCC is also a scalar pair. Preserve both pointer words rather than converting the low
+-            # word to a per-lane mask bit. Mask-producing moves keep the existing path below.
+-            lo, hi = self.src64_data(s, "s_mov_b64")
+-            self.emit(f"OpStore %vcc {lo}")
+-            self.emit(f"OpStore %vcc_hi {hi}")
+-            return
+-        if d["k"] == "special" and d["t"] in ("vcc", "vcc_lo"):
++        if d["k"] == "special" and d["t"] in ("vcc", "vcc_lo") and (self.holds_lane_mask(s) or s["k"] == "imm"):
+             self.emit(f"OpStore %vcc {self.mask_src(s)}")
+             return
+-        if d["k"] != "sgpr" or d.get("n") != 2:
++        to_vcc = d["k"] == "special" and d["t"] in ("vcc", "vcc_lo")
++        if not to_vcc and (d["k"] != "sgpr" or d.get("n") != 2):
+             raise Unsupported("s_mov_b64 destination")
+         lit_lo = lit_hi = None
+         if s["k"] == "special" and s["t"] == "exec":
+@@ -1684,13 +1678,17 @@ class Gen:
+         elif s["k"] == "special" and s["t"] == "vcc":
+             lo = self.tmp()
+             self.emit(f"{lo} = OpLoad %uint %vcc")
+-            if not self.wave64 and not self.holds_lane_mask(s):
++            if "vcc" in self.cur_masks:
++                hi = lo                    # this lane's bit in both halves, as for EXEC
++            else:
+                 hi = self.tmp()
+                 self.emit(f"{hi} = OpLoad %uint %vcc_hi")
+-            else:
+-                hi = lo            # this lane's bit in both halves, as for EXEC
+         else:
+             raise Unsupported("s_mov_b64 source")
++        if to_vcc:
++            self.emit(f"OpStore %vcc {lo}")
++            self.emit(f"OpStore %vcc_hi {hi}")
++            return
+         self.store_reg("sgpr", d["r"], lo)
+         self.store_reg("sgpr", d["r"] + 1, hi)
+         if self.desc_cache_ok():
+-- 
+2.54.0
+

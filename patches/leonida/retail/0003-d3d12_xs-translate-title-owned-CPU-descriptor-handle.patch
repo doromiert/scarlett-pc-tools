@@ -1,7 +1,7 @@
 From 3754117af227fe2e3b090097af194120d5247454 Mon Sep 17 00:00:00 2001
 From: LeonidaBringup <bringup@local>
 Date: Mon, 23 Nov 2026 17:41:55 +0000
-Subject: [PATCH 03/10] d3d12_xs: translate title-owned CPU descriptor handles
+Subject: [PATCH 03/13] d3d12_xs: translate title-owned CPU descriptor handles
  in ListProxy and preserve ClearDepthStencilView FLOAT Depth
 
 device slots 17-24, and #2490 wraps console-ABI command lists in ListProxy, but

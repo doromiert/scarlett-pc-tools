@@ -43,6 +43,10 @@ does not boot. Its Windows runtime can be tested under Wine on Linux; see its
 build and platform documentation. [LEONIDA_INTEGRATION.md](LEONIDA_INTEGRATION.md)
 contains the pinned source patch series, build details and actual-executable launcher.
 
+[FORGE_INTEGRATION.md](FORGE_INTEGRATION.md) is the current, more advanced source
+recipe. It includes native graphics pipelines, private shader-catalog generation,
+and actual loading diagnostics. Locally sampled frames are still black.
+
 The initial reference checkout below is for inspection. Use the pinned integration
 guide for the more advanced native startup experiment.
 

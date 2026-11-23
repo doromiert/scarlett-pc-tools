@@ -1,7 +1,7 @@
 From 5cd17faaf668718c508848f5386fa6d4c0a9a66a Mon Sep 17 00:00:00 2001
 From: FIocker <4461558+FIocker@users.noreply.github.com>
 Date: Mon, 23 Nov 2026 13:26:21 +0100
-Subject: [PATCH 1/7] rdna2spirv: write the compute thread-group SGPR
+Subject: [PATCH 01/15] rdna2spirv: write the compute thread-group SGPR
  (TG_SIZE_EN)
 
 RSRC2 bit 10 adds an SGPR after the workgroup ids. The translator refused every compute

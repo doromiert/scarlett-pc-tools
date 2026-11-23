@@ -1,0 +1,59 @@
+From 7c515543c0a368a8cc3d2f1a7e2512bcc4d016c2 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 21:33:38 +0100
+Subject: [PATCH 15/15] Read scalar memory pointer words from VCC data or
+ materialized lane masks
+
+Reuses wave_mask to read scalar VCC words numerically, including the independent high word in wave32. Eleven remaining real library programs now translate and pass SPIR-V validation; the hardware halt program remains refused. Output equivalence is not yet established.
+---
+ docs/design.md      |  7 +++++++
+ tools/rdna2spirv.py | 12 ++++++++++--
+ 2 files changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/docs/design.md b/docs/design.md
+index 1d86b3ff1..66ab78161 100644
+--- a/docs/design.md
++++ b/docs/design.md
+@@ -682,3 +682,10 @@ loads may use that pair as their base. The path refuses a base tracked as a lane
+ mask; wave64 VCC pointer bases remain unsupported. Mask moves keep the existing
+ per-lane representation. One requested kernel with this form translates and
+ passes SPIR-V validation; pointer behavior still needs actual-runtime evidence.
++
++Following PR8330's scalar-data VCC moves, SMEM pointer bases in VCC may also be
++used in either wave size. Plain scalar words are read unchanged. Words stored
++as per-lane mask bits are materialized through the existing wave_mask helper
++before the numeric SMEM address calculation; wave32 VCC_HI remains independent.
++No pointer validity rule is relaxed. Validation is exercised on actual library
++programs; hardware output correctness remains to be established.
+diff --git a/tools/rdna2spirv.py b/tools/rdna2spirv.py
+index bc205637a..033d2718c 100644
+--- a/tools/rdna2spirv.py
++++ b/tools/rdna2spirv.py
+@@ -11696,14 +11696,22 @@ class Gen:
+         slist_dst = d["k"] == "slist" and len(d["r"]) == n
+         base_slots = (list(range(base["r"], base["r"] + base.get("n", 1))) if base["k"] == "sgpr"
+                       else list(base["r"]) if base["k"] == "slist"
+-                      else ["vcc_lo", "vcc_hi"] if (not self.wave64 and base.get("t") == "vcc"
+-                           and not self.holds_lane_mask(base) and "vcc_hi" not in self.cur_masks) else None)
++                      else ["vcc_lo", "vcc_hi"] if base.get("t") == "vcc" else None)
+         if (d["k"] != "sgpr" and not single_special and not slist_dst) or base_slots is None:
+             raise Unsupported(f"{op} operands {d.get('t', d['k'])} {base.get('t', base['k'])}")
+ 
++        scalar_mask_words = {}
++
+         def load_slot(slot):
+             if isinstance(slot, int):
+                 return self.load_reg("sgpr", slot)
++            operand = {"k": "special", "t": "vcc" if self.wave64 else slot}
++            if self.holds_lane_mask(operand):
++                key = operand["t"]
++                if key not in scalar_mask_words:
++                    scalar_mask_words[key] = self.wave_mask(operand)
++                # Wave32 VCC_HI is a separate scalar/mask word, not lanes32-63 of VCC_LO.
++                return scalar_mask_words[key][1 if self.wave64 and slot == "vcc_hi" else 0]
+             t = self.tmp()
+             self.emit(f"{t} = OpLoad %uint {'%vcc' if slot == 'vcc_lo' else '%vcc_hi'}")
+             return t
+-- 
+2.54.0
+

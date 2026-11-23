@@ -158,10 +158,10 @@ def boot(target, runtime, output, timeout):
     return run_worker([sys.executable, str(worker), str(exe), "--runtime", str(runtime)], output, timeout)
 
 
-def positive(value):
+def positive(value, maximum=600):
     number = float(value)
-    if not 0 < number <= 600:
-        raise argparse.ArgumentTypeError("Choose a timeout greater than 0 and at most 600 seconds.")
+    if not 0 < number <= maximum:
+        raise argparse.ArgumentTypeError(f"Choose a timeout greater than 0 and at most {maximum} seconds.")
     return number
 
 
@@ -272,7 +272,8 @@ def main(argv=None):
     p.add_argument("--loader", required=True, help="Built gta6rt.exe; its TLS helper must be alongside it")
     p.add_argument("--output", required=True, help="External attempt directories, logs and write overlays")
     p.add_argument("--wine", help="Linux: Wine executable (default: wine on PATH)")
-    p.add_argument("--timeout", type=positive, default=60)
+    p.add_argument("--timeout", type=lambda value: positive(value, 3600), default=60,
+                   help="Observation limit in seconds (maximum: 3600)")
     args = parser.parse_args(argv)
     print("Inspecting local files…" if args.command != "boot" else "Preparing boot diagnostic…",
           file=sys.stderr, flush=True)

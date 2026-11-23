@@ -145,12 +145,38 @@ All 42 initially captured native compute payloads translated and validated after
 the upstream thread-group SGPR change. The title subsequently requests hundreds
 of additional pipeline-library compute programs. The first library pass produced
 1,860 validated modules; they need the library's exact kind-0 dispatch-state keys
-to match at runtime. Further translation and actual launch work continues.
+to match at runtime. The expanded private cache now has 2,642 validated library modules. A ten-minute
+actual run still showed no playable scene. Later fixes address programs requested
+after that run's early frames, and a longer observation is underway with guest
+assertions retained and bounded native-pipeline progress diagnostics.
 
 The XCL upstream comparison has advanced to `956a476` for another local build.
 Its README reports a steady frame loop but still a black image for the newer
 retail title. Our actual launch still stops at VKD3D shared-fence vtable identity
 assertion; the frame-loop claim was not reproduced in our Wine setup.
+
+## Current forge comparison
+
+The maintainers' forge integration at `70bc8a25e` adds native graphics pipeline
+handling missing from the earlier runtime. The source recipe and exact patch
+series are in [FORGE_INTEGRATION.md](FORGE_INTEGRATION.md).
+
+The first actual forge run exposed a frame-token mismatch and the existing
+allocation-size assertion. Sharing device/presentation tokens restored successful
+presentation; current upstream descriptor cleaning cleared the measured allocation
+stop. The ongoing assertion-enabled run resolves a 25,321-entry private graphics
+catalog and has advanced beyond 1,500 native compute completions without a reported
+API failure. Every sampled presented frame remains black.
+
+A non-invasive CPU profile of that actual process found 4,541 of 4,703 samples
+(96.6%) in RADV compute compilation across eleven workers. Memory pressure and swap
+were zero during the profile. The evidence shows active compilation, not a global
+deadlock. No synthetic workload was used for this result.
+
+The compute-library toolchain now validates 2,683 of 2,684 programs; the hardware
+halt remains unsupported. New session-cache/checkpoint source ports are prepared
+for preserving expensive completed work, with actual write/restart verification
+still pending. They are not evidence of a faster or playable boot yet.
 
 ## Not verified
 

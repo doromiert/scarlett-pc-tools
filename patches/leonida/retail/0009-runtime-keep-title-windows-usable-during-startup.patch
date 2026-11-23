@@ -1,7 +1,7 @@
 From 79d122fce80be58599f396a1c6a05763722cf675 Mon Sep 17 00:00:00 2001
 From: doromiert <doromiert@gmail.com>
 Date: Mon, 23 Nov 2026 20:28:53 +0100
-Subject: [PATCH 09/10] runtime: keep title windows usable during startup
+Subject: [PATCH 09/13] runtime: keep title windows usable during startup
 
 ---
  runtime/CMakeLists.txt            |   1 +
