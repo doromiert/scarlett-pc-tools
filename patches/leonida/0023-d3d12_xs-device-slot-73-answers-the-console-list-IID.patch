@@ -1,0 +1,131 @@
+From 6e68217f51bf99de70d6cb99ac18d7ce73debf14 Mon Sep 17 00:00:00 2001
+From: NiiRoZz <simonin.remi25@gmail.com>
+Date: Mon, 23 Nov 2026 16:51:30 +0100
+Subject: [PATCH 23/33] d3d12_xs: device slot 73 answers the console list IID
+ with the console list proxy
+
+Xbox device slot 73 (CreateCommandListX, routed by #6935) passed the caller's riid to the PC
+CreateCommandList. Measured locally at a title's call sites, that riid is a console command-list IID no PC
+object answers, so every list failed and the title asserted after its first allocator. The list now comes
+from the slot 12 path (#2490's console list proxy over a PC graphics list); an IID the proxy answers is
+returned as asked, and any other is answered with the proxy itself, logged once.
+
+A plain PC list is not enough: handed out unwrapped, the title faults right after the first list. With the
+proxy, all of the title's lists are created and closed.
+
+xs_proxy_mock_test: slot 73 returns a list proxy over the mock's list, a made-up IID the PC does not know
+gets a list proxy, and ID3D12GraphicsCommandList1 is returned as asked. Also drops the duplicate
+Kind::list case the #2490 merge left in the mock.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/shims/d3d12_xs_device.cpp   | 34 +++++++++++++++++++++++------
+ runtime/shims/d3d12_xs_device.h     |  7 +++---
+ runtime/test/xs_proxy_mock_test.cpp | 19 +++++++++++++++-
+ 3 files changed, 49 insertions(+), 11 deletions(-)
+
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index 63eafef16..42b2250ee 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -168,7 +168,7 @@ const char* slot_name(unsigned slot) {
+         case 50: return "EnqueueMakeResident (proxies unwrapped)";
+         case 62: return "Xbox CreateComputePipelineState";
+         case 67: return "Xbox DeserializeComputePipelineStateX";
+-        case 73: return "Xbox CreateCommandListX -> PC CreateCommandList";
++        case 73: return "Xbox CreateCommandListX -> console list proxy";
+         case 75: return "CreateCommandQueue1 -> queue proxy";
+         case 76: return "Xbox resource creation";
+         case 78: return "Xbox SetFrameIntervalX";
+@@ -1943,12 +1943,32 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word,
+                      "[rt] d3d12_xs: slot 73 CreateCommandListX desc words 0x%08x 0x%08x -> node mask 0, type %d\n",
+                      words[0], words[1], static_cast<int>(type));
+ 
+-    // Leonida wraps its Vulkan allocators; a PC allocator comes back unwrapped and is passed as it is. Pipeline states
+-    // are not wrapped by this proxy, so initial_state is already the real object (a proxy there is passed through too).
+-    auto* allocator = allocator_proxy_real_allocator(reinterpret_cast<void*>(allocator_word));
+-    if (!allocator) allocator = reinterpret_cast<ID3D12CommandAllocator*>(allocator_word);
+-    auto* initial_state = reinterpret_cast<ID3D12PipelineState*>(initial_state_word);
+-    return self->real->CreateCommandList(0, type, allocator, initial_state, *riid, out);
++    // The list comes from the slot 12 path (the allocator proxy unwrapped there), as the console list proxy over a PC
++    // graphics list. Measured locally at a title's call sites: riid is a console command-list IID that no PC object
++    // answers, so asking the PC device for it fails every list. The proxy is the console-shaped list that IID asks
++    // for: an IID the proxy answers is returned as asked, and any other is answered with the proxy itself.
++    void* list = nullptr;
++    const HRESULT hr = proxy_create_command_list(self, 0, static_cast<std::uint64_t>(type), allocator_word,
++                                                 initial_state_word, &__uuidof(ID3D12GraphicsCommandList), &list);
++    if (FAILED(hr)) return hr;
++    if (!list) return E_FAIL;
++    auto* unknown = static_cast<IUnknown*>(list);
++    if (IsEqualIID(*riid, __uuidof(ID3D12GraphicsCommandList))) {
++        *out = list;
++        return S_OK;
++    }
++    void* asked = nullptr;
++    if (SUCCEEDED(unknown->QueryInterface(*riid, &asked)) && asked) {
++        unknown->Release();
++        *out = asked;
++        return S_OK;
++    }
++    static std::atomic<bool> console_iid_logged{false};
++    if (first_call(console_iid_logged))
++        std::fprintf(stderr, "[rt] d3d12_xs: slot 73 asks for a list IID the PC does not know; answered with the "
++                             "console list proxy\n");
++    *out = list;
++    return S_OK;
+ }
+ 
+ // Device slot 48, measured on the retail title: (desc, riid, out) with riid = IID_ID3D12CommandQueue. On the PC the
+diff --git a/runtime/shims/d3d12_xs_device.h b/runtime/shims/d3d12_xs_device.h
+index 1d998e097..12c3de136 100644
+--- a/runtime/shims/d3d12_xs_device.h
++++ b/runtime/shims/d3d12_xs_device.h
+@@ -15,9 +15,10 @@
+ //   slot 76   resource creation -> PC CreateCommittedResource (PC slot 27), with the Xbox layout word ignored.
+ //   slot 48   CreateCommandQueueX(desc, riid, out) -> the same queue proxy as slot 8. The Xbox desc's first fields are
+ //             D3D12_COMMAND_QUEUE_DESC's (public HLE).
+-//   slot 73   CreateCommandListX(desc, allocator, initialState, riid, out) -> PC CreateCommandList(0, type, allocator,
+-//             initialState, riid, out). The type is the first word of the Xbox desc; there is no node-mask argument
+-//             in the console call (public HLE; the PC six-argument form differs).
++//   slot 73   CreateCommandListX(desc, allocator, initialState, riid, out) -> the slot 12 console list proxy over PC
++//             CreateCommandList(0, type, allocator, initialState). The type is the first word of the Xbox desc; there
++//             is no node-mask argument in the console call (public HLE; the PC six-argument form differs). An riid the
++//             proxy does not answer (the console's own list IID) is answered with the proxy.
+ //   slots 78/79/80  SetFrameIntervalX, ScheduleFrameEventX, WaitFrameEventX. A per-device token state machine answers
+ //             them before the PC vtable is indexed; WaitFrameEventX returns at once with a fresh non-zero token.
+ //             Slot 80 is outside a PC ID3D12Device11 table, so it is checked before the beyond-table refusal.
+diff --git a/runtime/test/xs_proxy_mock_test.cpp b/runtime/test/xs_proxy_mock_test.cpp
+index e003c09ad..a693a3abc 100644
+--- a/runtime/test/xs_proxy_mock_test.cpp
++++ b/runtime/test/xs_proxy_mock_test.cpp
+@@ -804,12 +804,29 @@ int check_xbox_slots() {
+     EXPECT(mock->calls[73] == 0 && mock->calls[12] == 1 && xs::device_slot_hits(73) == 1);
+     EXPECT(mock->args[12][0] == 0 && mock->args[12][1] == D3D12_COMMAND_LIST_TYPE_DIRECT);
+     EXPECT(mock->args[12][2] == word(real_allocator) && mock->args[12][3] == 0);
+-    EXPECT(mock->args[12][4] == word(&list_iid));
++    EXPECT(IsEqualIID(*reinterpret_cast<const IID*>(mock->args[12][4]), list_iid));
+ 
+     // Release the list before the refusal calls below: the COM convention (and the handler) nulls the caller's
+     // output on failure, so an invalid call would clear this pointer.
+     EXPECT(release(list) == 0);
+ 
++    // An IID the PC does not know (the console's own list IID; this one is made up for the test) still gets a list:
++    // the console list proxy, not a failure from the PC device.
++    // {8d2c4f61-3a5e-4b7c-9e10-2f6a8b4c3d51}
++    constexpr GUID kConsoleListIid{0x8d2c4f61, 0x3a5e, 0x4b7c, {0x9e, 0x10, 0x2f, 0x6a, 0x8b, 0x4c, 0x3d, 0x51}};
++    void* console_list = nullptr;
++    EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&kConsoleListIid), word(&console_list))) ==
++           S_OK);
++    EXPECT(xs::is_list_proxy(console_list) && mock->calls[12] == 2 && mock->calls[73] == 0);
++    EXPECT(IsEqualIID(*reinterpret_cast<const IID*>(mock->args[12][4]), list_iid));
++    EXPECT(release(console_list) == 0);
++    // A PC list IID the proxy answers is returned as asked.
++    const IID list1_iid = __uuidof(ID3D12GraphicsCommandList1);
++    void* list1 = nullptr;
++    EXPECT(hr_of(raw(device, 73, word(&desc), word(allocator), 0, word(&list1_iid), word(&list1))) == S_OK);
++    EXPECT(xs::is_list_proxy(list1) && mock->calls[12] == 3);
++    EXPECT(release(list1) == 0);
++
+     // Missing description, allocator or output: E_INVALIDARG/E_POINTER before the real device is called.
+     EXPECT(hr_of(raw(device, 73, 0, word(allocator), 0, word(&list_iid), word(&list))) == E_INVALIDARG);
+     EXPECT(hr_of(raw(device, 73, word(&desc), 0, 0, word(&list_iid), word(&list))) == E_INVALIDARG);

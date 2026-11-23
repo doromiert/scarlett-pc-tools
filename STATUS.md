@@ -46,8 +46,27 @@ Source review advanced to `4ce16cd58e7ada451088d978d96320cb27881bcb`.
 The tested artifact above is a separate,
 explicitly identified revision, not a build of that newer checkout.
 
+## Locally built native integration
+
+The source recipe and exact revisions are in [LEONIDA_INTEGRATION.md](LEONIDA_INTEGRATION.md).
+On Wine 11.0, Mesa 26.1.8 / RADV, Linux 6.18.48 and an RX 6900 XT,
+launching the actual supplied executable with the opt-in shared-memory adapter:
+
+- Entered the executable, initialized GameInput, and opened a file through DirectStorage.
+- Allocated physical pages and created a Vulkan device on the RX 6900 XT.
+- Created five queues, five fences, and 581 command lists that were then closed.
+- Reserved placeholder ranges and imported the title's physical memory as a GPU buffer.
+- Created descriptor heaps through the title's allocation hooks and reached view creation.
+- Stopped in device slot 70, where an Xbox raw shader-resource-view call is incorrectly
+  forwarded to PC `CreatePlacedResource1`, causing an access violation.
+
+The last real run did not reach a draw, present, menu or playable scene. Upstream
+[PR 7066](https://github.com/ItsNotRexed/Leonida/pull/7066) identifies the same slot,
+but currently substitutes a null SRV without implementing its raw GPU-address
+semantics. It is not included in this snapshot. Assertions were not skipped.
+
 ## Not verified
 
-Native graphics, translated shader output, a playable scene, simulation speed at
+Rendered output, translated game shaders, a playable scene, simulation speed at
 different render rates, or gyro aiming. The last two remain requirements in
 ROADMAP.md. No timing or input patches are applied to the game.

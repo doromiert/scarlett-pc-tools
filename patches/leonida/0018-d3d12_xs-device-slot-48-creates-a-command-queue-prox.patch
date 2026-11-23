@@ -1,0 +1,149 @@
+From 0fbd47111e367491bce729a129e1ad4c7b754cca Mon Sep 17 00:00:00 2001
+From: Alex Collini <pipodi93@gmail.com>
+Date: Mon, 23 Nov 2026 16:30:47 +0100
+Subject: [PATCH 18/33] d3d12_xs: device slot 48 creates a command queue proxy
+ from the 32-byte Xbox description
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/d3d12_vulkan.md                |  2 +-
+ runtime/shims/d3d12_xs_device.cpp   | 28 ++++++++++++++++++++++++--
+ runtime/test/xs_proxy_mock_test.cpp | 31 +++++++++++++++++++++++++++--
+ 3 files changed, 56 insertions(+), 5 deletions(-)
+
+diff --git a/docs/d3d12_vulkan.md b/docs/d3d12_vulkan.md
+index ba16a3cdf..c449bde46 100644
+--- a/docs/d3d12_vulkan.md
++++ b/docs/d3d12_vulkan.md
+@@ -2084,7 +2084,7 @@ The trace will enumerate them.
+ 
+ | D3D12 / Xbox object | Vulkan / layer object | Notes |
+ |---|---|---|
+-| `ID3D12Device` … `ID3D12Device11` | one `Device` object with the public chain plus measured Xbox overrides | The shipped BVH builder names Device11; slots 1/15/18/19/27/38 matched desktop in prior art, slot 62 is called as `CreateComputePipelineState`, slot 76 is Xbox texture creation, and heap slots 9/10 return in RAX. Unknown Xbox IIDs/slots are logged and refused. |
++| `ID3D12Device` … `ID3D12Device11` | one `Device` object with the public chain plus measured Xbox overrides | The shipped BVH builder names Device11; slots 1/15/18/19/27/38 matched desktop in prior art, slot 48 is called as `(desc, riid, out)` with `IID_ID3D12CommandQueue` (PC slot 48 is `OpenExistingHeapFromAddress`; the 32-byte desc is a PC `D3D12_COMMAND_QUEUE_DESC` plus four Xbox words, logged once, and the proxy takes the slot 8 path with the PC prefix and only `DISABLE_GPU_TIMEOUT` kept), slot 62 is called as `CreateComputePipelineState`, slot 76 is Xbox texture creation, and heap slots 9/10 return in RAX. Unknown Xbox IIDs/slots are logged and refused. |
+ | `ID3D12CommandQueue` | one leased `VkQueue` per live queue: direct queues on the graphics family, compute queues on an async-compute family and copy queues on a transfer-only (DMA) family when the GPU has them (`src/queue_families.h`), else graphics-family leases | Distinct Vulkan queues allow cross-queue waits and signals to make progress. With more than one family in use, buffers, images, the arena and staging are created `VK_SHARING_MODE_CONCURRENT` over those families, so no ownership transfers are needed. Barriers on copy and compute queues are narrowed to the stages their family has; render-target and depth clears are refused there (as in D3D12), and the D24/RGB96 copy conversions and bindless flushes stay off a transfer-only queue. Tested by `vk_queue_test`. `PresentX`, `SuspendX`, `ResumeX` are Xbox queue methods, not in the public vtable; public GDKX samples present only through them (§4.5). Call shapes known, slots **Open**. |
+ | `ID3D12CommandAllocator` | IR arena + `VkCommandPool` | Reset only when the previous submission's fence is complete. |
+ | `ID3D12GraphicsCommandList` … `8` | `CommandList` with IR | Replay at `ExecuteCommandLists`; bundles inlined. Supports render passes, mesh dispatch, enhanced barriers; records the GCL8 front/back stencil references (applied only once a pipeline path consumes them). `Draw` views are inlined and moved into the command stream (D3D-289), eliminating per-draw heap allocations. |
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index 413a2682c..4cbbff0cd 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -6,7 +6,7 @@
+ // arguments only, so the x64 registers and stack words line up exactly; methods that return a struct keep their
+ // hidden return pointer in RDX, which is passed through as the first argument unchanged. The measured exceptions
+ // are IUnknown (0-2), slot 14 (which wraps the heap), 26 (the title passes the return buffer in RCX and the device in
+-// RDX), 62 and 76, plus the heap proxy's 9/10 conversion from the PC hidden-pointer form to the Xbox RAX form. Slots
++// RDX), 48 (Xbox queue creation), 62 and 76, plus the heap proxy's 9/10 conversion from the PC hidden-pointer form to the Xbox RAX form. Slots
+ // 8/75 (command queues), 36 (fences) and 32 (a shared fence) wrap what they create in queue and fence proxies built
+ // the same way, and slots 31/34/35/45/46/50 hand the real objects behind heap, queue and fence proxies to the real
+ // device (see the command queue and fence section).
+@@ -139,7 +139,7 @@ const char* slot_name(unsigned slot) {
+         case 43: return "GetAdapterLuid";
+         case 45: return "SetEventOnMultipleFenceCompletion (fence proxies unwrapped)";
+         case 46: return "SetResidencyPriority (proxies unwrapped)";
+-        case 48: return "Xbox CreateCommandQueueX -> queue proxy";
++        case 48: return "Xbox CreateCommandQueue (32-byte desc) -> queue proxy";
+         case 50: return "EnqueueMakeResident (proxies unwrapped)";
+         case 62: return "Xbox CreateComputePipelineState";
+         case 67: return "Xbox DeserializeComputePipelineStateX";
+@@ -1217,6 +1217,26 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word,
+     return self->real->CreateCommandList(0, type, allocator, initial_state, *riid, out);
+ }
+ 
++// Device slot 48, measured on the retail title: (desc, riid, out) with riid = IID_ID3D12CommandQueue. On the PC the
++// slot is OpenExistingHeapFromAddress, so forwarding it by number fails. desc is a PC D3D12_COMMAND_QUEUE_DESC
++// (16 bytes) followed by four more 32-bit Xbox words of unknown meaning, logged once. Only the PC prefix is used and
++// only the flag the PC knows is kept; the rest is the slot 8 path.
++HRESULT proxy_create_command_queue_xbox(DeviceProxy* self, const std::uint32_t* desc, const IID* riid, void** out) {
++    note_slot(48);
++    if (out) *out = nullptr;
++    if (!desc) return E_INVALIDARG;
++    static_assert(sizeof(D3D12_COMMAND_QUEUE_DESC) == 16, "the PC prefix of the Xbox description is 16 bytes");
++    D3D12_COMMAND_QUEUE_DESC pc{};
++    std::memcpy(&pc, desc, sizeof(pc));
++    pc.Flags &= D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT;
++    static std::atomic<bool> logged{false};
++    if (!logged.exchange(true, std::memory_order_relaxed))
++        std::fprintf(stderr,
++                     "[rt] d3d12_xs: slot 48 queue: flags=0x%x extra words=0x%x 0x%x 0x%x 0x%x\n",
++                     static_cast<unsigned>(desc[2]), desc[4], desc[5], desc[6], desc[7]);
++    return proxy_create_command_queue(self, &pc, riid, out);
++}
++
+ // Device slot 75: ID3D12Device9::CreateCommandQueue1(desc, creator_id, riid, out), called by slot index.
+ HRESULT proxy_create_command_queue1(DeviceProxy* self, std::uint64_t desc, std::uint64_t creator_id,
+                                     const IID* riid, void** out) {
+@@ -1512,6 +1532,10 @@ std::uint64_t WINAPI proxy_slot(DeviceProxy* self, std::uint64_t a1, std::uint64
+     } else if constexpr (Slot == 8) {
+         return hr_to_u64(proxy_create_command_queue(self, reinterpret_cast<const D3D12_COMMAND_QUEUE_DESC*>(a1),
+                                                     reinterpret_cast<const IID*>(a2), reinterpret_cast<void**>(a3)));
++    } else if constexpr (Slot == 48) {
++        return hr_to_u64(proxy_create_command_queue_xbox(self, reinterpret_cast<const std::uint32_t*>(a1),
++                                                         reinterpret_cast<const IID*>(a2),
++                                                         reinterpret_cast<void**>(a3)));
+     } else if constexpr (Slot == 9) {
+         return hr_to_u64(proxy_create_command_allocator(self, a1, reinterpret_cast<const IID*>(a2),
+                                                         reinterpret_cast<void**>(a3)));
+diff --git a/runtime/test/xs_proxy_mock_test.cpp b/runtime/test/xs_proxy_mock_test.cpp
+index 329ed48a2..e9f7c1253 100644
+--- a/runtime/test/xs_proxy_mock_test.cpp
++++ b/runtime/test/xs_proxy_mock_test.cpp
+@@ -93,6 +93,7 @@ struct Mock {
+     unsigned calls[kMockSlots];
+     std::uint64_t args[kMockSlots][5];
+     std::uint64_t array[kMockSlots][4];  // device: the first entries of the array argument, as received
++    D3D12_COMMAND_QUEUE_DESC queue_desc;  // device: the description of its last CreateCommandQueue (slot 8)
+ };
+ 
+ Mock g_pool[256];
+@@ -188,7 +189,9 @@ std::uint64_t mock_call(Mock* m, unsigned slot, const std::uint64_t* words) {
+     const std::uint64_t a1 = words[0], a2 = words[1], a3 = words[2], a4 = words[3];
+     if (m->kind == Kind::device) {
+         switch (slot) {
+-            case 8: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));    // CreateCommandQueue
++            case 8:                                                                           // CreateCommandQueue
++                if (a1) std::memcpy(&m->queue_desc, reinterpret_cast<const void*>(a1), sizeof(m->queue_desc));
++                return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a2, a3));
+             case 9: return static_cast<std::uint32_t>(mock_create(m, Kind::allocator, a2, a3));  // CreateCmdAllocator
+             case 75: return static_cast<std::uint32_t>(mock_create(m, Kind::queue, a3, a4));   // CreateCommandQueue1
+             case 36: return static_cast<std::uint32_t>(mock_create(m, Kind::fence, a3, a4));   // CreateFence
+@@ -403,6 +406,30 @@ int check_levels() {
+     return 0;
+ }
+ 
++// ---- 1b. Slot 48: the title's CreateCommandQueue with a 32-byte description ----
++
++int check_slot48() {
++    Mock* mock = nullptr;
++    void* device = make_device(mock, 3, true);
++    EXPECT(device);
++    // 16-byte PC prefix, then four Xbox words; the flags carry a bit the PC does not know besides the timeout bit.
++    const std::uint32_t desc[8] = {D3D12_COMMAND_LIST_TYPE_COMPUTE, 100,
++                                   0x8000u | D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT, 1, 0x11, 0x22, 0x33, 0x44};
++    void* queue = reinterpret_cast<void*>(1);
++    EXPECT(hr_of(raw(device, 48, word(desc), word(&kQueueIid), word(&queue))) == S_OK);
++    EXPECT(xs::is_queue_proxy(queue) && mock->calls[8] == 1);
++    EXPECT(mock->queue_desc.Type == D3D12_COMMAND_LIST_TYPE_COMPUTE && mock->queue_desc.Priority == 100 &&
++           mock->queue_desc.Flags == D3D12_COMMAND_QUEUE_FLAG_DISABLE_GPU_TIMEOUT &&
++           mock->queue_desc.NodeMask == 1);
++    EXPECT(release(queue) == 0);
++    void* none = reinterpret_cast<void*>(1);
++    EXPECT(hr_of(raw(device, 48, 0, word(&kQueueIid), word(&none))) == E_INVALIDARG && !none);
++    EXPECT(mock->calls[8] == 1);
++    EXPECT(release(device) == 0);
++    std::printf("%s: slot 48 makes a queue proxy from a 32-byte description, PC prefix and flags only\n", g_label);
++    return 0;
++}
++
+ // ---- 2. Fences with and without ID3D12Fence1 ----
+ 
+ int check_fence1() {
+@@ -1002,7 +1029,7 @@ int main(int argc, char** argv) {
+         return run_fault_mode(argv[1]);
+     }
+     if (argc != 1) return 2;
+-    if (check_tail(true) || check_levels() || check_fence1() || check_create_failures() || check_open_shared() ||
++    if (check_tail(true) || check_levels() || check_slot48() || check_fence1() || check_create_failures() || check_open_shared() ||
+         check_alloc_failures() || check_allocators() || check_xbox_slots() || check_custom_heap_properties())
+         return 1;
+     std::printf("xs_proxy_mock_test: PASS (%d allocations refused on purpose)\n", g_failed_news);

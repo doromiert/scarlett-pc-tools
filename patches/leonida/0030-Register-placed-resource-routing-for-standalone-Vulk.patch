@@ -1,0 +1,31 @@
+From b06ace713a94274d8d3ded8670854d556c57d689 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 17:31:08 +0100
+Subject: [PATCH 30/33] Register placed-resource routing for standalone Vulkan
+ devices too
+
+---
+ runtime/shims/d3d12_vulkan_device.cpp | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
+index a1aa308bd..f7e405d97 100644
+--- a/runtime/shims/d3d12_vulkan_device.cpp
++++ b/runtime/shims/d3d12_vulkan_device.cpp
+@@ -4845,6 +4845,8 @@ public:
+     static constexpr GUID kTag{0xc58e1d27, 0x3a96, 0x4b4f, {0x9e, 0x72, 0x6d, 0x0a, 0x8b, 0x5f, 0x3c, 0x61}};
+ 
+     explicit Device(const VulkanDeviceInfo& info) {
++        // Both externally supplied and standalone Vulkan devices must route console placed resources.
++        rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
+         state_.info = info;
+         queue_users_.resize(info.command_queues.size(), 0);
+         compute_users_.resize(info.compute_queues.size(), 0);
+@@ -8463,7 +8465,6 @@ private:
+ HRESULT create_vulkan_device(const VulkanDeviceInfo& info, REFIID riid, void** out) {
+     if (!out) return E_POINTER;
+     *out = nullptr;
+-    rt::d3d12_xs::set_placed_at_va_handler(&create_buffer_at_host_address);
+     auto* device = new Device(info);
+     if (!device->ok()) {
+         device->Release();

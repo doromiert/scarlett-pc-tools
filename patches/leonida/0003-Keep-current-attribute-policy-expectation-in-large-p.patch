@@ -1,0 +1,26 @@
+From 69688056514adbac908624cf1d4d4115cb62c7ba Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 16:54:29 +0100
+Subject: [PATCH 03/33] Keep current attribute-policy expectation in large-page
+ integration test
+
+---
+ runtime/test/xmem_test.cpp | 5 +++--
+ 1 file changed, 3 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/test/xmem_test.cpp b/runtime/test/xmem_test.cpp
+index 6966419d4..5562b25f4 100644
+--- a/runtime/test/xmem_test.cpp
++++ b/runtime/test/xmem_test.cpp
+@@ -501,8 +501,9 @@ void test_virtual_alloc_large_pages(XMemVirtualAllocFn virtual_alloc) {
+ 
+     SetLastError(ERROR_SUCCESS);
+     void* const attributed = virtual_alloc(nullptr, k2MiB, MEM_RESERVE | MEM_COMMIT | kLargePages, 1, PAGE_READWRITE);
+-    check(attributed == nullptr && GetLastError() == ERROR_NOT_SUPPORTED,
+-          "a nonzero attribute word is still rejected with 2 MiB pages");
++    check(attributed != nullptr && reinterpret_cast<uintptr_t>(attributed) % k2MiB == 0,
++          "2 MiB pages retain main's recorded-only attribute policy and alignment");
++    if (attributed) check(VirtualFree(attributed, 0, MEM_RELEASE), "release the attributed 2 MiB region");
+ }
+ 
+ using HostVirtualAllocFn = void*(WINAPI*)(void*, SIZE_T, DWORD, DWORD);

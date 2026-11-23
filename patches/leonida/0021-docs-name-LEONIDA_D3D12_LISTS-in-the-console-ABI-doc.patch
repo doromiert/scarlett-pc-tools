@@ -1,0 +1,34 @@
+From eab4a7fae544dbf375392da8950b4e67d304e88e Mon Sep 17 00:00:00 2001
+From: Nolan Cotter <186326284+NolanCotter@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 05:17:59 -0700
+Subject: [PATCH 21/33] docs: name LEONIDA_D3D12_LISTS in the console ABI doc
+
+test_every_variable_is_named_in_a_document fails when a code-used
+environment variable is documented nowhere. The variable is described
+in the command-list section where the two list layouts are defined.
+
+Generated with [Devin](https://devin.ai)
+
+Co-Authored-By: Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+---
+ docs/d3d12_xs_console_abi.md | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/docs/d3d12_xs_console_abi.md b/docs/d3d12_xs_console_abi.md
+index 39f570b28..604eb0e1f 100644
+--- a/docs/d3d12_xs_console_abi.md
++++ b/docs/d3d12_xs_console_abi.md
+@@ -171,6 +171,13 @@ Layout shift on the list tail (sibling layer): from `CopyTextureRegionX` on, met
+ later in the newer layout — newer→older pairs 85→83, 86→84, 87→85, 90→88, 91→89, 92→90, 95→93,
+ 96→94.
+ 
++The shim hands out console-shaped command lists by default: `GetCommandList`-shaped queries build
++the proxy with the console vtable above. `LEONIDA_D3D12_LISTS=pc` makes it hand out PC-shaped lists
++instead, for guests compiled against the PC headers (the `tiny_frame` test fixture calls through PC
++vtable indices; without the variable its `ClearRenderTargetView` at PC slot 48 lands on the
++console's `IASetVertexBuffers` and `Close` never runs). The device, queue, heap and fence stay
++console-shaped either way.
++
+ ### 5.4 DMA command list
+ 
+ | Slot | Method | Evidence |

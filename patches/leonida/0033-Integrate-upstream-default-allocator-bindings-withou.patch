@@ -1,0 +1,58 @@
+From 8a06c50ec6f009224344c33078b2f91a0ef6b474 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 17:38:53 +0100
+Subject: [PATCH 33/33] Integrate upstream default allocator bindings without
+ replacing physical storage
+
+---
+ runtime/shims/xmem.cpp | 30 ++++++++++++++++++++++++++++++
+ 1 file changed, 30 insertions(+)
+
+diff --git a/runtime/shims/xmem.cpp b/runtime/shims/xmem.cpp
+index 0a9eae7e4..cea033996 100644
+--- a/runtime/shims/xmem.cpp
++++ b/runtime/shims/xmem.cpp
+@@ -63,6 +63,33 @@ void __stdcall XMemFree(void* p, uint64_t attributes) {
+     _aligned_free(p);
+ }
+ 
++// Default allocator bindings adapted from upstream PR #6919 (36936f3b, NiiRoZz).
++// XMemAllocDefault / XMemFreeDefault: the GDK's own allocator behind XMemAlloc and XMemFree, which a title that hooks
++// XMemAlloc forwards to. The measured title reaches each through one wrapper that is a bare tail jump to the import,
++// so they take exactly XMemAlloc's and XMemFree's arguments. They share the heap: a block from either allocator may be
++// released by either free.
++void* __stdcall XMemAllocDefault(size_t size, uint64_t attributes) {
++    note_attributes("XMemAllocDefault", attributes, size, _ReturnAddress());
++    return _aligned_malloc(size ? size : 1, kAlign);
++}
++
++void __stdcall XMemFreeDefault(void* p, uint64_t attributes) {
++    note_attributes("XMemFreeDefault", attributes, kNoSize, _ReturnAddress());
++    _aligned_free(p);
++}
++
++// BOOL XMemIsToolsMemAvailable(void). The measured title calls it from one helper, which six out-of-memory paths reach
++// only after an allocation has failed; the helper breaks into the debugger when the result is zero. Tools memory is
++// the extra memory of a development kit. A PC has none, so the answer is FALSE, and the title's own breakpoint marks
++// where it ran out of memory.
++BOOL WINAPI XMemIsToolsMemAvailable() {
++    static std::atomic<bool> warned{false};
++    if (!warned.exchange(true, std::memory_order_relaxed)) {
++        std::fprintf(stderr, "[rt] xmem: XMemIsToolsMemAvailable -> FALSE (no devkit tools memory; logged once)\n");
++    }
++    return FALSE;
++}
++
+ // Measured call sites pass a zeroed 64-byte structure. Only the MEMORY_BASIC_INFORMATION-compatible prefix is
+ // known: callers read at least the base and size fields. Fill that prefix from VirtualQueryEx and zero the rest.
+ constexpr size_t kVirtualQueryOutSize = 64;
+@@ -458,6 +485,9 @@ SHIM_TABLE(title_memory,
+ );
+ 
+ SHIM_TABLE(xmem,
++    {"xmem.dll", "XMemAllocDefault", reinterpret_cast<void*>(&XMemAllocDefault)},
++    {"xmem.dll", "XMemFreeDefault", reinterpret_cast<void*>(&XMemFreeDefault)},
++    {"xmem.dll", "XMemIsToolsMemAvailable", reinterpret_cast<void*>(&XMemIsToolsMemAvailable)},
+     {"xmem.dll", "XMemAlloc", reinterpret_cast<void*>(&XMemAlloc)},
+     {"xmem.dll", "XMemFree", reinterpret_cast<void*>(&XMemFree)},
+     {"xmem.dll", "XMemVirtualQuery", reinterpret_cast<void*>(&XMemVirtualQuery)},

@@ -1,0 +1,27 @@
+From ab85cda518a82759ee03ca53e86c53053b7b621c Mon Sep 17 00:00:00 2001
+From: kotorvr <332716892+kotorvr@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 20:29:04 +0000
+Subject: [PATCH 08/33] check_loaded_gameinput: match the dot with [.], not an
+ invalid CMake escape
+
+"\." is not an escape CMake knows in a quoted argument. CMake 3.31 in
+script mode warns and leaves the whole string unprocessed, so "\n" stayed
+literal too and the binding line never matched; CMake 4 accepted it.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ runtime/test/check_loaded_gameinput.cmake | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/runtime/test/check_loaded_gameinput.cmake b/runtime/test/check_loaded_gameinput.cmake
+index 93252218a..ee01459b2 100644
+--- a/runtime/test/check_loaded_gameinput.cmake
++++ b/runtime/test/check_loaded_gameinput.cmake
+@@ -13,6 +13,6 @@ if(NOT code STREQUAL "0" OR NOT output MATCHES "(^|\n)tiny_gameinput: PASS(\n|$)
+     OR NOT output MATCHES "(^|\n)game exited with code 0(\n|$)")
+   message(FATAL_ERROR "Loaded GameInput ordinal fixture returned ${code}\n${output}")
+ endif()
+-if(NOT output MATCHES "(^|\n) +shim +GameInput\.dll!#1(\n|$)")
++if(NOT output MATCHES "(^|\n) +shim +GameInput[.]dll!#1(\n|$)")
+   message(FATAL_ERROR "GameInput.dll ordinal 1 was not bound to the shim\n${output}")
+ endif()

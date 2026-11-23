@@ -1,0 +1,104 @@
+From bed948ae520e2be758025dfa3620259ea43fcfad Mon Sep 17 00:00:00 2001
+From: Spaghetih <191181391+Spaghetih@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 16:42:18 +0100
+Subject: [PATCH 01/33] d3d12_xs: serve D3D12ConfigureVirtualMemoryX, the
+ retail executable's first d3d12_xs call (D3D-661)
+
+The 1.0.2.1 executable calls it once, with a pointer to a 32-byte input block, and checks only for success. The PC device has no GPU virtual-address layout to configure, so the shim logs the block and returns S_OK.
+
+AI-assisted (Claude Code).
+---
+ docs/d3d12_xs_surface.md       |  2 +-
+ runtime/shims/d3d12_xs.cpp     | 27 +++++++++++++++++++++++++++
+ runtime/test/root_sig_test.cpp | 15 +++++++++++++++
+ 3 files changed, 43 insertions(+), 1 deletion(-)
+
+diff --git a/docs/d3d12_xs_surface.md b/docs/d3d12_xs_surface.md
+index aed604416..1b7bf83f8 100644
+--- a/docs/d3d12_xs_surface.md
++++ b/docs/d3d12_xs_surface.md
+@@ -64,7 +64,7 @@ and the individual stubs in
+ | 1 | `D3D12ZeroMemoryX` | console | absent | console fast-zero; `memset` is equivalent |
+ | 2 | `PixGetPixieEntryPoints` | console (PIX) | absent | no PIX path |
+ | 3 | `D3D10CreateBlob` | console (D3D10) | absent | local `ID3D10Blob`; no D3D10 dependency needed |
+-| 4 | `D3D12ConfigureVirtualMemoryX` | console | absent | VM policy; PC/Vulkan owns it |
++| 4 | `D3D12ConfigureVirtualMemoryX` | console | present | VM policy; PC/Vulkan owns it. Logs the caller's 32-byte input block and returns `S_OK` (D3D-661) |
+ | 5 | `D3D12CreateDevice` | standard | **absent** | Leonida exports only the Xbox entry point; see §2.3 |
+ | 6 | `D3D12CreateRootSignatureDeserializer` | standard | present | forwarded |
+ | 7 | `D3D12CreateVersionedRootSignatureDeserializer` | standard | absent | forward if imported |
+diff --git a/runtime/shims/d3d12_xs.cpp b/runtime/shims/d3d12_xs.cpp
+index cf3cdfaf8..7a5a298f0 100644
+--- a/runtime/shims/d3d12_xs.cpp
++++ b/runtime/shims/d3d12_xs.cpp
+@@ -213,6 +213,32 @@ HRESULT WINAPI D3D12XboxCreateDevice(IUnknown* adapter, const void* params, cons
+     return result(method, S_OK);
+ }
+ 
++// D3D-661. Call-site shape in the 1.0.2.1 executable (one call site; static look, issue #6750): one argument, a pointer
++// to a 32-byte block on the caller's stack. The caller zeroes the block and sets only the second 32-bit word, a value
++// derived from the size of the XMemVirtualAlloc reservation it makes next. The result is only checked for success
++// (>= 0), and the block is not read again after the call, so it is input only. It is the first d3d12_xs import the
++// title reaches, before D3D12XboxCreateDevice. The PC device has no GPU virtual-address layout to configure, so the
++// block is logged (8 x 32-bit words) and S_OK is returned. Only the first argument is read.
++HRESULT WINAPI D3D12ConfigureVirtualMemoryX(const void* config) {
++    constexpr auto method = "D3D12ConfigureVirtualMemoryX";
++    if (config) {
++        const uint32_t* words = static_cast<const uint32_t*>(config);
++        char line[8 * 9 + 1];
++        line[0] = '\0';
++        size_t used = 0;
++        for (int i = 0; i < 8 && used < sizeof(line); ++i) {
++            int n = std::snprintf(line + used, sizeof(line) - used, "%s%08x", i ? " " : "",
++                                  static_cast<unsigned>(words[i]));
++            if (n < 0) break;
++            used += static_cast<size_t>(n);
++        }
++        std::fprintf(stderr, "[rt] d3d12_xs: D3D12ConfigureVirtualMemoryX config[8] = %s\n", line);
++    } else {
++        std::fprintf(stderr, "[rt] d3d12_xs: D3D12ConfigureVirtualMemoryX config = null\n");
++    }
++    return rt::d3d12_trace::result(method, S_OK);
++}
++
+ static_assert(std::is_same_v<decltype(&serialize_root_signature), SerializeFn>);
+ static_assert(std::is_same_v<decltype(&create_root_signature_deserializer), DeserializerFn>);
+ static_assert(std::is_same_v<decltype(&serialize_root_signature_legacy), LegacySerializeFn>);
+@@ -225,4 +251,5 @@ SHIM_TABLE(d3d12_xs,
+     {"d3d12_xs.dll", "D3D12CreateRootSignatureDeserializer",
+      reinterpret_cast<void*>(&create_root_signature_deserializer)},
+     {"d3d12_xs.dll", "D3D12XboxCreateDevice", reinterpret_cast<void*>(&D3D12XboxCreateDevice)},
++    {"d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX", reinterpret_cast<void*>(&D3D12ConfigureVirtualMemoryX)},
+ );
+diff --git a/runtime/test/root_sig_test.cpp b/runtime/test/root_sig_test.cpp
+index c13bcc553..363243217 100644
+--- a/runtime/test/root_sig_test.cpp
++++ b/runtime/test/root_sig_test.cpp
+@@ -6,6 +6,7 @@
+ #include <windows.h>
+ #include <d3d12.h>
+ 
++#include <cstdint>
+ #include <cstdio>
+ #include <cstring>
+ #include <vector>
+@@ -308,6 +309,20 @@ void test_registered_shim(bool supports_1_2) {
+           "shim registry exposes d3d12_xs!D3D12CreateRootSignatureDeserializer");
+     check(rt::shims::find("d3d12_xs.dll", "D3D12XboxCreateDevice") != nullptr,
+           "shim registry exposes d3d12_xs!D3D12XboxCreateDevice");
++
++    // D3D-661: the title checks only for success (>= 0), with a pointer to a 32-byte block as the one argument.
++    using ConfigureFn = HRESULT(WINAPI*)(const void*);
++    auto configure = reinterpret_cast<ConfigureFn>(rt::shims::find("d3d12_xs.dll", "D3D12ConfigureVirtualMemoryX"));
++    check(configure != nullptr, "shim registry exposes d3d12_xs!D3D12ConfigureVirtualMemoryX");
++    if (configure) {
++        uint32_t block[8] = {0x11111111u, 0x22222222u, 0x33333333u, 0x44444444u,
++                             0x55555555u, 0x66666666u, 0x77777777u, 0x88888888u};
++        uint32_t before[8];
++        std::memcpy(before, block, sizeof(block));
++        check(configure(block) == S_OK, "D3D12ConfigureVirtualMemoryX returns S_OK for a 32-byte block");
++        check(std::memcmp(before, block, sizeof(block)) == 0, "D3D12ConfigureVirtualMemoryX leaves the block unchanged");
++        check(configure(nullptr) == S_OK, "D3D12ConfigureVirtualMemoryX returns S_OK for a null block");
++    }
+     if (!fn) return;
+ 
+     D3D12_VERSIONED_ROOT_SIGNATURE_DESC xbox{};

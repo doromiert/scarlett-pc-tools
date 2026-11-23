@@ -1,0 +1,86 @@
+From 78de5e5bef1b83cab03a433e5f2474099e9140e1 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 17:03:32 +0100
+Subject: [PATCH 06/33] Reconcile TLS integration tests with existing-thread
+ installation and Wine paths
+
+---
+ runtime/test/check_tls_index0.cmake     | 16 ++++++++++++++++
+ runtime/test/loader_tls_index0_test.cpp | 16 +++++++++-------
+ 2 files changed, 25 insertions(+), 7 deletions(-)
+
+diff --git a/runtime/test/check_tls_index0.cmake b/runtime/test/check_tls_index0.cmake
+index a1ca31b8f..9a3ada6b2 100644
+--- a/runtime/test/check_tls_index0.cmake
++++ b/runtime/test/check_tls_index0.cmake
+@@ -30,6 +30,22 @@ endforeach()
+ 
+ set(missing "${TRACE_DIR}/leonida_no_such_temp")
+ file(REMOVE_RECURSE "${missing}")
++# Wine replaces an inherited Unix TMP/TEMP with its default temporary directory. Translate the
++# intentionally invalid destination to a Windows path so this tests a failed reservation, not Wine's fallback.
++if(CMAKE_HOST_UNIX AND RUNNER)
++  list(GET RUNNER 0 _wine_runner)
++  get_filename_component(_wine_bin "${_wine_runner}" DIRECTORY)
++  find_program(_winepath NAMES winepath HINTS "${_wine_bin}")
++  if(NOT _winepath)
++    message(FATAL_ERROR "winepath is required to exercise the failed temporary-directory case under Wine")
++  endif()
++  execute_process(COMMAND "${_winepath}" -w "${missing}"
++    RESULT_VARIABLE _path_code OUTPUT_VARIABLE _missing_windows OUTPUT_STRIP_TRAILING_WHITESPACE)
++  if(NOT _path_code STREQUAL "0" OR _missing_windows STREQUAL "")
++    message(FATAL_ERROR "Cannot translate the invalid TMP path for the Wine reservation failure test")
++  endif()
++  set(missing "${_missing_windows}")
++endif()
+ foreach(mode run init dry-run)
+   execute_process(
+     COMMAND ${CMAKE_COMMAND} -E env "TMP=${missing}" "TEMP=${missing}" ${RUNNER} "${LOADER}" --${mode} "${GUEST}"
+diff --git a/runtime/test/loader_tls_index0_test.cpp b/runtime/test/loader_tls_index0_test.cpp
+index 6e4fa4fc7..fa1a2c273 100644
+--- a/runtime/test/loader_tls_index0_test.cpp
++++ b/runtime/test/loader_tls_index0_test.cpp
+@@ -210,8 +210,8 @@ __declspec(noinline) bool call_reserve(std::string* why) { return rt::reserve_tl
+ 
+ // ---- runs ----
+ 
+-// A thread started before the reservation that runs no TLS code before it. After the move it installs the
+-// executable's copy itself (install_tls_for_thread, as for any module and a thread older than load()).
++// A thread started before the reservation that runs no TLS code before it. Current main installs the executable
++// copy into existing threads during load(); explicit install/uninstall calls must leave that automatic copy alone.
+ struct EarlyThread {
+     HANDLE go = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+     HANDLE done = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+@@ -220,15 +220,16 @@ struct EarlyThread {
+     rt::Loader* loader = nullptr;
+     rt::Module* module = nullptr;
+     Ga ga{};
+-    int host = -1, ga_installed = -1, ga_after_set = -1;
++    int host = -1, ga_before_install = -1, ga_installed = -1, ga_after_set = -1;
+     bool host_at_home = false, block_in_slot0 = false, slot0_restored = false;
+ 
+     static __declspec(noinline) void checks(EarlyThread* t) {
+         t->host = host_value();
+         t->host_at_home = host_tls_at_home();
+         void* before = module_tls_slots()[0];
++        t->ga_before_install = t->ga.get();
+         t->loader->install_tls_for_thread(*t->module);
+-        t->block_in_slot0 = module_tls_slots()[0] != before;
++        t->block_in_slot0 = before != nullptr && before != t->module->tls_block && module_tls_slots()[0] == before;
+         t->ga_installed = t->ga.get();
+         t->ga.set(5);
+         t->ga_after_set = t->ga.get();
+@@ -305,9 +306,10 @@ void test_first_run(const fs::path& exe, const fs::path& dll, EarlyThread& early
+         WaitForSingleObject(early.done, INFINITE);
+         check(early.host == 1234 && early.host_at_home,
+               "a thread that existed before the reservation finds a fresh copy of this EXE's TLS at the home index");
+-        check(early.block_in_slot0 && early.ga_installed == 42 && early.ga_after_set == 5,
+-              "install_tls_for_thread gives that thread its own copy in slot 0");
+-        check(early.slot0_restored, "uninstall_tls_for_thread puts that thread's slot 0 back");
++        check(early.block_in_slot0 && early.ga_before_install == 42 && early.ga_installed == 42 && early.ga_after_set == 5,
++              "load installs an independent slot-0 copy on an existing thread; explicit install is a no-op");
++        check(ga.get() == 43, "the existing thread's write does not change the loading thread's copy");
++        check(early.slot0_restored, "explicit uninstall leaves the automatically installed slot-0 copy in place");
+ 
+         loader.initialise();
+         check(m.initialised, "initialise() runs the executable's TLS callbacks (it has none)");

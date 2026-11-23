@@ -1,0 +1,45 @@
+From 053b08d1708803afc9da38cd520c8b39d7ecdb3e Mon Sep 17 00:00:00 2001
+From: Alex Collini <pipodi93@gmail.com>
+Date: Mon, 23 Nov 2026 16:30:44 +0100
+Subject: [PATCH 25/33] d3d12_xs: extend the device proxy table to 192 slots so
+ slots past the PC vtable refuse with E_NOTIMPL
+
+The retail title calls device slot 133, past the 128-entry table; the call read an empty entry and jumped to 0.
+Every slot beyond the PC device's vtable now reaches the generic thunk. Mock test covers slot 133.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ runtime/shims/d3d12_xs_device.cpp   | 5 ++++-
+ runtime/test/xs_proxy_mock_test.cpp | 3 +++
+ 2 files changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index 42b2250ee..706bf989c 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -53,7 +53,10 @@
+ namespace rt::d3d12_xs {
+ namespace {
+ 
+-constexpr unsigned kMaxSlots = 128;
++// The retail title calls device slots well past ID3D12Device14 (slot 133 at least); every slot past the PC device's
++// vtable goes through the generic thunk and is refused with E_NOTIMPL, so the table must outlast the highest one.
++constexpr unsigned kMaxSlots = 192;
++static_assert(kMaxSlots > 133, "the proxy table must cover the slots the retail title calls (up to 133)");
+ static_assert(kMaxSlots > 83, "the proxy table must cover ID3D12Device14 (83 slots)");
+ static_assert(sizeof(void*) == 8, "the Xbox-ABI proxy is x64-only");
+ static_assert(sizeof(D3D12_CPU_DESCRIPTOR_HANDLE) == 8,
+diff --git a/runtime/test/xs_proxy_mock_test.cpp b/runtime/test/xs_proxy_mock_test.cpp
+index a693a3abc..a970fff2b 100644
+--- a/runtime/test/xs_proxy_mock_test.cpp
++++ b/runtime/test/xs_proxy_mock_test.cpp
+@@ -420,6 +420,9 @@ int check_levels() {
+             EXPECT(r75 == E_NOTIMPL && !queue1 && mock->calls[75] == 0);
+         }
+ 
++        // 133: past every PC device vtable; the retail title calls it. Refused, not a jump through a missing entry.
++        EXPECT(hr_of(raw(device, 133)) == E_NOTIMPL && mock->calls[127] == 0);
++
+         Mock* const queue_mock = reinterpret_cast<Mock*>(real_queue);
+         Mock* const fence_mock = reinterpret_cast<Mock*>(real_fence);
+         EXPECT(release(queue) == 0 && release(fence) == 0);

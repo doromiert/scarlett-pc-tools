@@ -1,0 +1,52 @@
+From c49699278fb3e31f6f199bc0302eb479850fc89f Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 17:16:14 +0100
+Subject: [PATCH 09/33] Set invalid TMP inside Wine for TLS reservation failure
+ test
+
+---
+ runtime/test/check_tls_index0.cmake | 29 +++++++++++++++++++++++++----
+ 1 file changed, 25 insertions(+), 4 deletions(-)
+
+diff --git a/runtime/test/check_tls_index0.cmake b/runtime/test/check_tls_index0.cmake
+index 9a3ada6b2..9d708d9f7 100644
+--- a/runtime/test/check_tls_index0.cmake
++++ b/runtime/test/check_tls_index0.cmake
+@@ -45,12 +45,33 @@ if(CMAKE_HOST_UNIX AND RUNNER)
+     message(FATAL_ERROR "Cannot translate the invalid TMP path for the Wine reservation failure test")
+   endif()
+   set(missing "${_missing_windows}")
++  foreach(_which LOADER GUEST)
++    execute_process(COMMAND "${_winepath}" -w "${${_which}}"
++      RESULT_VARIABLE _path_code OUTPUT_VARIABLE _${_which}_windows OUTPUT_STRIP_TRAILING_WHITESPACE)
++    if(NOT _path_code STREQUAL "0")
++      message(FATAL_ERROR "Cannot translate the ${_which} path for the Wine failure test")
++    endif()
++  endforeach()
+ endif()
+ foreach(mode run init dry-run)
+-  execute_process(
+-    COMMAND ${CMAKE_COMMAND} -E env "TMP=${missing}" "TEMP=${missing}" ${RUNNER} "${LOADER}" --${mode} "${GUEST}"
+-    TIMEOUT 90
+-    RESULT_VARIABLE code OUTPUT_VARIABLE output ERROR_VARIABLE error)
++  if(CMAKE_HOST_UNIX AND RUNNER)
++    # Wine also replaces invalid Windows TMP/TEMP inherited from Unix. Set them after bootstrap in a batch file.
++    # A batch file avoids the extra backslash quoting Wine adds to embedded quotes in a cmd /c argument.
++    set(_batch "${TRACE_DIR}/tls_invalid_temp_${mode}.cmd")
++    set(_body "@echo off\rchcp 65001 >nul\rset \"TMP=${missing}\"\rset \"TEMP=${missing}\"\r\"${_LOADER_windows}\" --${mode} \"${_GUEST_windows}\"\rexit /b %errorlevel%\r")
++    string(REPLACE "\r" "\r\n" _body "${_body}")
++    file(WRITE "${_batch}" "${_body}")
++    execute_process(COMMAND "${_winepath}" -w "${_batch}"
++      OUTPUT_VARIABLE _batch_windows OUTPUT_STRIP_TRAILING_WHITESPACE COMMAND_ERROR_IS_FATAL ANY)
++    execute_process(COMMAND ${RUNNER} cmd /d /c "${_batch_windows}"
++      TIMEOUT 90 RESULT_VARIABLE code OUTPUT_VARIABLE output ERROR_VARIABLE error)
++    file(REMOVE "${_batch}")
++  else()
++    execute_process(
++      COMMAND ${CMAKE_COMMAND} -E env "TMP=${missing}" "TEMP=${missing}" ${RUNNER} "${LOADER}" --${mode} "${GUEST}"
++      TIMEOUT 90
++      RESULT_VARIABLE code OUTPUT_VARIABLE output ERROR_VARIABLE error)
++  endif()
+   set(reason "module TLS index 0 \\(the home clone of gta6rt_tls_host.dll cannot be loaded")
+   if(mode STREQUAL "dry-run")
+     if(NOT code STREQUAL "0" OR NOT error MATCHES "does not get ${reason}")

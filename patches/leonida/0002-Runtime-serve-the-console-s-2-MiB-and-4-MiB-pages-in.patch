@@ -1,0 +1,562 @@
+From 4fb64a94f05377b7f521ac61191d9c14f2970188 Mon Sep 17 00:00:00 2001
+From: "Linnard Alex Brown Jr." <labj1987@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 21:08:03 -0500
+Subject: [PATCH 02/33] Runtime: serve the console's 2 MiB and 4 MiB pages in
+ XMemVirtualAlloc and a title's VirtualAlloc
+
+The console's allocation type picks the page size with bits the host reads
+differently: 0x20000000 (2 MiB) is the host's MEM_LARGE_PAGES, which needs
+SeLockMemoryPrivilege, 0x80000000 (4 MiB) is rejected, and 0x20400000 (64 KiB)
+becomes MEM_LARGE_PAGES | MEM_PHYSICAL. XMemVirtualAlloc failed the 2 MiB mode
+and rejected 4 MiB, and the title VirtualAlloc shim forwarded all three.
+
+Both now share one path: the bits are decoded (other combinations stay
+ERROR_INVALID_PARAMETER), never forwarded, and every page size is served from
+ordinary host pages with the base aligned to the page size (VirtualAlloc2 with
+an alignment requirement, else a reserve/release/reserve probe with retry),
+sizes and addresses rounded to whole pages, and one host allocation per
+region so VirtualFree and VirtualQuery match what was returned. A title's
+VirtualAlloc still needs an operation; nonzero XMem attribute words still
+fail with ERROR_NOT_SUPPORTED.
+
+Page-size values as read in OpenScarlett (MIT, kernelx_abi.h, xmemory.cpp) and
+omonkeyz/xbox-emulator (GPL-3.0-or-later, crates/compat/xmem/src/virt.rs); the
+probe fallback follows xbox-emulator's reserve_aligned (sys.rs).
+
+xmem_test gains 2 MiB / 4 MiB / 64 KiB cases for both entry points (24 of 104
+checks fail on main; 146/146 pass here), and xmem_probe reruns it with
+LEONIDA_XMEM_NO_VIRTUALALLOC2 set to cover the fallback.
+
+AI-assisted (Claude Code).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/runtime_imports.md    |  38 ++++++++
+ runtime/CMakeLists.txt     |   3 +
+ runtime/README.md          |   4 +-
+ runtime/shims/xmem.cpp     | 158 ++++++++++++++++++++++++++++------
+ runtime/test/xmem_test.cpp | 172 ++++++++++++++++++++++++++++++++++++-
+ 5 files changed, 342 insertions(+), 33 deletions(-)
+
+diff --git a/docs/runtime_imports.md b/docs/runtime_imports.md
+index a73736e99..7ec5cdc76 100644
+--- a/docs/runtime_imports.md
++++ b/docs/runtime_imports.md
+@@ -212,6 +212,44 @@ and the `api-ms-win-core-file-*` sets a GDK title links against.
+ 
+ `runtime/test/file_system_test.cpp` (ctest `file_system`) covers this over folders it makes in `%TEMP%`.
+ 
++## Console page sizes
++
++A title asks for the console's page sizes in the allocation type of `xmem.dll!XMemVirtualAlloc` and of its own
++`VirtualAlloc` (the `kernel32.dll`, `kernelbase.dll` and `api-ms-win-core-memory-l1-1-*` imports
++`runtime/shims/xmem.cpp` serves):
++
++| Allocation-type bits | Page size |
++|---|---|
++| `MEM_LARGE_PAGES \| MEM_PHYSICAL` (`0x20400000`) | 64 KiB |
++| `MEM_LARGE_PAGES` (`0x20000000`) | 2 MiB |
++| `MEM_4MB_PAGES` (`0x80000000`), with or without `MEM_LARGE_PAGES` | 4 MiB |
++
++The host reads the same bits differently: its `MEM_LARGE_PAGES` needs `SeLockMemoryPrivilege`, which a player's
++account does not hold, and it rejects `MEM_4MB_PAGES`. The values are the GDK names as other layers read them
++(OpenScarlett `include/openscarlett/kernel/kernelx_abi.h`, xbox-emulator `crates/compat/xmem/src/virt.rs`). The
++shim never forwards these bits. It serves every page size from ordinary host pages and keeps what a title can see
++of it:
++
++- a new region's base is a multiple of the page size (`VirtualAlloc2` with an alignment requirement; where that is
++  missing or refuses the parameter, a reserve-release-reserve probe that retries when another thread takes the
++  range);
++- the size is rounded up to whole pages, and an address given with the page-size bits is rounded out to the pages
++  it touches, so a commit with `MEM_LARGE_PAGES` inside a 2 MiB reservation commits that whole 2 MiB page;
++- each new region is one host allocation, so `VirtualFree(base, 0, MEM_RELEASE)` and `VirtualQuery` report the
++  base and the rounded size the title was given.
++
++`XMemVirtualAlloc` with no operation bit reserves and commits; a title's `VirtualAlloc` with a page-size bit still
++needs `MEM_RESERVE` or `MEM_COMMIT`, as on Win32. Any other combination of these bits (`0x00400000` alone with
++`XMemVirtualAlloc`, `MEM_4MB_PAGES` with `MEM_PHYSICAL`) fails with `ERROR_INVALID_PARAMETER`, and the
++`XMemVirtualAlloc` attribute word is recorded rather than applied, as on current main. A title's `VirtualAlloc` with
++`MEM_PHYSICAL` and no page-size bit goes to the host unchanged. Not covered: the page size is taken from each call's
++bits, not remembered per region, so a commit without them inside a 2 MiB reservation commits host pages only; the
++host still pages 4 KiB at a time (only TLB timing could tell); and no shim serves the physical-page calls
++(`XMemAllocatePhysicalPages` and the mapping functions), which take the same bits. `xmem_test` checks every page
++size through `XMemVirtualAlloc` (alignment, rounding, commit inside a reservation, release, the rejected
++combinations) and through a title's `VirtualAlloc` (alignment, rounding, release, the operation rule); `xmem_probe`
++runs it again with `LEONIDA_XMEM_NO_VIRTUALALLOC2` set, to cover the probe fallback.
++
+ ## When an unimplemented import is called
+ 
+ The table above has no unimplemented imports, but the game executable will. A call to one used to return 0
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index ffa310910..95b09250b 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -972,6 +972,9 @@ if(BUILD_TESTING)
+   endif()
+   if(WIN32 AND TARGET xmem_test)
+     add_test(NAME xmem COMMAND xmem_test)
++    # The same checks through the aligned-reservation fallback the shim uses where VirtualAlloc2 is missing.
++    add_test(NAME xmem_probe COMMAND xmem_test)
++    set_tests_properties(xmem_probe PROPERTIES ENVIRONMENT "LEONIDA_XMEM_NO_VIRTUALALLOC2=1")
+   endif()
+   if(WIN32 AND TARGET process_cmdline_test)
+     add_test(NAME process_cmdline COMMAND process_cmdline_test)
+diff --git a/runtime/README.md b/runtime/README.md
+index fef8a3bcb..1d0234c0f 100644
+--- a/runtime/README.md
++++ b/runtime/README.md
+@@ -161,7 +161,9 @@ Current limits, by design:
+   measured three-argument
+   `XMemVirtualQuery(process, address, out)`. Allocations are 64-byte aligned; the working-set and
+   virtual-query outputs fill the observed 64-byte structures and return `FALSE`/`0` on a null or bad
+-  address.
++  address. `XMemVirtualAlloc` and a title's `VirtualAlloc` serve the console's 64 KiB, 2 MiB and 4 MiB page modes
++  from ordinary host pages at the page size's alignment, without the host's large-page privilege; see
++  [docs/runtime_imports.md](../docs/runtime_imports.md#console-page-sizes).
+ - The `kernel32.dll` file API — `CreateFileA/W`, `FindFirstFileA/W`/`FindNextFileA/W`/`FindClose`,
+   `GetFileAttributesA/W`, `GetFileAttributesExA/W` and `DeleteFileA/W`: a `GAME:` path maps under `--game-dir`, an
+   open that can write and a delete go to `--overlay DIR` (default `<game-dir>\overlay`), which reads prefer, and a path
+diff --git a/runtime/shims/xmem.cpp b/runtime/shims/xmem.cpp
+index a1061af21..28fd90fce 100644
+--- a/runtime/shims/xmem.cpp
++++ b/runtime/shims/xmem.cpp
+@@ -127,14 +127,41 @@ BOOL __stdcall XMemGetWorkingSetStatistics(uint32_t /*kind*/, void* stats) {
+     return TRUE;
+ }
+ 
+-// XMem allocation-type page bits select the guest page granularity and must not be forwarded as Win32 flags.
++// The console's allocation type selects the page size with bits the host reads differently, so they are never
++// forwarded as Win32 flags:
++//   MEM_LARGE_PAGES (0x20000000) alone                        2 MiB pages
++//   MEM_LARGE_PAGES | MEM_PHYSICAL (0x20400000)               64 KiB pages
++//   MEM_4MB_PAGES (0x80000000), with or without MEM_LARGE_PAGES  4 MiB pages
++// Values: the GDK's names as read in OpenScarlett (include/openscarlett/kernel/kernelx_abi.h, MIT) and xbox-emulator
++// (crates/compat/xmem/src/virt.rs, GPL-3.0-or-later), which also picked this approach: on the host, MEM_LARGE_PAGES
++// needs SeLockMemoryPrivilege and MEM_4MB_PAGES is rejected outright, so the shim serves every page size from
++// ordinary pages and keeps what a title can see of the page size: the base is aligned to it and the region is a
++// whole number of pages. The host still pages 4 KiB at a time underneath, which a title cannot observe except through
++// TLB timing. Any other combination of these bits fails with ERROR_INVALID_PARAMETER.
+ constexpr DWORD kXmemLargePages = 0x20000000;
+-constexpr DWORD kXmem64kPages = 0x20400000;
+-constexpr DWORD kXmemPageModeMask = kXmem64kPages;
++constexpr DWORD kXmemPhysical = 0x00400000;
++constexpr DWORD kXmem64kPages = kXmemLargePages | kXmemPhysical;
++constexpr DWORD kXmem4MbPages = 0x80000000;
++constexpr DWORD kXmemPageModeMask = kXmem64kPages | kXmem4MbPages;
+ constexpr SIZE_T kXmemPageSize64k = 0x10000;
++constexpr SIZE_T kXmemPageSize2M = 0x200000;
++constexpr SIZE_T kXmemPageSize4M = 0x400000;
+ constexpr DWORD kXmemHostAllocationTypeMask =
+     MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH | 0x01000000;
+ 
++// The guest page size the allocation type asks for, or 0 for the host's own pages. False for a combination that names
++// no page size.
++bool guest_page_size(DWORD allocation_type, SIZE_T& page) {
++    switch (allocation_type & kXmemPageModeMask) {
++        case 0: page = 0; return true;
++        case kXmem64kPages: page = kXmemPageSize64k; return true;
++        case kXmemLargePages: page = kXmemPageSize2M; return true;
++        case kXmem4MbPages:
++        case kXmem4MbPages | kXmemLargePages: page = kXmemPageSize4M; return true;
++        default: return false;
++    }
++}
++
+ bool round_up_size(SIZE_T value, SIZE_T alignment, SIZE_T& rounded) {
+     const SIZE_T max = (std::numeric_limits<SIZE_T>::max)();
+     if (alignment == 0 || (alignment & (alignment - 1)) != 0 || value > max - (alignment - 1)) return false;
+@@ -152,26 +179,72 @@ DWORD host_protect(DWORD p) {
+     return cpu ? cpu : PAGE_NOACCESS;
+ }
+ 
+-void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
+-    // Host-backed support covers ordinary and 64 KiB guest reservations. The 2 MiB guest mode needs an aligned
+-    // reservation strategy that this shim does not provide, so fail explicitly instead of returning a misaligned
+-    // region.
+-    //
+-    // The attribute word is recorded, not applied, as for XMemAlloc: the host has no allocator ids or memory types.
+-    // The retail executable passes 0x21, 0x3, 0x183, 0x283 and 0x181 and stops at an int3 when a reservation
+-    // returns NULL, so refusing a nonzero word is not an option.
+-    note_attributes("XMemVirtualAlloc", attributes, size, _ReturnAddress());
+-    if (size == 0) {
+-        SetLastError(ERROR_INVALID_PARAMETER);
++// VirtualAlloc2 (Windows 10 1803 and later; Wine has it too) reserves at an alignment in one call. It is looked up
++// rather than imported so the runtime still loads where it is missing. LEONIDA_XMEM_NO_VIRTUALALLOC2 (any value)
++// makes the shim behave as if it were missing, so the test suite runs the fallback below as well (xmem_probe).
++using VirtualAlloc2Fn = PVOID(WINAPI*)(HANDLE, PVOID, SIZE_T, ULONG, ULONG, MEM_EXTENDED_PARAMETER*, ULONG);
++
++VirtualAlloc2Fn virtual_alloc2() {
++    static const VirtualAlloc2Fn fn = []() -> VirtualAlloc2Fn {
++        if (GetEnvironmentVariableW(L"LEONIDA_XMEM_NO_VIRTUALALLOC2", nullptr, 0) != 0) return nullptr;
++        HMODULE kernelbase = GetModuleHandleW(L"kernelbase.dll");
++        return kernelbase ? reinterpret_cast<VirtualAlloc2Fn>(
++                                reinterpret_cast<void*>(GetProcAddress(kernelbase, "VirtualAlloc2")))
++                          : nullptr;
++    }();
++    return fn;
++}
++
++// A new region of `size` bytes (a multiple of `alignment`) whose base is a multiple of `alignment`, which is larger than
++// the host's 64 KiB allocation granularity. Without VirtualAlloc2, or when it refuses the alignment parameter, reserve
++// `size + alignment` to find a free range, release it and reserve the aligned part of it; another thread can take
++// that range in between, so try again a bounded number of times (the method of xbox-emulator's reserve_aligned in
++// crates/compat/xmem/src/sys.rs). Each region is a single host allocation, so VirtualFree(base, 0, MEM_RELEASE) and
++// VirtualQuery see exactly what was returned.
++void* reserve_aligned(SIZE_T size, SIZE_T alignment, DWORD host_type, DWORD protect) {
++    if (const VirtualAlloc2Fn alloc2 = virtual_alloc2()) {
++        MEM_ADDRESS_REQUIREMENTS requirements{};
++        requirements.Alignment = alignment;
++        MEM_EXTENDED_PARAMETER parameter{};
++        parameter.Type = MemExtendedParameterAddressRequirements;
++        parameter.Pointer = &requirements;
++        if (void* p = alloc2(GetCurrentProcess(), nullptr, size, host_type | MEM_RESERVE, protect, &parameter, 1)) {
++            return p;
++        }
++        // Only a refused parameter can mean an older host without alignment support; anything else is final.
++        if (GetLastError() != ERROR_INVALID_PARAMETER) return nullptr;
++    }
++
++    if (size > (std::numeric_limits<SIZE_T>::max)() - alignment) {
++        SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+         return nullptr;
+     }
++    const SIZE_T probe_size = size + alignment;
++    for (int attempt = 0; attempt < 64; ++attempt) {
++        void* const probe = VirtualAlloc(nullptr, probe_size, MEM_RESERVE | (host_type & MEM_TOP_DOWN), PAGE_NOACCESS);
++        if (!probe) return nullptr;
++        const uintptr_t start = reinterpret_cast<uintptr_t>(probe);
++        uintptr_t aligned = (start + alignment - 1) & ~(static_cast<uintptr_t>(alignment) - 1);
++        // Top-down: take the highest aligned base inside the probe, as the host would have.
++        if (host_type & MEM_TOP_DOWN) aligned = (start + alignment) & ~(static_cast<uintptr_t>(alignment) - 1);
++        VirtualFree(probe, 0, MEM_RELEASE);
++        if (void* p = VirtualAlloc(reinterpret_cast<void*>(aligned), size, host_type | MEM_RESERVE, protect)) return p;
++        const DWORD error = GetLastError();
++        if (error != ERROR_INVALID_ADDRESS) return nullptr;  // anything but losing the race is final
++    }
++    SetLastError(ERROR_NOT_ENOUGH_MEMORY);
++    return nullptr;
++}
+ 
+-    const DWORD page_mode = allocation_type & kXmemPageModeMask;
+-    if (page_mode == kXmemLargePages) {
+-        SetLastError(ERROR_NOT_SUPPORTED);
++// XMemVirtualAlloc's and a title's VirtualAlloc's common part. `default_operation`: no MEM_RESERVE/MEM_COMMIT/MEM_RESET
++// bit means reserve and commit (XMemVirtualAlloc); a title's VirtualAlloc requires an operation, as on Win32.
++void* console_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, DWORD protect, bool default_operation) {
++    if (size == 0) {
++        SetLastError(ERROR_INVALID_PARAMETER);
+         return nullptr;
+     }
+-    if (page_mode != 0 && page_mode != kXmem64kPages) {
++    SIZE_T guest_page = 0;
++    if (!guest_page_size(allocation_type, guest_page)) {
+         SetLastError(ERROR_INVALID_PARAMETER);
+         return nullptr;
+     }
+@@ -183,15 +256,20 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
+     }
+ 
+     DWORD host_type = allocation_type & kXmemHostAllocationTypeMask;
+-    if (host_type == 0) host_type = MEM_RESERVE | MEM_COMMIT;
++    if (host_type == 0) {
++        if (!default_operation) {
++            SetLastError(ERROR_INVALID_PARAMETER);
++            return nullptr;
++        }
++        host_type = MEM_RESERVE | MEM_COMMIT;
++    }
+ 
+     SYSTEM_INFO system_info{};
+     GetSystemInfo(&system_info);
+-    const SIZE_T page_granularity = page_mode == kXmem64kPages ? kXmemPageSize64k : system_info.dwPageSize;
++    const SIZE_T page_granularity = guest_page ? guest_page : system_info.dwPageSize;
+     const SIZE_T base_granularity =
+-        page_mode == kXmem64kPages
+-            ? kXmemPageSize64k
+-            : ((host_type & MEM_RESERVE) ? system_info.dwAllocationGranularity : system_info.dwPageSize);
++        guest_page ? guest_page
++                   : ((host_type & MEM_RESERVE) ? system_info.dwAllocationGranularity : system_info.dwPageSize);
+     if (page_granularity == 0 || (page_granularity & (page_granularity - 1)) != 0 || base_granularity == 0 ||
+         (base_granularity & (base_granularity - 1)) != 0) {
+         SetLastError(ERROR_INVALID_PARAMETER);
+@@ -199,6 +277,8 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
+     }
+ 
+     if (address != nullptr) {
++        // Round the range out to whole guest pages: a commit inside a 2 MiB reservation commits that whole page. The
++        // page size comes from this call's bits; nothing remembers the page size a region was reserved with.
+         const uintptr_t requested = reinterpret_cast<uintptr_t>(address);
+         const uintptr_t max = (std::numeric_limits<uintptr_t>::max)();
+         if (size > max - requested) {
+@@ -215,12 +295,26 @@ void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type,
+                               ~(static_cast<uintptr_t>(page_granularity) - 1);
+         address = reinterpret_cast<void*>(base);
+         size = static_cast<SIZE_T>(end - base);
+-    } else if (page_mode == kXmem64kPages && !round_up_size(size, page_granularity, size)) {
++    } else if (guest_page != 0 && !round_up_size(size, page_granularity, size)) {
+         SetLastError(ERROR_INVALID_PARAMETER);
+         return nullptr;
+     }
+ 
+-    return VirtualAlloc(address, size, host_type, host_protect(protect));
++    // A new region with pages coarser than the host's 64 KiB allocation granularity needs an aligned reservation.
++    // (MEM_COMMIT without MEM_RESERVE and no address also makes a new region on Win32.) MEM_RESET with no address is
++    // left to the host to refuse.
++    if (address == nullptr && guest_page > system_info.dwAllocationGranularity &&
++        (host_type & (MEM_RESERVE | MEM_COMMIT))) {
++        return reserve_aligned(size, guest_page, host_type, protect);
++    }
++    return VirtualAlloc(address, size, host_type, protect);
++}
++
++void* WINAPI XMemVirtualAlloc(void* address, SIZE_T size, DWORD allocation_type, ULONGLONG attributes, DWORD protect) {
++    // Preserve main's attribute tracing and CPU protection mapping while applying PR #4531's aligned page modes.
++    // The host has no console allocator ids; the attribute word is recorded rather than rejected.
++    note_attributes("XMemVirtualAlloc", attributes, size, _ReturnAddress());
++    return console_virtual_alloc(address, size, allocation_type, host_protect(protect), true);
+ }
+ 
+ UINT WINAPI XMemGetWriteWatch(DWORD flags, void* base_address, SIZE_T region_size, void** addresses, ULONG_PTR* count,
+@@ -283,13 +377,21 @@ BOOL WINAPI XMemTransferMemory(uint32_t type, SIZE_T size) {
+ // with ERROR_INVALID_PARAMETER (measured on Windows 11 26200: VirtualAlloc(NULL, 64 KiB, MEM_COMMIT | MEM_RESERVE |
+ // 0x10000000, PAGE_READWRITE) returns NULL; so does 0x40000000), so an engine allocating its heaps this way gets
+ // NULL at boot. Both are hints about where the memory lives; the host has no such split, so they are dropped and
+-// the rest is passed through. The PAGE_GRAPHICS_* protection bits are dropped (host_protect). Not done: whether
+-// graphics memory has to come from an arena the D3D12 layer can see (#313).
++// the rest is passed through. A page-size request (MEM_LARGE_PAGES or MEM_4MB_PAGES, see above) is the console's,
++// not the host's MEM_LARGE_PAGES, which needs SeLockMemoryPrivilege: it goes through XMemVirtualAlloc's page
++// handling, keeping Win32's rule that an operation is required. MEM_PHYSICAL without MEM_LARGE_PAGES is passed
++// through. The PAGE_GRAPHICS_* protection bits are dropped (host_protect). Not done: whether graphics memory
++// has to come from an arena the D3D12 layer can see (#313).
+ constexpr DWORD kMemGraphics = 0x10000000;
+ constexpr DWORD kMemTitle = 0x40000000;
+ 
+ LPVOID WINAPI TitleVirtualAlloc(LPVOID address, SIZE_T size, DWORD allocation_type, DWORD protect) {
+-    return VirtualAlloc(address, size, allocation_type & ~(kMemGraphics | kMemTitle), host_protect(protect));
++    protect = host_protect(protect);
++    allocation_type &= ~(kMemGraphics | kMemTitle);
++    if (allocation_type & (kXmemLargePages | kXmem4MbPages)) {
++        return console_virtual_alloc(address, size, allocation_type, protect, false);
++    }
++    return VirtualAlloc(address, size, allocation_type, protect);
+ }
+ 
+ }  // namespace
+diff --git a/runtime/test/xmem_test.cpp b/runtime/test/xmem_test.cpp
+index edc5fd33c..6966419d4 100644
+--- a/runtime/test/xmem_test.cpp
++++ b/runtime/test/xmem_test.cpp
+@@ -6,6 +6,7 @@
+ // size at +8, and XMemVirtualQuery's MEMORY_BASIC_INFORMATION prefix inside a zeroed 64-byte output.
+ // XMemTransferMemory follows the call shape in Microsoft's public samples: TRUE for any direction and size, with
+ // nothing committed, and one trace event per distinct (type, size).
++// Console 64 KiB, 2 MiB and 4 MiB page modes are also checked through both allocation APIs.
+ #include <windows.h>
+ #include <psapi.h>
+ 
+@@ -219,10 +220,21 @@ void test_virtual_alloc(XMemVirtualAllocFn virtual_alloc, XMemGetWriteWatchFn ge
+     check(VirtualFree(base, 0, MEM_RELEASE), "release the synthetic write-watch region");
+ 
+     SetLastError(ERROR_SUCCESS);
+-    void* const large_page = virtual_alloc(nullptr, page_size, MEM_RESERVE | MEM_COMMIT | 0x20000000, 0,
+-                                           PAGE_READWRITE);
+-    check(large_page == nullptr && GetLastError() == ERROR_NOT_SUPPORTED,
+-          "unsupported large-page allocation is rejected before host allocation");
++    // The rebased large-page implementation must retain main's attribute and protection handling.
++    constexpr SIZE_T guest_2m = SIZE_T{2} << 20;
++    void* const attributed_large = virtual_alloc(nullptr, guest_2m + 1,
++                                                 MEM_RESERVE | MEM_COMMIT | 0x20000000, 0x183, 0x22004);
++    check(attributed_large != nullptr, "2 MiB pages accept recorded attributes and graphics protection bits");
++    if (attributed_large) {
++        MEMORY_BASIC_INFORMATION large_info{};
++        check(reinterpret_cast<uintptr_t>(attributed_large) % guest_2m == 0, "attributed 2 MiB pool alignment");
++        check(VirtualQuery(attributed_large, &large_info, sizeof large_info) &&
++                  large_info.RegionSize == guest_2m * 2 && large_info.Protect == PAGE_READWRITE,
++              "attributed 2 MiB pool rounds size and maps CPU protection");
++        static_cast<volatile uint8_t*>(attributed_large)[guest_2m] = 0x5a;
++        check(static_cast<volatile uint8_t*>(attributed_large)[guest_2m] == 0x5a, "attributed 2 MiB pool is writable");
++        check(VirtualFree(attributed_large, 0, MEM_RELEASE), "release attributed 2 MiB pool");
++    }
+ 
+     // The retail executable's GPU pools: the attribute word is recorded, and the PAGE_GRAPHICS_* bits are dropped.
+     MEMORY_BASIC_INFORMATION mbi{};
+@@ -380,6 +392,119 @@ void test_transfer_trace(XMemTransferMemoryFn transfer) {
+     DeleteFileW(path.c_str());
+ }
+ 
++// The console's page-size bits in the allocation type: MEM_LARGE_PAGES alone is 2 MiB pages, MEM_4MB_PAGES (with or
++// without MEM_LARGE_PAGES) 4 MiB pages, and MEM_LARGE_PAGES | MEM_PHYSICAL 64 KiB pages. None of them needs a host
++// privilege: the region is ordinary pages, reserved at the page size's alignment and rounded to whole pages.
++constexpr DWORD kLargePages = 0x20000000;
++constexpr DWORD k4MbPages = 0x80000000;
++constexpr DWORD k64kPages = 0x20400000;
++constexpr SIZE_T k2MiB = 0x200000;
++constexpr SIZE_T k4MiB = 0x400000;
++
++struct PageMode {
++    DWORD bits;
++    SIZE_T page;
++    const char* name;
++};
++constexpr PageMode kLargeModes[] = {
++    {kLargePages, k2MiB, "2 MiB (0x20000000)"},
++    {k4MbPages, k4MiB, "4 MiB (0x80000000)"},
++    {k4MbPages | kLargePages, k4MiB, "4 MiB (0xa0000000)"},
++};
++
++bool is_aligned(const void* p, SIZE_T alignment) {
++    return p && (reinterpret_cast<uintptr_t>(p) & (alignment - 1)) == 0;
++}
++
++// One run of pages as VirtualQuery sees it from `base`: exactly `size` bytes in `state`, inside the allocation that
++// starts at `allocation` (by default `base` itself). Writes the first and last byte when it is committed.
++bool region_is(void* base, SIZE_T size, DWORD state, void* allocation = nullptr) {
++    MEMORY_BASIC_INFORMATION info{};
++    if (VirtualQuery(base, &info, sizeof(info)) != sizeof(info)) return false;
++    if (!allocation) allocation = base;
++    if (info.BaseAddress != base || info.AllocationBase != allocation || info.RegionSize != size ||
++        info.State != state) {
++        std::printf("  query %p: base %p allocation base %p size %#zx state %#lx\n", base, info.BaseAddress,
++                    info.AllocationBase, static_cast<size_t>(info.RegionSize), static_cast<unsigned long>(info.State));
++        return false;
++    }
++    if (state == MEM_COMMIT) {
++        auto* const bytes = static_cast<volatile uint8_t*>(base);
++        bytes[0] = 0x11;
++        bytes[size - 1] = 0x22;
++        return bytes[0] == 0x11 && bytes[size - 1] == 0x22;
++    }
++    return true;
++}
++
++bool released(void* base) {
++    if (!VirtualFree(base, 0, MEM_RELEASE)) return false;
++    MEMORY_BASIC_INFORMATION info{};
++    return VirtualQuery(base, &info, sizeof(info)) == sizeof(info) && info.State == MEM_FREE;
++}
++
++void test_virtual_alloc_large_pages(XMemVirtualAllocFn virtual_alloc) {
++    char what[200];
++    for (const PageMode& mode : kLargeModes) {
++        // Not a whole page, so the size has to round up: 1.5 pages -> 2 pages.
++        const SIZE_T request = mode.page + mode.page / 2;
++        const SIZE_T rounded = mode.page * 2;
++        SetLastError(ERROR_SUCCESS);
++        void* const p = virtual_alloc(nullptr, request, MEM_RESERVE | MEM_COMMIT | mode.bits, 0, PAGE_READWRITE);
++        std::snprintf(what, sizeof what, "XMemVirtualAlloc with %s pages returns memory (error %lu)", mode.name,
++                      p ? 0ul : static_cast<unsigned long>(GetLastError()));
++        check(p != nullptr, what);
++        if (!p) continue;
++        std::snprintf(what, sizeof what, "XMemVirtualAlloc with %s pages is aligned to the page size", mode.name);
++        check(is_aligned(p, mode.page), what);
++        std::snprintf(what, sizeof what, "XMemVirtualAlloc with %s pages commits whole pages", mode.name);
++        check(region_is(p, rounded, MEM_COMMIT), what);
++        std::snprintf(what, sizeof what, "VirtualFree releases a %s page region", mode.name);
++        check(released(p), what);
++
++        // No operation bits: XMemVirtualAlloc reserves and commits, as for the other page modes.
++        void* const defaulted = virtual_alloc(nullptr, 1, mode.bits, 0, PAGE_READWRITE);
++        std::snprintf(what, sizeof what, "XMemVirtualAlloc(1 byte, %s pages, no operation) commits one page",
++                      mode.name);
++        check(is_aligned(defaulted, mode.page) && region_is(defaulted, mode.page, MEM_COMMIT), what);
++        if (defaulted) VirtualFree(defaulted, 0, MEM_RELEASE);
++
++        // Reserve, then commit by an address inside the second page: the commit covers that whole page and starts at
++        // its base, the console's commit granularity.
++        void* const reserved =
++            virtual_alloc(nullptr, mode.page * 3, MEM_RESERVE | MEM_TOP_DOWN | mode.bits, 0, PAGE_READWRITE);
++        std::snprintf(what, sizeof what, "a %s page reservation with MEM_TOP_DOWN is aligned and stays reserved",
++                      mode.name);
++        check(is_aligned(reserved, mode.page) && region_is(reserved, mode.page * 3, MEM_RESERVE), what);
++        if (!reserved) continue;
++        auto* const second = static_cast<uint8_t*>(reserved) + mode.page;
++        void* const committed = virtual_alloc(second + 0x1234, 0x10, MEM_COMMIT | mode.bits, 0, PAGE_READWRITE);
++        std::snprintf(what, sizeof what, "committing inside a %s page commits that page from its base", mode.name);
++        check(committed == second && region_is(second, mode.page, MEM_COMMIT, reserved), what);
++        std::snprintf(what, sizeof what, "the pages around a %s page commit stay reserved", mode.name);
++        check(region_is(reserved, mode.page, MEM_RESERVE) &&
++                  region_is(second + mode.page, mode.page, MEM_RESERVE, reserved),
++              what);
++        std::snprintf(what, sizeof what, "VirtualFree releases the whole %s page reservation", mode.name);
++        check(released(reserved), what);
++    }
++
++    // Combinations no page size answers stay invalid, before anything is allocated.
++    for (const DWORD bits : {DWORD{k64kPages | k4MbPages}, DWORD{k4MbPages | 0x00400000}, DWORD{0x00400000}}) {
++        SetLastError(ERROR_SUCCESS);
++        void* const p = virtual_alloc(nullptr, k4MiB, MEM_RESERVE | MEM_COMMIT | bits, 0, PAGE_READWRITE);
++        std::snprintf(what, sizeof what, "XMemVirtualAlloc rejects page bits %#lx with ERROR_INVALID_PARAMETER",
++                      static_cast<unsigned long>(bits));
++        check(p == nullptr && GetLastError() == ERROR_INVALID_PARAMETER, what);
++        if (p) VirtualFree(p, 0, MEM_RELEASE);
++    }
++
++    SetLastError(ERROR_SUCCESS);
++    void* const attributed = virtual_alloc(nullptr, k2MiB, MEM_RESERVE | MEM_COMMIT | kLargePages, 1, PAGE_READWRITE);
++    check(attributed == nullptr && GetLastError() == ERROR_NOT_SUPPORTED,
++          "a nonzero attribute word is still rejected with 2 MiB pages");
++}
++
+ using HostVirtualAllocFn = void*(WINAPI*)(void*, SIZE_T, DWORD, DWORD);
+ 
+ // RT-217: a title's kernel32!VirtualAlloc carries the console's MEM_GRAPHICS / MEM_TITLE type bits, which the host
+@@ -416,6 +541,43 @@ void test_title_virtual_alloc() {
+     }
+ }
+ 
++// The same page-size bits through a title's kernel32!VirtualAlloc. The host reads 0x20000000 as its own
++// MEM_LARGE_PAGES (which needs SeLockMemoryPrivilege) and rejects 0x80000000, so these failed before the shim
++// handled them. Win32 rules stay: an operation (reserve or commit) is required.
++void test_title_virtual_alloc_large_pages() {
++    constexpr DWORD kMemGraphics = 0x10000000;
++    constexpr DWORD kMemTitle = 0x40000000;
++    const char* const dlls[] = {"kernel32.dll", "kernelbase.dll", "api-ms-win-core-memory-l1-1-0.dll"};
++    char what[200];
++    for (const char* dll : dlls) {
++        const auto alloc = reinterpret_cast<HostVirtualAllocFn>(rt::shims::find(dll, "VirtualAlloc"));
++        if (!alloc) continue;  // test_title_virtual_alloc reports the missing registration
++        for (const PageMode& mode : kLargeModes) {
++            for (const DWORD tags : {DWORD{0}, DWORD{kMemGraphics | kMemTitle}}) {
++                SetLastError(ERROR_SUCCESS);
++                void* const p = alloc(nullptr, mode.page + 1, MEM_RESERVE | MEM_COMMIT | mode.bits | tags,
++                                      PAGE_READWRITE);
++                std::snprintf(what, sizeof what, "%s!VirtualAlloc, %s pages, tags %#lx: aligned, two pages (error %lu)",
++                              dll, mode.name, static_cast<unsigned long>(tags),
++                              p ? 0ul : static_cast<unsigned long>(GetLastError()));
++                check(is_aligned(p, mode.page) && region_is(p, mode.page * 2, MEM_COMMIT), what);
++                if (p) check(released(p), "release the title's large-page region");
++            }
++        }
++
++        void* const sixty_four = alloc(nullptr, 0x1001, MEM_RESERVE | MEM_COMMIT | k64kPages, PAGE_READWRITE);
++        std::snprintf(what, sizeof what, "%s!VirtualAlloc with 64 KiB pages commits one 64 KiB page", dll);
++        check(is_aligned(sixty_four, 0x10000) && region_is(sixty_four, 0x10000, MEM_COMMIT), what);
++        if (sixty_four) VirtualFree(sixty_four, 0, MEM_RELEASE);
++
++        SetLastError(ERROR_SUCCESS);
++        void* const no_operation = alloc(nullptr, k2MiB, kLargePages, PAGE_READWRITE);
++        std::snprintf(what, sizeof what, "%s!VirtualAlloc with 2 MiB pages and no operation fails as on Win32", dll);
++        check(no_operation == nullptr && GetLastError() == ERROR_INVALID_PARAMETER, what);
++        if (no_operation) VirtualFree(no_operation, 0, MEM_RELEASE);
++    }
++}
++
+ void print_result() {
+     if (g_failures == 0) {
+         std::printf("xmem_test: OK (%d checks)\n", g_checks);
+@@ -463,6 +625,7 @@ int main() {
+     test_virtual_query(query);
+     if (virtual_alloc && get_write_watch && reset_write_watch) {
+         test_virtual_alloc(virtual_alloc, get_write_watch, reset_write_watch);
++        test_virtual_alloc_large_pages(virtual_alloc);
+     }
+     test_attribute_trace(alloc, free_mem, virtual_alloc);
+     if (transfer) {
+@@ -471,6 +634,7 @@ int main() {
+     }
+ 
+     test_title_virtual_alloc();
++    test_title_virtual_alloc_large_pages();
+ 
+     print_result();
+     return g_failures ? 1 : 0;

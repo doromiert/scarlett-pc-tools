@@ -3,7 +3,7 @@
 Local inspection and experimental boot diagnostics for user-supplied Xbox Series
 packages. **This is not a playable port or a complete Xbox compatibility layer.**
 
-The repository contains original tooling and synthetic test inputs only. No game
+The repository contains tooling, attributed runtime source patches and synthetic test inputs. No game
 executables, DLLs, archives, keys, extracted assets, shaders, or private test logs
 are included. Keep your dump, runtime checkouts, work files and reports outside
 this repository. Nothing here uploads game content or retrieves a dump.
@@ -40,9 +40,11 @@ does not establish integrity, export coverage, or compatibility.
 build with a Windows PE loader, console API shims, shader translation and a Vulkan
 backend. At the revision reviewed here it explicitly reports that the real game
 does not boot. Its Windows runtime can be tested under Wine on Linux; see its
-build and platform documentation. No Leonida code is vendored here.
+build and platform documentation. [LEONIDA_INTEGRATION.md](LEONIDA_INTEGRATION.md)
+contains the pinned source patch series, build details and actual-executable launcher.
 
-Reference revision reviewed: `1cc6e3c121969761d9dad8fdec99f19928213973`.
+The initial reference checkout below is for inspection. Use the pinned integration
+guide for the more advanced native startup experiment.
 
 ```sh
 git clone https://github.com/ItsNotRexed/Leonida /external/tools/Leonida
@@ -99,4 +101,4 @@ and unapproved extensions, including force-added dumps and reports. Run it befor
 every push. Do not paste private traces or extracted content into issues or PRs.
 
 Original tools: GPL-3.0-or-later. External projects retain their own licenses;
-their code and build artifacts are obtained separately.
+attributed source patches are included; external build artifacts are obtained separately.

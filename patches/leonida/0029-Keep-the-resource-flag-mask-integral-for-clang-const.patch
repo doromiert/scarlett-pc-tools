@@ -1,0 +1,23 @@
+From aaaec0f2cedb8c20f4fcc7c4db6d5344542de254 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 17:30:08 +0100
+Subject: [PATCH 29/33] Keep the resource flag mask integral for clang constant
+ evaluation
+
+---
+ runtime/shims/d3d12_xs_device.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index b4f305c23..2adaa325e 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -2292,7 +2292,7 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
+     const PlacedAtVaHandler handler = g_placed_at_va.load(std::memory_order_acquire);
+     if (!handler) return E_NOTIMPL;
+     if (!out || !xbox_desc || !riid) return E_POINTER;
+-    constexpr auto kPcResourceFlags = static_cast<D3D12_RESOURCE_FLAGS>(0x7ff);
++    constexpr std::uint32_t kPcResourceFlags = 0x7ff;
+     D3D12_RESOURCE_DESC pc_desc = *xbox_desc;
+     const auto xbox_flags = static_cast<std::uint32_t>(pc_desc.Flags);
+     pc_desc.Flags = static_cast<D3D12_RESOURCE_FLAGS>(xbox_flags & kPcResourceFlags);

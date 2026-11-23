@@ -1,0 +1,234 @@
+From 7ed4ecf6bfcb9619fc9bbe15ff6603faf5a4a98c Mon Sep 17 00:00:00 2001
+From: kotorvr <332716892+kotorvr@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 20:04:33 +0000
+Subject: [PATCH 07/33] gameinput: answer GameInputCreate imported by ordinal 1
+
+gameinput.lib imports GameInputCreate from GameInput.dll by ordinal 1 with
+no name. The shim was registered by name only, so the loader's "#1" lookup
+found nothing and bound the host GameInput.dll instead. Register the ordinal
+beside the name.
+
+run_tiny_gameinput runs a stand-in that imports it by ordinal only under
+gta6rt --run and checks the loader's report binds it to the shim.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+---
+ docs/gameinput.md                         | 24 +++++++++++++++-
+ runtime/CMakeLists.txt                    | 24 ++++++++++++++++
+ runtime/shims/gameinput.cpp               |  3 ++
+ runtime/test/check_loaded_gameinput.cmake | 18 ++++++++++++
+ runtime/test/fixtures/gameinput_stub.cpp  | 10 +++++++
+ runtime/test/fixtures/gameinput_stub.def  |  3 ++
+ runtime/test/fixtures/tiny_gameinput.cpp  | 34 +++++++++++++++++++++++
+ runtime/test/gameinput_test.cpp           |  3 ++
+ 8 files changed, 118 insertions(+), 1 deletion(-)
+ create mode 100644 runtime/test/check_loaded_gameinput.cmake
+ create mode 100644 runtime/test/fixtures/gameinput_stub.cpp
+ create mode 100644 runtime/test/fixtures/gameinput_stub.def
+ create mode 100644 runtime/test/fixtures/tiny_gameinput.cpp
+
+diff --git a/docs/gameinput.md b/docs/gameinput.md
+index 4b617b487..d4bd208a9 100644
+--- a/docs/gameinput.md
++++ b/docs/gameinput.md
+@@ -486,12 +486,34 @@ as working; nothing measured them, and the `resistance` mode was not tried.
+   report tables (or why it has none), plays each motor and trigger for a second with `--rumble`, then prints the live
+   reading and the newest raw input report.
+ 
++## The import is by ordinal
++
++A title built against `gameinput.lib` has no `GameInputCreate` string in its import table: the library imports it
++from `GameInput.dll` by ordinal 1.
++
++| Measured | Result |
++|---|---|
++| Windows SDK 10.0.26100, `um/x64/gameinput.lib` | one import record: `GameInput.dll`, `GameInputCreate`, ordinal 1, name type "by ordinal" |
++| `System32\GameInput.dll` and `GameInputRedist.dll` (Windows 11 26200) | export ordinal 1 is `GameInputCreate` |
++| A Series-built GDK sample, as [sammwyy/xvalkyrie](https://github.com/sammwyy/xvalkyrie) reports it (GPL-3.0; `docs/research/gdk-titles.md` at `b883d2d`; a fact read there, no code) | imports `GameInput.dll` ordinal 1 and nothing else from that module |
++
++The first two rows were read here with a standard-library parser of the archive's short import records and of the
++export directory; the third is another project's measurement of a console build and is not reproduced here, since
++building a Series sample needs the GDK's Xbox extensions. That the game's executable imports it the same way is a
++hypothesis until the executable is read.
++
++The loader looks an ordinal import up in the shim registry as `#<n>` (`Loader::resolve`, `runtime/src/pe_loader.cpp`),
++so the shim registers `gameinput.dll!#1` beside the name. Before that, such an import found no shim and was bound to
++the host's `GameInput.dll` by ordinal: Xbox pads only, none of the mapping on this page. CTest's `run_tiny_gameinput`
++runs a stand-in that imports `GameInputCreate` by ordinal only (`runtime/test/fixtures/gameinput_stub.def`,
++`NONAME`) under `gta6rt --run` and checks that the loader's report says `shim  GameInput.dll!#1`.
++
+ ## VERIFY
+ 
+ These need the game executable or a test on hardware:
+ 
+ - **Which API version and module.** The shim is GameInput v0 and registers `GameInputCreate` under `gameinput.dll`
+-  and `xgameruntime.dll`. GameInput v1 and later (NuGet 1.x and up) changed the interfaces; if the executable was
++  (by name and as ordinal 1, see [The import is by ordinal](#the-import-is-by-ordinal)) and `xgameruntime.dll`. GameInput v1 and later (NuGet 1.x and up) changed the interfaces; if the executable was
+   built against one of those, the vtables need a second set.
+ - **IIDs.** `QueryInterface` answers the v0 IIDs from the public header.
+ - **Reading history.** Microsoft's [next reading](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/input/gameinput/interfaces/igameinput/methods/igameinput_getnextreading)
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index a9d2f1c1c..6b4d9eac3 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -583,6 +583,25 @@ if(BUILD_TESTING)
+     set_target_properties(tiny_gdk_load PROPERTIES
+       RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
+     )
++    # GameInputCreate imported by ordinal 1 with no name, as gameinput.lib links it; only where the shim is built.
++    if(TARGET gameinput_test)
++      add_library(gameinput_stub SHARED test/fixtures/gameinput_stub.cpp test/fixtures/gameinput_stub.def)
++      target_compile_definitions(gameinput_stub PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
++      target_compile_options(gameinput_stub PRIVATE /W4 /permissive- /utf-8)
++      set_target_properties(gameinput_stub PROPERTIES
++        OUTPUT_NAME GameInput
++        PREFIX ""
++        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/$<CONFIG>"
++        ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/stubs/$<CONFIG>"
++      )
++      add_executable(tiny_gameinput test/fixtures/tiny_gameinput.cpp)
++      target_link_libraries(tiny_gameinput PRIVATE gameinput_stub)
++      target_compile_definitions(tiny_gameinput PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
++      target_compile_options(tiny_gameinput PRIVATE /W4 /permissive- /utf-8)
++      set_target_properties(tiny_gameinput PROPERTIES
++        RUNTIME_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/fixtures/game/$<CONFIG>"
++      )
++    endif()
+     # Run-time LoadLibrary of a bundled Xbox DLL (importing xmem.dll) through rt::Loader.
+     add_library(xmem_stub SHARED test/fixtures/xmem_stub.cpp test/fixtures/xmem_stub.def)
+     target_compile_definitions(xmem_stub PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+@@ -1133,6 +1152,11 @@ if(BUILD_TESTING)
+     add_test(NAME run_tiny_atexit COMMAND ${CMAKE_COMMAND}
+       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_atexit>"
+       "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_atexit.cmake")
++    if(TARGET tiny_gameinput)
++      add_test(NAME run_tiny_gameinput COMMAND ${CMAKE_COMMAND}
++        "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_gameinput>"
++        "-DRUNNER=${CMAKE_CROSSCOMPILING_EMULATOR}" -P "${CMAKE_CURRENT_SOURCE_DIR}/test/check_loaded_gameinput.cmake")
++    endif()
+     add_test(NAME run_tiny_game COMMAND gta6rt --run $<TARGET_FILE:tiny_game> -- hello 42)
+     add_test(NAME run_tiny_game_console_paths COMMAND ${CMAKE_COMMAND}
+       "-DLOADER=$<TARGET_FILE:gta6rt>" "-DGUEST=$<TARGET_FILE:tiny_game>"
+diff --git a/runtime/shims/gameinput.cpp b/runtime/shims/gameinput.cpp
+index 4a42afbcf..d242fe0e9 100644
+--- a/runtime/shims/gameinput.cpp
++++ b/runtime/shims/gameinput.cpp
+@@ -31,6 +31,8 @@
+ //
+ // ASSUMPTION: the console executable is not available, so the DLL it imports GameInputCreate from is unknown. The PC
+ // API lives in gameinput.dll; on console the GDK links it through xgameruntime. Both names are registered.
++// gameinput.lib imports GameInputCreate from GameInput.dll by ordinal 1, with no name (docs/gameinput.md, "The import
++// is by ordinal"), so "#1" is registered too: the loader looks an ordinal import up as "#<n>".
+ #include <windows.h>
+ 
+ #include <SDL3/SDL.h>
+@@ -2669,5 +2671,6 @@ void set_hid_backend(const HidBackend* backend) { g_hid = backend ? backend : &k
+ 
+ SHIM_TABLE(gameinput,
+     {"gameinput.dll", "GameInputCreate", reinterpret_cast<void*>(&GameInputCreate)},
++    {"gameinput.dll", "#1", reinterpret_cast<void*>(&GameInputCreate)},
+     {"xgameruntime.dll", "GameInputCreate", reinterpret_cast<void*>(&GameInputCreate)},
+ );
+diff --git a/runtime/test/check_loaded_gameinput.cmake b/runtime/test/check_loaded_gameinput.cmake
+new file mode 100644
+index 000000000..93252218a
+--- /dev/null
++++ b/runtime/test/check_loaded_gameinput.cmake
+@@ -0,0 +1,18 @@
++# Run the ordinal-import GameInput fixture (tiny_gameinput) under the loader and check from outside, as
++# check_loaded_gdk.cmake does, that it passed and that the loader's report binds GameInput.dll ordinal 1 to the shim.
++# The binding is read from the report because a host GameInput.dll answers the fixture's calls too.
++get_filename_component(guest_dir "${GUEST}" DIRECTORY)
++get_filename_component(guest_name "${GUEST}" NAME)
++execute_process(
++  COMMAND ${RUNNER} "${LOADER}" --run "${guest_name}"
++  WORKING_DIRECTORY "${guest_dir}"
++  TIMEOUT 90
++  RESULT_VARIABLE code OUTPUT_VARIABLE output ERROR_VARIABLE output)
++string(REPLACE "\r\n" "\n" output "${output}")
++if(NOT code STREQUAL "0" OR NOT output MATCHES "(^|\n)tiny_gameinput: PASS(\n|$)"
++    OR NOT output MATCHES "(^|\n)game exited with code 0(\n|$)")
++  message(FATAL_ERROR "Loaded GameInput ordinal fixture returned ${code}\n${output}")
++endif()
++if(NOT output MATCHES "(^|\n) +shim +GameInput\.dll!#1(\n|$)")
++  message(FATAL_ERROR "GameInput.dll ordinal 1 was not bound to the shim\n${output}")
++endif()
+diff --git a/runtime/test/fixtures/gameinput_stub.cpp b/runtime/test/fixtures/gameinput_stub.cpp
+new file mode 100644
+index 000000000..c3e6cfba4
+--- /dev/null
++++ b/runtime/test/fixtures/gameinput_stub.cpp
+@@ -0,0 +1,10 @@
++// Link-time stand-in for GameInput.dll, so tiny_gameinput.exe gets the import a GDK title has: GameInputCreate by
++// ordinal 1 and no name (gameinput_stub.def; docs/gameinput.md, "The import is by ordinal"). Under `gta6rt --run` the
++// shim registry answers the import and this DLL never loads; it is built into a folder the loader does not search.
++// Test code, not game content.
++#include <windows.h>
++
++extern "C" HRESULT __stdcall GameInputCreate(void** out) {
++    if (out) *out = nullptr;
++    return E_FAIL;
++}
+diff --git a/runtime/test/fixtures/gameinput_stub.def b/runtime/test/fixtures/gameinput_stub.def
+new file mode 100644
+index 000000000..339a57919
+--- /dev/null
++++ b/runtime/test/fixtures/gameinput_stub.def
+@@ -0,0 +1,3 @@
++LIBRARY GameInput
++EXPORTS
++    GameInputCreate @1 NONAME
+diff --git a/runtime/test/fixtures/tiny_gameinput.cpp b/runtime/test/fixtures/tiny_gameinput.cpp
+new file mode 100644
+index 000000000..b1be22c4c
+--- /dev/null
++++ b/runtime/test/fixtures/tiny_gameinput.cpp
+@@ -0,0 +1,34 @@
++// A mapped program that imports GameInputCreate the way a GDK title does: from GameInput.dll, by ordinal 1, with no
++// name in its import table (docs/gameinput.md, "The import is by ordinal"). Run under `gta6rt --run`, the loader must
++// bind that import to the GameInput shim; check_loaded_gameinput.cmake reads the binding from the loader's report,
++// since a host GameInput.dll would answer the calls below as well. Ordinary test code; no game data.
++#include <windows.h>
++#include <unknwn.h>
++
++#include <cstdio>
++
++extern "C" __declspec(dllimport) HRESULT __stdcall GameInputCreate(void** game_input);
++
++namespace {
++
++int fail(const char* stage, unsigned long value) {
++    std::printf("tiny_gameinput: FAIL %s (0x%08lx)\n", stage, value);
++    return 1;
++}
++
++}  // namespace
++
++int main() {
++    std::setvbuf(stdout, nullptr, _IONBF, 0);
++    void* first = nullptr;
++    HRESULT hr = GameInputCreate(&first);
++    if (hr != S_OK || !first) return fail("GameInputCreate", static_cast<unsigned long>(hr));
++    // The shim hands out one instance per process; each call adds a reference.
++    void* second = nullptr;
++    hr = GameInputCreate(&second);
++    if (hr != S_OK || second != first) return fail("a second GameInputCreate returns the same instance", static_cast<unsigned long>(hr));
++    static_cast<IUnknown*>(second)->Release();
++    static_cast<IUnknown*>(first)->Release();
++    std::puts("tiny_gameinput: PASS");
++    return 0;
++}
+diff --git a/runtime/test/gameinput_test.cpp b/runtime/test/gameinput_test.cpp
+index 7217dc37b..05b0cfe60 100644
+--- a/runtime/test/gameinput_test.cpp
++++ b/runtime/test/gameinput_test.cpp
+@@ -1622,6 +1622,9 @@ int main() {
+     check(create != nullptr, "gameinput.dll!GameInputCreate is registered");
+     check(rt::shims::find("xgameruntime.dll", "GameInputCreate") == reinterpret_cast<void*>(create),
+           "xgameruntime.dll!GameInputCreate is the same function");
++    // gameinput.lib imports it by ordinal 1 and no name; the loader asks the registry for "#1" (pe_loader.cpp resolve).
++    check(rt::shims::find("gameinput.dll", "#1") == reinterpret_cast<void*>(create),
++          "gameinput.dll ordinal 1 is the same function");
+     if (!create) return 1;
+ 
+     IGameInput* input = nullptr;

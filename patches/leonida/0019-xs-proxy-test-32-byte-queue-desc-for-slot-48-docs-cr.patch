@@ -1,0 +1,70 @@
+From 79d9ef1734fb53ebf376383169e0c7d8575b64ff Mon Sep 17 00:00:00 2001
+From: Alex Collini <pipodi93@gmail.com>
+Date: Mon, 23 Nov 2026 17:19:47 +0100
+Subject: [PATCH 19/33] xs proxy test: 32-byte queue desc for slot 48; docs
+ credit #6954
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/d3d12_command_objects.md       | 2 +-
+ docs/retail_boot_chain.md           | 2 +-
+ runtime/test/xs_proxy_mock_test.cpp | 6 ++++--
+ 3 files changed, 6 insertions(+), 4 deletions(-)
+
+diff --git a/docs/d3d12_command_objects.md b/docs/d3d12_command_objects.md
+index 5a214e325..3cbc5a6f3 100644
+--- a/docs/d3d12_command_objects.md
++++ b/docs/d3d12_command_objects.md
+@@ -830,7 +830,7 @@ command object.
+ | Item | Why it is blocked |
+ |---|---|
+ | `PresentX` | No slot, signature, plane struct or swapchain/plane parameters. Prior art gives only names, the 2-plane/8-view limits and four flag names. |
+-| `CreateCommandQueueX` | No slot or parameter layout; only the UMD message and an inferred shape. |
++| `CreateCommandQueueX` | No slot or parameter layout; only the UMD message and an inferred shape. The retail title calls device slot 48 as (desc, riid, out) with a 32-byte desc (#6954), which differs from the (pDesc, pShaderQueueParams, riid, out) shape inferred above. |
+ | `SuspendX` / `ResumeX` | No slot or signature. |
+ | Xbox queue/list/fence/allocator slot deviations | No runtime binary and no game executable; the package has no queue, fence or allocator client, and its only command-list client is the BVH builder. |
+ | Builder's list field `+0x350` | Read once (`0x1d877`) and not explained by the inline buffer of section 3.5a, which covers `+0x18`, `+0x28`, `+0x30`, `+0x140`, `+0x141`, `+0x344` and `+0x544`. |
+diff --git a/docs/retail_boot_chain.md b/docs/retail_boot_chain.md
+index f46c698b9..8f338bde2 100644
+--- a/docs/retail_boot_chain.md
++++ b/docs/retail_boot_chain.md
+@@ -21,7 +21,7 @@ stand-ins named below (not pull requests yet). Own 1.0.2.1 copy, Windows 11, RTX
+ | 5 | Fatal assert when `DStorageGetFactory` returns null | #4348 |
+ | 6 | `XMemAllocatePhysicalPages` unimplemented; the title asserts on FALSE | Local stand-in, §2 |
+ | 7 | `D3D12XboxCreateDevice` succeeds; device slot 26 is called with its arguments swapped | Local, §3.1 |
+-| 8 | Device slot 48 is forwarded to the PC slot 48 and fails | Local, §3.2 |
++| 8 | Device slot 48 is forwarded to the PC slot 48 and fails | #6954 |
+ | 9 | Device slot 73 is forwarded to the PC slot 73; the title then reads through a null list | #2490's list proxy plus local routing, §3.3 |
+ | 10 | An `XMemVirtualAlloc` reserve of about 185 MiB with type `0x42000`, attribute 7 and `PAGE_NOACCESS` is refused with `ERROR_INVALID_PARAMETER`. `0x40000` is `MEM_RESERVE_PLACEHOLDER` on the PC, which `VirtualAlloc` refuses and only `VirtualAlloc2` accepts; stop 11 supports the same reading on the console | Local: reserve it with `VirtualAlloc2(MEM_RESERVE \| MEM_RESERVE_PLACEHOLDER)` |
+ | 11 | The title carves five sub-ranges out of that placeholder with `MEM_RESERVE \| MEM_REPLACE_PLACEHOLDER \| MEM_PHYSICAL \| MEM_LARGE_PAGES` (`0x20406000`) at addresses inside it, then allocates a second batch of physical pages | Local: a physical reserve inside a known placeholder stays a placeholder (the page maps split it); other `MEM_REPLACE_PLACEHOLDER` calls split the range and allocate it in place |
+diff --git a/runtime/test/xs_proxy_mock_test.cpp b/runtime/test/xs_proxy_mock_test.cpp
+index e9f7c1253..a9c9c98b9 100644
+--- a/runtime/test/xs_proxy_mock_test.cpp
++++ b/runtime/test/xs_proxy_mock_test.cpp
+@@ -305,6 +305,8 @@ const IID kUnknownIid = __uuidof(IUnknown);
+ const IID kResourceIid = __uuidof(ID3D12Resource);
+ const IID kDevice1Iid = __uuidof(ID3D12Device1);
+ const D3D12_COMMAND_QUEUE_DESC kQueueDesc{};
++// The retail title's slot 48 desc is 32 bytes (the route logs words 4..7); type in word 0 as in kQueueDesc.
++const std::uint32_t kXboxQueueDesc[8]{};
+ 
+ // A device proxy over a new mock device. The proxy takes the mock's one reference.
+ void* make_device(Mock*& mock, int level, bool fence1, bool allocator_tag = true) {
+@@ -754,7 +756,7 @@ int check_xbox_slots() {
+ 
+     // 48 CreateCommandQueueX(desc, riid, out): the queue proxy, created through the PC slot 8 path.
+     void* queue = nullptr;
+-    EXPECT(hr_of(raw(device, 48, word(&kQueueDesc), word(&kQueueIid), word(&queue))) == S_OK);
++    EXPECT(hr_of(raw(device, 48, word(kXboxQueueDesc), word(&kQueueIid), word(&queue))) == S_OK);
+     EXPECT(xs::is_queue_proxy(queue) && mock->calls[48] == 0 && mock->calls[8] == 1);
+     EXPECT(mock->args[8][0] == word(&kQueueDesc));
+ 
+@@ -830,7 +832,7 @@ int run_env_slots(bool valid) {
+         EXPECT(hr_of(raw(device, 97, 0, 0, 0, 0)) == S_OK && mock->calls[97] == 0);
+         EXPECT(hr_of(raw(device, 98, 0, 0, 0, 0, word(&token))) == S_OK && token && mock->calls[98] == 0);
+         void* queue = nullptr;
+-        EXPECT(hr_of(raw(device, 99, word(&kQueueDesc), word(&kQueueIid), word(&queue))) == S_OK);
++        EXPECT(hr_of(raw(device, 99, word(kXboxQueueDesc), word(&kQueueIid), word(&queue))) == S_OK);
+         EXPECT(xs::is_queue_proxy(queue) && mock->calls[99] == 0);
+         const IID allocator_iid = __uuidof(ID3D12CommandAllocator);
+         void* allocator = nullptr;

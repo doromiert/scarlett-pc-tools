@@ -14,11 +14,15 @@ def check():
     for raw in filter(None, names):
         name = raw.decode("utf-8")
         p = PurePosixPath(name)
-        if p.suffix not in ALLOWED and p.name not in SPECIAL:
+        source_patch = p.suffix == ".patch" and p.parts[:2] == ("patches", "leonida")
+        native_source = name == "native/radv_file_userptr.c"
+        if p.suffix not in ALLOWED and p.name not in SPECIAL and not source_patch and not native_source:
             errors.append(f"Unapproved tracked file type: {name}")
             continue
         # Check staged bytes rather than a possibly different working-tree file.
         content = subprocess.check_output(["git", "show", ":" + name])
+        if source_patch and (b"GIT binary patch" in content or b"Binary files " in content):
+            errors.append(f"Binary delta in source patch: {name}")
         if len(content) > MAX_BYTES or b"\0" in content:
             errors.append(f"Binary or oversized tracked file: {name}")
         try:

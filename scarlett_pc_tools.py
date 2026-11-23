@@ -1,9 +1,11 @@
-"""Inspect local packages and run a bounded, experimental Unicorn diagnostic."""
+"""Inspect local packages and run bounded native or CPU-emulated startup diagnostics."""
 import argparse
 import hashlib
 import importlib.util
 import json
 import os
+import shutil
+import signal
 from pathlib import Path
 import subprocess
 import sys
@@ -179,6 +181,63 @@ def leonida_check(target, runtime, output, full_check=False):
     return subprocess.call(command, cwd=runtime)
 
 
+def leonida_run(target, loader, output, timeout, wine=None):
+    exe = package_exe(target)
+    loader = Path(loader).expanduser().resolve(strict=True)
+    if not exe.is_file():
+        raise FileNotFoundError(exe)
+    output = outside_git(output)
+    output.mkdir(parents=True, exist_ok=True)
+    if output.is_relative_to(exe.parent):
+        raise ValueError("Keep native launch output outside the dump directory.")
+    attempt = Path(tempfile.mkdtemp(prefix="leonida-", dir=output))
+    env = {**os.environ, "LEONIDA_UNIMPLEMENTED": "stop", "LEONIDA_D3D12": "vulkan"}
+    env.pop("LEONIDA_SKIP_INT3", None)
+    command = [str(loader), "--run", str(exe), "--game-dir", str(exe.parent),
+               "--overlay", str(attempt / "overlay"), "--trace", str(attempt / "startup.jsonl"), "--trace-d3d12"]
+    if os.name != "nt":
+        wine = shutil.which(wine or "wine")
+        if not wine or not shutil.which("unshare") or not sys.platform.startswith("linux"):
+            raise ValueError("Native launch here requires Linux, Wine and unshare; Windows runs the loader directly.")
+        for i in (0, 2, 4, 6, 8):
+            command[i] = "Z:" + command[i].replace("/", "\\")
+        command = ["unshare", "-Urnpf", "--kill-child", wine, *command]
+        env.update(WINEPREFIX=str(attempt / "wineprefix"), WINEARCH="win64", WINEDEBUG="-all",
+                   WINEDLLOVERRIDES="mscoree,mshtml=;winedbg.exe=d")
+        env["PATH"] = str(Path(wine).parent) + os.pathsep + env.get("PATH", "")
+    log = attempt / "run.log"
+    print(f"Launching actual executable; private log: {log}", file=sys.stderr, flush=True)
+    start = time.monotonic()
+    with log.open("w", encoding="utf-8") as stream:
+        child = subprocess.Popen(command, cwd=exe.parent, env=env, stdout=stream,
+                                 stderr=subprocess.STDOUT, start_new_session=os.name != "nt")
+        status = "finished"
+        try:
+            while True:
+                remaining = timeout - (time.monotonic() - start)
+                if remaining <= 0:
+                    status = "timeout"
+                    break
+                try:
+                    child.wait(timeout=min(5, remaining))
+                    break
+                except subprocess.TimeoutExpired:
+                    print(f"Running: {time.monotonic() - start:.0f}s; see {log}", file=sys.stderr, flush=True)
+        finally:
+            if child.poll() is None:
+                if os.name == "nt":
+                    child.kill()
+                else:
+                    os.killpg(child.pid, signal.SIGKILL)
+                child.wait()
+    result = {"status": status, "exit_code": child.returncode,
+              "elapsed_seconds": round(time.monotonic() - start, 2), "log": str(log),
+              "trace": str(attempt / "startup.jsonl"), "gameplay_observed": False}
+    write_json(attempt / "summary.json", result)
+    print(json.dumps(result, indent=2))
+    return 0 if status == "finished" and child.returncode == 0 else 1
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     subs = parser.add_subparsers(dest="command", required=True)
@@ -195,12 +254,20 @@ def main(argv=None):
     p.add_argument("--runtime", required=True, help="Path to a separately obtained Leonida checkout")
     p.add_argument("--output", required=True, help="External work directory")
     p.add_argument("--full-check", action="store_true", help="Also hash all game files; can take minutes")
+    p = subs.add_parser("leonida-run", help="Run the actual executable with a built Leonida loader and private trace")
+    p.add_argument("target")
+    p.add_argument("--loader", required=True, help="Built gta6rt.exe; its TLS helper must be alongside it")
+    p.add_argument("--output", required=True, help="External attempt directories, logs and write overlays")
+    p.add_argument("--wine", help="Linux: Wine executable (default: wine on PATH)")
+    p.add_argument("--timeout", type=positive, default=60)
     args = parser.parse_args(argv)
     print("Inspecting local files…" if args.command != "boot" else "Preparing boot diagnostic…",
           file=sys.stderr, flush=True)
     import pefile
 
     try:
+        if args.command == "leonida-run":
+            return leonida_run(args.target, args.loader, args.output, args.timeout, args.wine)
         if args.command == "leonida-check":
             return leonida_check(args.target, args.runtime, args.output, args.full_check)
         if args.command == "inspect":

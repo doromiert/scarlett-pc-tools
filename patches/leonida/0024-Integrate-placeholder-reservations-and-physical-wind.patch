@@ -1,0 +1,205 @@
+From e7eff377cf1562a747dd1bdfbcbc1b7b24e72413 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 17:28:30 +0100
+Subject: [PATCH 24/33] Integrate placeholder reservations and physical windows
+ for retail startup
+
+Adapt PR6919 placeholder handling (36936f3b, NiiRoZz) to PR6995 shared physical storage. Preserve aligned page allocation. Trace null indirect-call callers for the real executable.
+---
+ runtime/shims/startup_trace.h   |  5 +++
+ runtime/shims/xmem.cpp          | 56 ++++++++++++++++++++++++---------
+ runtime/shims/xmem_physical.cpp | 32 ++++++++++++++++---
+ runtime/shims/xmem_physical.h   |  3 +-
+ 4 files changed, 77 insertions(+), 19 deletions(-)
+
+diff --git a/runtime/shims/startup_trace.h b/runtime/shims/startup_trace.h
+index ca4a4853f..c968e6ce2 100644
+--- a/runtime/shims/startup_trace.h
++++ b/runtime/shims/startup_trace.h
+@@ -116,6 +116,11 @@ constexpr int kMaxFrames = 16;
+ 
+ inline std::string stack_from(const CONTEXT& start_context) {
+     CONTEXT c = start_context;
++    // An indirect call through a null vtable entry still pushed its caller's return address.
++    if (!c.Rip && c.Rsp && !IsBadReadPtr(reinterpret_cast<void*>(c.Rsp), sizeof(DWORD64))) {
++        c.Rip = *reinterpret_cast<DWORD64*>(c.Rsp);
++        c.Rsp += sizeof(DWORD64);
++    }
+     std::string out = "[";
+     for (int i = 0; i < kMaxFrames && c.Rip; ++i) {
+         if (i) out += ',';
+diff --git a/runtime/shims/xmem.cpp b/runtime/shims/xmem.cpp
+index 98651eec3..0a9eae7e4 100644
+--- a/runtime/shims/xmem.cpp
++++ b/runtime/shims/xmem.cpp
+@@ -148,7 +148,8 @@ constexpr SIZE_T kXmemPageSize64k = 0x10000;
+ constexpr SIZE_T kXmemPageSize2M = 0x200000;
+ constexpr SIZE_T kXmemPageSize4M = 0x400000;
+ constexpr DWORD kXmemHostAllocationTypeMask =
+-    MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH | 0x01000000;
++    MEM_COMMIT | MEM_RESERVE | MEM_RESET | MEM_TOP_DOWN | MEM_WRITE_WATCH | 0x01000000 |
++    MEM_RESERVE_PLACEHOLDER | MEM_REPLACE_PLACEHOLDER;
+ // The physical-page store's reservation, set by xmem_physical.cpp when it is linked (xmem_physical.h).
+ std::atomic<rt::xmem::PhysicalReserveFn> g_physical_reserve{nullptr};
+ 
+@@ -246,16 +247,6 @@ void* console_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, D
+         SetLastError(ERROR_INVALID_PARAMETER);
+         return nullptr;
+     }
+-    // A new reserve-only range in the 64 KiB page mode (MEM_LARGE_PAGES | MEM_PHYSICAL) is where the title maps the
+-    // pages of XMemAllocatePhysicalPages, so it comes from the physical-page store when that is linked
+-    // (xmem_physical.cpp). Nothing is backed yet, so the attribute word does not matter here; the console's
+-    // PAGE_GRAPHICS_* bits are dropped and the CPU protection is what each mapped page gets.
+-    if (address == nullptr && (allocation_type & ~MEM_TOP_DOWN) == (MEM_RESERVE | kXmem64kPages)) {
+-        if (const rt::xmem::PhysicalReserveFn reserve = rt::xmem::physical_reserve()) {
+-            return reserve(size, host_protect(protect));
+-        }
+-    }
+-
+     SIZE_T guest_page = 0;
+     if (!guest_page_size(allocation_type, guest_page)) {
+         SetLastError(ERROR_INVALID_PARAMETER);
+@@ -279,10 +270,18 @@ void* console_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, D
+ 
+     SYSTEM_INFO system_info{};
+     GetSystemInfo(&system_info);
+-    const SIZE_T page_granularity = guest_page ? guest_page : system_info.dwPageSize;
+-    const SIZE_T base_granularity =
++    const bool new_placeholder = (host_type & MEM_RESERVE_PLACEHOLDER) != 0;
++    const bool replace = (host_type & MEM_REPLACE_PLACEHOLDER) != 0;
++    SIZE_T page_granularity = guest_page ? guest_page : system_info.dwPageSize;
++    SIZE_T base_granularity =
+         guest_page ? guest_page
+                    : ((host_type & MEM_RESERVE) ? system_info.dwAllocationGranularity : system_info.dwPageSize);
++    if (new_placeholder || replace) {
++        if (page_granularity < system_info.dwAllocationGranularity)
++            page_granularity = system_info.dwAllocationGranularity;
++        if (base_granularity < system_info.dwAllocationGranularity)
++            base_granularity = system_info.dwAllocationGranularity;
++    }
+     if (page_granularity == 0 || (page_granularity & (page_granularity - 1)) != 0 || base_granularity == 0 ||
+         (base_granularity & (base_granularity - 1)) != 0) {
+         SetLastError(ERROR_INVALID_PARAMETER);
+@@ -308,11 +307,40 @@ void* console_virtual_alloc(void* address, SIZE_T size, DWORD allocation_type, D
+                               ~(static_cast<uintptr_t>(page_granularity) - 1);
+         address = reinterpret_cast<void*>(base);
+         size = static_cast<SIZE_T>(end - base);
+-    } else if (guest_page != 0 && !round_up_size(size, page_granularity, size)) {
++    } else if ((guest_page != 0 || new_placeholder || replace) && !round_up_size(size, page_granularity, size)) {
+         SetLastError(ERROR_INVALID_PARAMETER);
+         return nullptr;
+     }
+ 
++    // Placeholder forms adapted from upstream PR #6919 (36936f3b), preserving #6995's shared physical-page store.
++    if (replace && !address) {
++        SetLastError(ERROR_INVALID_PARAMETER);
++        return nullptr;
++    }
++    if (guest_page == kXmemPageSize64k &&
++        (host_type & ~(MEM_TOP_DOWN | MEM_REPLACE_PLACEHOLDER)) == MEM_RESERVE && (!address || replace)) {
++        if (const rt::xmem::PhysicalReserveFn reserve = rt::xmem::physical_reserve())
++            return reserve(address, size, protect);
++    }
++    if (new_placeholder || replace) {
++        const VirtualAlloc2Fn alloc2 = virtual_alloc2();
++        if (!alloc2) {
++            SetLastError(ERROR_NOT_SUPPORTED);
++            return nullptr;
++        }
++        if (replace) {
++            MEMORY_BASIC_INFORMATION info{};
++            if (!VirtualQuery(address, &info, sizeof(info)) || info.State != MEM_RESERVE) {
++                SetLastError(ERROR_INVALID_ADDRESS);
++                return nullptr;
++            }
++            if ((info.AllocationBase != address || info.RegionSize != size) &&
++                !VirtualFree(address, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) return nullptr;
++        }
++        return alloc2(GetCurrentProcess(), address, size, host_type | MEM_RESERVE,
++                      new_placeholder ? PAGE_NOACCESS : protect, nullptr, 0);
++    }
++
+     // A new region with pages coarser than the host's 64 KiB allocation granularity needs an aligned reservation.
+     // (MEM_COMMIT without MEM_RESERVE and no address also makes a new region on Win32.) MEM_RESET with no address is
+     // left to the host to refuse.
+diff --git a/runtime/shims/xmem_physical.cpp b/runtime/shims/xmem_physical.cpp
+index 1edeecd7c..03c5f52fe 100644
+--- a/runtime/shims/xmem_physical.cpp
++++ b/runtime/shims/xmem_physical.cpp
+@@ -406,7 +406,7 @@ BOOL WINAPI XMemMapPhysicalPagesScatter(PVOID* va_array, ULONG_PTR count, ULONG_
+     }
+ }
+ 
+-void* reserve_physical(SIZE_T size, DWORD protect) {
++void* reserve_physical(void* address, SIZE_T size, DWORD protect) {
+     if (!api().ok()) {
+         static std::atomic<bool> warned{false};
+         if (!warned.exchange(true)) {
+@@ -414,6 +414,7 @@ void* reserve_physical(SIZE_T size, DWORD protect) {
+                          "[rt] xmem: no VirtualAlloc2/MapViewOfFile3 placeholders on this host; physical-page "
+                          "reservations are ordinary ones and XMemMapPhysicalPages fails\n");
+         }
++        if (address) { SetLastError(ERROR_NOT_SUPPORTED); return nullptr; }
+         return VirtualAlloc(nullptr, size, MEM_RESERVE, protect);
+     }
+     if (size == 0 || size > (std::numeric_limits<SIZE_T>::max)() - (kPage - 1)) {
+@@ -421,11 +422,34 @@ void* reserve_physical(SIZE_T size, DWORD protect) {
+         return nullptr;
+     }
+     size = (size + kPage - 1) & ~(kPage - 1);
+-    void* p = api().alloc2(GetCurrentProcess(), nullptr, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS,
+-                           nullptr, 0);
++    void* p = address;
++    if (address) {
++        MEMORY_BASIC_INFORMATION info{};
++        if ((reinterpret_cast<uintptr_t>(address) & (kPage - 1)) ||
++            !VirtualQuery(address, &info, sizeof(info)) || info.State != MEM_RESERVE ||
++            size > info.RegionSize || reinterpret_cast<uintptr_t>(address) -
++                reinterpret_cast<uintptr_t>(info.BaseAddress) > info.RegionSize - size) {
++            SetLastError(ERROR_INVALID_ADDRESS);
++            return nullptr;
++        }
++        // PR #6919: a reserve-only physical replacement remains a placeholder until page views are mapped.
++        if ((info.AllocationBase != address || info.RegionSize != size) &&
++            !VirtualFree(address, size, MEM_RELEASE | MEM_PRESERVE_PLACEHOLDER)) return nullptr;
++    } else {
++        p = api().alloc2(GetCurrentProcess(), nullptr, size, MEM_RESERVE | MEM_RESERVE_PLACEHOLDER, PAGE_NOACCESS,
++                        nullptr, 0);
++    }
+     if (!p) return nullptr;
+     try {
+         const std::lock_guard lock(g_mutex);
++        const uintptr_t base = reinterpret_cast<uintptr_t>(p);
++        auto next = g_regions.lower_bound(base);
++        if ((next != g_regions.end() && next->first - base < size) ||
++            (next != g_regions.begin() && base - std::prev(next)->first < std::prev(next)->second.pages * kPage)) {
++            if (!address) VirtualFree(p, 0, MEM_RELEASE);
++            SetLastError(ERROR_INVALID_ADDRESS);
++            return nullptr;
++        }
+         Region r;
+         r.pages = size / kPage;
+         r.protect = protect;
+@@ -433,7 +457,7 @@ void* reserve_physical(SIZE_T size, DWORD protect) {
+         r.isolated.assign(r.pages, 0);
+         g_regions.emplace(reinterpret_cast<uintptr_t>(p), std::move(r));
+     } catch (const std::bad_alloc&) {
+-        VirtualFree(p, 0, MEM_RELEASE);
++        if (!address) VirtualFree(p, 0, MEM_RELEASE);
+         SetLastError(ERROR_NOT_ENOUGH_MEMORY);
+         return nullptr;
+     }
+diff --git a/runtime/shims/xmem_physical.h b/runtime/shims/xmem_physical.h
+index f48705472..1f7cc03c2 100644
+--- a/runtime/shims/xmem_physical.h
++++ b/runtime/shims/xmem_physical.h
+@@ -10,7 +10,8 @@ namespace rt::xmem {
+ 
+ // Reserves `size` bytes (a multiple of 64 KiB) of address space that XMemMapPhysicalPages[Scatter] can map pages
+ // into, with `protect` as the CPU protection of every page mapped there. Null with the last error set on failure.
+-using PhysicalReserveFn = void* (*)(SIZE_T size, DWORD protect);
++// A non-null address names an existing placeholder subrange to retain for physical views.
++using PhysicalReserveFn = void* (*)(void* address, SIZE_T size, DWORD protect);
+ 
+ void set_physical_reserve(PhysicalReserveFn fn);
+ PhysicalReserveFn physical_reserve();
