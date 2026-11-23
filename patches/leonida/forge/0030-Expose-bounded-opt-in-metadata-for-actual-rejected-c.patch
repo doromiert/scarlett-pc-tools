@@ -1,0 +1,61 @@
+From f24829299fd757cec8ebac00b3f3ccd9cd8d24d4 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 22:48:29 +0100
+Subject: [PATCH 30/31] Expose bounded opt-in metadata for actual rejected
+ console SRVs
+
+---
+ runtime/shims/d3d12_xs_device.cpp | 32 +++++++++++++++++++++++++++++++
+ 1 file changed, 32 insertions(+)
+
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index 59fd8cdc7..1e5a55347 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -2759,11 +2759,43 @@ void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words,
+     note_slot(70);
+     log_xbox_route_once(70, "CreateShaderResourceView from raw words", texture_words, view_desc, destination, 0, 0);
+     if (!destination) return;
++    const std::uint64_t original_destination = destination;
+     // The console's CPU handle may be in a title-backed heap (#7021): translated before either write below.
+     destination = translate_cpu_handle(self, D3D12_CPU_DESCRIPTOR_HANDLE{static_cast<SIZE_T>(destination)}).ptr;
+ 
+     RawSrvShape shape{};
+     const char* why = parse_raw_srv(texture_words, view_desc, shape);
++    static const bool diagnostics = [] {
++        char value[2]{};
++        return GetEnvironmentVariableA("LEONIDA_RAW_SRV_DIAGNOSTICS", value, sizeof(value)) == 1 && value[0] == '1';
++    }();
++    if (diagnostics) {
++        static std::atomic<std::uint64_t> calls{0}, rejected{0}, categories[8]{};
++        const std::uint64_t call = calls.fetch_add(1, std::memory_order_relaxed) + 1;
++        const std::uint64_t failed = why ? rejected.fetch_add(1, std::memory_order_relaxed) + 1 : 0;
++        const unsigned category = !shape.resource.Dimension ? 0 :
++            shape.resource.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER ? 1 :
++            shape.view.ViewDimension != D3D12_SRV_DIMENSION_BUFFER ? 2 :
++            !shape.va ? 3 :
++            shape.view.Format == DXGI_FORMAT_UNKNOWN && shape.view.Buffer.StructureByteStride ? 4 :
++            shape.view.Format == DXGI_FORMAT_R32_TYPELESS && (shape.view.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW) ? 5 :
++            shape.view.Format != DXGI_FORMAT_UNKNOWN ? 6 : 7;
++        const std::uint64_t category_count = categories[category].fetch_add(1, std::memory_order_relaxed) + 1;
++        if (category_count <= 4 || (category_count & (category_count - 1)) == 0)
++            std::fprintf(stderr,
++                         "[rt] slot70 metadata: call=%llu rejected=%llu category=%u category_count=%llu reason=%s "
++                         "rd_dim=%d width=%llu rd_format=%d srv_dim=%d srv_format=%d mapping=0x%x "
++                         "first=%llu count=%u stride=%u flags=0x%x va=0x%llx dst=0x%llx->0x%llx\n",
++                         static_cast<unsigned long long>(call), static_cast<unsigned long long>(failed), category,
++                         static_cast<unsigned long long>(category_count), why ? why : "accepted raw buffer", int(shape.resource.Dimension),
++                         static_cast<unsigned long long>(shape.resource.Width), int(shape.resource.Format),
++                         int(shape.view.ViewDimension), int(shape.view.Format), shape.view.Shader4ComponentMapping,
++                         static_cast<unsigned long long>(shape.view.Buffer.FirstElement), shape.view.Buffer.NumElements,
++                         shape.view.Buffer.StructureByteStride, unsigned(shape.view.Buffer.Flags),
++                         static_cast<unsigned long long>(shape.va),
++                         static_cast<unsigned long long>(original_destination),
++                         static_cast<unsigned long long>(destination));
++    }
+     if (why || !self->resource_provider) {
+         log_slot70_null_once(why ? why : "no resource provider", texture_words, view_desc);
+         write_null_srv(self, destination);
+-- 
+2.54.0
+

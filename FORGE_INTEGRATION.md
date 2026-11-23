@@ -20,9 +20,9 @@ git switch -c local/scarlett-forge 70bc8a25e1c69c3f058cf550a8db9397c6a89d0c
 git am "$TOOLS"/patches/leonida/forge/*.patch
 ```
 
-The twenty-five attributed source patches add the CPU descriptor-handle fix,
+The thirty-one attributed source patches add the CPU descriptor-handle fix,
 presentation diagnostics, visible windows with an independent message pump,
-monitor fitting, loading captions, console stream-stage mapping, shared frame
+monitor fitting, compute/graphics loading captions, console stream-stage mapping, shared frame
 tokens, the current descriptor-cleaning experiment, optional local native-shader
 capture, session pipeline-cache persistence/checkpoints, newer title-memory
 buffer handling, shared shader modules, and frame-poll compatibility. The current
@@ -107,7 +107,28 @@ integration has passed the previous allocation assertion, resolved its graphics
 catalog, created native graphics pipelines, and presented black frames. An
 actual-run CPU profile found 96.6% of sampled work in RADV compute compilation;
 progress advanced beyond 1,920 native completions without a reported API failure.
-This is ongoing startup work, not gameplay. The current frame-pacing handoff
+This is ongoing startup work, not gameplay. A later actual profile found the three
+remaining hot threads in graphics compilation (893/894 samples), which the old
+compute-only caption did not count. The updated caption reports live graphics
+pending/ready/failed counts; these are not a boot percentage or fixed total.
+
+`LEONIDA_GRAPHICS_PIPELINE_THREADS=1` optionally serializes graphics compilation.
+It was exercised after the three-compiler run nearly filled local swap. Successful
+slow graphics creation now checkpoints too. Checkpoint triggering measures driver
+time after acquiring the slot, so time waiting behind another compiler does not
+cause repeated cache writes. The actual run exceeded 53,000 successful graphics
+creations and wrote graphics checkpoints; frames remained black.
+
+`LEONIDA_RAW_SRV_DIAGNOSTICS=1` records bounded private descriptor metadata by
+shape. The actual calls established non-null typed R16/R8 and structured buffer
+views that the earlier raw-only bridge dropped. The new bridge preserves format,
+count, first element and stride with range and VA-alias alignment checks. Several
+observed addresses still do not resolve to a registered buffer, so these views
+remain null until backing/address mapping is implemented. Texture views still
+lack a console allocation-address association here. Forwarding is not evidence
+of shader consumption or correct pixels.
+
+The current frame-pacing handoff
 replays configuration made before the first presentation; zero-time frame polls
 return a nonfailing timeout and honor the observed token-on-timeout flag. This
 cleared a newly observed assertion at `exe+0x2482452`. It does not detach simulation

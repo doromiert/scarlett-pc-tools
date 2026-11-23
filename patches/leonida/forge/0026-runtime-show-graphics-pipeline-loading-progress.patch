@@ -1,0 +1,111 @@
+From be961479a315c9598b4dbd66b9f6d3af94bd10e2 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 22:29:36 +0100
+Subject: [PATCH 26/29] runtime: show graphics pipeline loading progress
+
+---
+ runtime/shims/d3d12_xs_device.cpp | 55 ++++++++++++++++++++++++++-----
+ runtime/shims/title_boot_status.h |  4 ++-
+ 2 files changed, 49 insertions(+), 10 deletions(-)
+
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index a2c6b9b9d..59fd8cdc7 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -68,11 +68,35 @@
+ namespace rt::d3d12_xs {
+ 
+ static std::atomic<std::uint64_t> g_native_pipeline_progress{0};
++static std::atomic<std::uint64_t> g_graphics_pipeline_pending{0};
++static std::atomic<std::uint64_t> g_graphics_pipeline_ready{0};
++static std::atomic<std::uint64_t> g_graphics_pipeline_failed{0};
++static std::atomic<std::uint64_t> g_boot_status_generation{0};
+ 
+ void report_native_pipeline_progress(std::uint64_t completed) {
+     std::uint64_t current = g_native_pipeline_progress.load(std::memory_order_relaxed);
+-    while (current < completed &&
+-           !g_native_pipeline_progress.compare_exchange_weak(current, completed, std::memory_order_relaxed)) {}
++    while (current < completed) {
++        if (g_native_pipeline_progress.compare_exchange_weak(current, completed, std::memory_order_relaxed)) {
++            g_boot_status_generation.fetch_add(1, std::memory_order_release);
++            break;
++        }
++    }
++}
++
++void report_graphics_pipeline_started() {
++    g_graphics_pipeline_pending.fetch_add(1, std::memory_order_relaxed);
++    g_boot_status_generation.fetch_add(1, std::memory_order_release);
++}
++
++void report_graphics_pipeline_finished(bool succeeded) {
++    std::uint64_t pending = g_graphics_pipeline_pending.load(std::memory_order_relaxed);
++    while (pending &&
++           !g_graphics_pipeline_pending.compare_exchange_weak(pending, pending - 1, std::memory_order_relaxed)) {}
++    if (succeeded)
++        g_graphics_pipeline_ready.fetch_add(1, std::memory_order_relaxed);
++    else
++        g_graphics_pipeline_failed.fetch_add(1, std::memory_order_relaxed);
++    g_boot_status_generation.fetch_add(1, std::memory_order_release);
+ }
+ 
+ namespace {
+@@ -1402,7 +1426,7 @@ struct PresentState {
+     std::condition_variable window_ready;
+     bool window_started = false;
+     std::atomic<bool> close_requested{false};
+-    std::uint64_t caption_progress = 0;
++    std::uint64_t caption_generation = 0;
+ 
+     void post_destroy_window();
+     void finish_close();
+@@ -1435,12 +1459,25 @@ LRESULT CALLBACK present_window_proc(HWND window, UINT message, WPARAM wparam, L
+         state = static_cast<PresentState*>(reinterpret_cast<CREATESTRUCTW*>(lparam)->lpCreateParams);
+         SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
+     } else if (message == WM_TIMER && state && wparam == PresentState::kProgressTimer) {
+-        const std::uint64_t completed = g_native_pipeline_progress.load(std::memory_order_relaxed);
+-        if (completed != state->caption_progress) {
+-            state->caption_progress = completed;
+-            wchar_t caption[96]{};
+-            std::swprintf(caption, std::size(caption), L"Leonida — loading game; %llu native pipelines ready",
+-                          static_cast<unsigned long long>(completed));
++        const std::uint64_t generation = g_boot_status_generation.load(std::memory_order_acquire);
++        if (generation != state->caption_generation) {
++            state->caption_generation = generation;
++            const auto compute = g_native_pipeline_progress.load(std::memory_order_relaxed);
++            const auto pending = g_graphics_pipeline_pending.load(std::memory_order_relaxed);
++            const auto ready = g_graphics_pipeline_ready.load(std::memory_order_relaxed);
++            const auto failed = g_graphics_pipeline_failed.load(std::memory_order_relaxed);
++            wchar_t caption[160]{};
++            if (failed) {
++                std::swprintf(caption, std::size(caption),
++                              L"Leonida — loading: compute %llu ready; graphics %llu pending, %llu ready, %llu failed",
++                              static_cast<unsigned long long>(compute), static_cast<unsigned long long>(pending),
++                              static_cast<unsigned long long>(ready), static_cast<unsigned long long>(failed));
++            } else {
++                std::swprintf(caption, std::size(caption),
++                              L"Leonida — loading: compute %llu ready; graphics %llu pending, %llu ready",
++                              static_cast<unsigned long long>(compute), static_cast<unsigned long long>(pending),
++                              static_cast<unsigned long long>(ready));
++            }
+             SetWindowTextW(window, caption);
+         }
+         return 0;
+diff --git a/runtime/shims/title_boot_status.h b/runtime/shims/title_boot_status.h
+index 74a62c52c..dac883728 100644
+--- a/runtime/shims/title_boot_status.h
++++ b/runtime/shims/title_boot_status.h
+@@ -4,7 +4,9 @@
+ 
+ namespace rt::d3d12_xs {
+ 
+-// Presentation-only status: the native pipeline path reports its real cumulative completion count.
++// Presentation-only status reported around the real pipeline APIs; these functions do not affect rendering.
+ void report_native_pipeline_progress(std::uint64_t completed);
++void report_graphics_pipeline_started();
++void report_graphics_pipeline_finished(bool succeeded);
+ 
+ }  // namespace rt::d3d12_xs
+-- 
+2.54.0
+

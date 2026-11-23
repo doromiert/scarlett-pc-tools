@@ -198,3 +198,25 @@ Our actual Wine run reproduced the native shared-fence identity assertion. A
 separate local XCL fence proxy cleared it and exposed the next `E_INVALIDARG` at
 `exe+0x2478b7b` during command-list creation. The allocator identity fix is being
 checked separately. No XCL implementation code is distributed in this repository.
+
+## Graphics phase and descriptor follow-up
+
+The actual compute count stabilized at the last reported 2,688 while three hot
+threads continued in RADV graphics creation (893/894 samples). The new runtime
+separates compute and graphics progress; a pending count is live, not a fixed
+remaining boot total. A serial graphics run exceeded 53,000 successful creations
+and persisted graphics checkpoints. Images remain black. Queue wait is excluded
+from the slow-compile checkpoint trigger.
+
+Bounded actual slot70 captures established typed R16/R8 and structured buffer
+views, plus texture views, beyond the existing raw-only path. The buffer bridge
+now validates and preserves exact view ranges/types, but several observed VAs
+have no registered resource and remain unresolved. Texture address associations
+and CPU-content synchronization remain incomplete. No rendering cause is proved
+solely by a discarded view.
+
+Separate XCL bring-up has passed the measured native fence, allocator, resource,
+descriptor-heap, root-signature, pipeline-state and memory-heap identity checks.
+A later execute-null crash identified allocator Xbox slot9 by exact guest
+callsite/PDB; its registration candidate is under actual-run verification.
+No XCL implementation source is included in this GPL-3.0 recipe.

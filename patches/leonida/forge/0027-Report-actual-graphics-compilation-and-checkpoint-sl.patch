@@ -1,0 +1,66 @@
+From 79ea52c21e3e1904b157c2abdd08d481705f2af2 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 22:30:16 +0100
+Subject: [PATCH 27/29] Report actual graphics compilation and checkpoint slow
+ successful pipelines
+
+---
+ runtime/shims/d3d12_vulkan_device.cpp | 35 ++++++++++++++++++++++++---
+ 1 file changed, 31 insertions(+), 4 deletions(-)
+
+diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
+index 1e418e710..2aeab2d50 100644
+--- a/runtime/shims/d3d12_vulkan_device.cpp
++++ b/runtime/shims/d3d12_vulkan_device.cpp
+@@ -15,6 +15,7 @@
+ #include "d3d12_trace.h"
+ #include "d3d12_xs_device.h"
+ #include "d3d12_xs_native_pso.h"
++#include "title_boot_status.h"
+ #include "dxgi_com.h"
+ #include "../src/arena_size.h"
+ #include "../src/shader_module_cache.h"
+@@ -4500,10 +4501,36 @@ private:
+         info.pDynamicState = &dynamic;
+         info.layout = graphics_.layout;
+         VkPipeline pipeline = VK_NULL_HANDLE;
+-        const rt::host_stall::Scope compiling;  // host-only time a guest Sleep sits out, as for compute (slot 57)
+-        if (device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, device_.pipeline_cache(), 1,
+-                                                          &info, nullptr, &pipeline) != VK_SUCCESS)
+-            return VK_NULL_HANDLE;
++        const VkPipelineCache cache = device_.pipeline_cache();
++        const ULONGLONG started = GetTickCount64();
++        static std::atomic<std::uint64_t> calls{0};
++        const std::uint64_t call = calls.fetch_add(1, std::memory_order_relaxed) + 1;
++        rt::d3d12_xs::report_graphics_pipeline_started();
++        if (call <= 8 || call % 128 == 0)
++            std::fprintf(stderr, "[rt] graphics pipeline compile started: call=%llu stages=%u\n",
++                         static_cast<unsigned long long>(call), info.stageCount);
++        VkResult result = VK_ERROR_UNKNOWN;
++        {
++            const rt::host_stall::Scope compiling;  // host-only time a guest Sleep sits out, as for compute (slot 57)
++            result = device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, cache, 1,
++                                                                    &info, nullptr, &pipeline);
++        }
++        rt::d3d12_xs::report_graphics_pipeline_finished(result == VK_SUCCESS);
++        if (call <= 8 || call % 128 == 0 || result != VK_SUCCESS)
++            std::fprintf(stderr, "[rt] graphics pipeline compile finished: call=%llu result=%d duration_ms=%llu\n",
++                         static_cast<unsigned long long>(call), static_cast<int>(result),
++                         static_cast<unsigned long long>(GetTickCount64() - started));
++        if (result != VK_SUCCESS) return VK_NULL_HANDLE;
++        if (cache && startup_cache_checkpoints_enabled() && GetTickCount64() - started >= 500) {
++            const std::unique_lock lock(device_.startup_cache_checkpoint_mutex, std::try_to_lock);
++            if (lock.owns_lock()) {
++                try {
++                    save_session_pipeline_cache(device_.context->vk, device_.info.device, cache);
++                } catch (const std::exception& error) {
++                    std::fprintf(stderr, "[rt] d3d12: graphics pipeline cache checkpoint failed (%s)\n", error.what());
++                }
++            }
++        }
+         return pipeline;
+     }
+ 
+-- 
+2.54.0
+

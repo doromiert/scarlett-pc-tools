@@ -1,0 +1,94 @@
+From f747b6d0fa021aa3e45e7340f1adb65253afb2f4 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 22:33:42 +0100
+Subject: [PATCH 28/29] Bound graphics compiler concurrency when explicitly
+ requested
+
+---
+ runtime/shims/d3d12_vulkan_device.cpp | 56 ++++++++++++++++++++++++---
+ 1 file changed, 50 insertions(+), 6 deletions(-)
+
+diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
+index 2aeab2d50..ed99a8eaf 100644
+--- a/runtime/shims/d3d12_vulkan_device.cpp
++++ b/runtime/shims/d3d12_vulkan_device.cpp
+@@ -49,6 +49,7 @@
+ #include <cctype>
+ #include <chrono>
+ #include <climits>
++#include <condition_variable>
+ #include <cstdlib>
+ #include <filesystem>
+ #include <fstream>
+@@ -337,6 +338,50 @@ void merge_session_pipeline_cache(const leonida::VulkanDeviceFunctions& vk, VkDe
+                      static_cast<int>(result));
+ }
+ 
++// Opt-in bound for the actual graphics compile phase; zero/unset retains the existing concurrency.
++class GraphicsCompileSlot {
++    struct State {
++        std::mutex mutex;
++        std::condition_variable changed;
++        unsigned active = 0;
++        const unsigned limit = [] {
++            char text[16]{};
++            const DWORD size = GetEnvironmentVariableA("LEONIDA_GRAPHICS_PIPELINE_THREADS", text, sizeof(text));
++            if (!size) return 0u;
++            if (size >= sizeof(text)) {
++                std::fprintf(stderr, "[rt] invalid LEONIDA_GRAPHICS_PIPELINE_THREADS; graphics concurrency unchanged\n");
++                return 0u;
++            }
++            char* end = nullptr;
++            const unsigned long value = std::strtoul(text, &end, 10);
++            if (!end || *end || value > 64) {
++                std::fprintf(stderr, "[rt] invalid LEONIDA_GRAPHICS_PIPELINE_THREADS; graphics concurrency unchanged\n");
++                return 0u;
++            }
++            if (value) std::fprintf(stderr, "[rt] graphics pipeline compile concurrency limited to %lu\n", value);
++            return static_cast<unsigned>(value);
++        }();
++    };
++    static State& state() { static State value; return value; }
++    State* held_ = nullptr;
++public:
++    GraphicsCompileSlot() {
++        auto& value = state();
++        if (!value.limit) return;
++        std::unique_lock lock(value.mutex);
++        value.changed.wait(lock, [&] { return value.active < value.limit; });
++        ++value.active;
++        held_ = &value;
++    }
++    ~GraphicsCompileSlot() {
++        if (!held_) return;
++        { const std::lock_guard lock(held_->mutex); --held_->active; }
++        held_->changed.notify_one();
++    }
++    GraphicsCompileSlot(const GraphicsCompileSlot&) = delete;
++    GraphicsCompileSlot& operator=(const GraphicsCompileSlot&) = delete;
++};
++
+ bool startup_cache_checkpoints_enabled() {
+     static const bool enabled = [] {
+         wchar_t value[2]{};
+@@ -4509,12 +4554,11 @@ private:
+         if (call <= 8 || call % 128 == 0)
+             std::fprintf(stderr, "[rt] graphics pipeline compile started: call=%llu stages=%u\n",
+                          static_cast<unsigned long long>(call), info.stageCount);
+-        VkResult result = VK_ERROR_UNKNOWN;
+-        {
+-            const rt::host_stall::Scope compiling;  // host-only time a guest Sleep sits out, as for compute (slot 57)
+-            result = device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, cache, 1,
+-                                                                    &info, nullptr, &pipeline);
+-        }
++        // Also bound the checkpoint's scratch allocation, and keep all host-only waiting outside guest Sleep time.
++        const rt::host_stall::Scope compiling;
++        const GraphicsCompileSlot slot;
++        const VkResult result = device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, cache, 1,
++                                                                               &info, nullptr, &pipeline);
+         rt::d3d12_xs::report_graphics_pipeline_finished(result == VK_SUCCESS);
+         if (call <= 8 || call % 128 == 0 || result != VK_SUCCESS)
+             std::fprintf(stderr, "[rt] graphics pipeline compile finished: call=%llu result=%d duration_ms=%llu\n",
+-- 
+2.54.0
+

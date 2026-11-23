@@ -1,0 +1,39 @@
+From d4439026aaa743c6fc75b37f314a5425a3fe2107 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 22:41:25 +0100
+Subject: [PATCH 29/29] Checkpoint graphics work by driver time instead of
+ queue wait
+
+---
+ runtime/shims/d3d12_vulkan_device.cpp | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
+index ed99a8eaf..af76f5cd2 100644
+--- a/runtime/shims/d3d12_vulkan_device.cpp
++++ b/runtime/shims/d3d12_vulkan_device.cpp
+@@ -4557,15 +4557,18 @@ private:
+         // Also bound the checkpoint's scratch allocation, and keep all host-only waiting outside guest Sleep time.
+         const rt::host_stall::Scope compiling;
+         const GraphicsCompileSlot slot;
++        const ULONGLONG driver_started = GetTickCount64();
+         const VkResult result = device_.context->vk.vkCreateGraphicsPipelines(device_.info.device, cache, 1,
+                                                                                &info, nullptr, &pipeline);
++        const ULONGLONG driver_ms = GetTickCount64() - driver_started;
+         rt::d3d12_xs::report_graphics_pipeline_finished(result == VK_SUCCESS);
+         if (call <= 8 || call % 128 == 0 || result != VK_SUCCESS)
+-            std::fprintf(stderr, "[rt] graphics pipeline compile finished: call=%llu result=%d duration_ms=%llu\n",
++            std::fprintf(stderr, "[rt] graphics pipeline compile finished: call=%llu result=%d driver_ms=%llu queue_ms=%llu\n",
+                          static_cast<unsigned long long>(call), static_cast<int>(result),
+-                         static_cast<unsigned long long>(GetTickCount64() - started));
++                         static_cast<unsigned long long>(driver_ms),
++                         static_cast<unsigned long long>(driver_started - started));
+         if (result != VK_SUCCESS) return VK_NULL_HANDLE;
+-        if (cache && startup_cache_checkpoints_enabled() && GetTickCount64() - started >= 500) {
++        if (cache && startup_cache_checkpoints_enabled() && driver_ms >= 500) {
+             const std::unique_lock lock(device_.startup_cache_checkpoint_mutex, std::try_to_lock);
+             if (lock.owns_lock()) {
+                 try {
+-- 
+2.54.0
+

@@ -1,0 +1,145 @@
+From 9dd2a460d2237369cce2d1c38c85ab8b776ab835 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 22:58:42 +0100
+Subject: [PATCH 31/31] Forward measured console typed and structured buffer
+ SRVs with exact ranges
+
+---
+ runtime/shims/d3d12_xs_device.cpp | 84 ++++++++++++++++++++++---------
+ 1 file changed, 59 insertions(+), 25 deletions(-)
+
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index 1e5a55347..60ae41671 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -2701,13 +2701,13 @@ HRESULT proxy_create_command_list_x(DeviceProxy* self, std::uint64_t desc_word,
+ // The PC slot 70 is ID3D12Device8::CreatePlacedResource1, which would take the destination handle for a resource
+ // description and write through it, so it is never forwarded.
+ //
+-// The one measured shape (PR 7066, eugen1763, first retail call) is a raw buffer view: texture_words starts with a
++// The first measured shape (PR 7066, eugen1763) was raw. Actual slot70 metadata also establishes typed R16_UINT,
++// R8_UINT and structured buffer views using the same prefix/address layout. texture_words starts with a
+ // desktop D3D12_RESOURCE_DESC (buffer), view_desc with a desktop D3D12_SHADER_RESOURCE_VIEW_DESC (R32_TYPELESS,
+-// BUFFER, RAW flag) followed at once by a D3D12_GPU_VIRTUAL_ADDRESS, the console VA slot 133 registered. For that shape
+-// and a VA inside a buffer the resource provider knows, the destination gets a raw view of that range: FirstElement
+-// (va - resource start) / 4, NumElements the description's Width / 4, cut to the end of the resource. Anything else
+-// (a texture, another dimension or format, no RAW flag, a VA no buffer holds, no provider, unreadable words) keeps the
+-// PC null view, which a shader reads as zeros, with one log line saying why. Texture shapes are not measured.
++// BUFFER, RAW flag in the first shape) followed at once by a D3D12_GPU_VIRTUAL_ADDRESS, the console VA slot133
++// registered. Resolve a buffer, preserve the requested view range/stride/format and adjust FirstElement for its VA
++// alias. A selected alias must be element-aligned and cover the whole view. Texture addresses still have no image
++// association here; unsupported or unresolved shapes keep a null view. The backend validates typed formats.
+ struct RawSrvShape {
+     D3D12_RESOURCE_DESC resource;
+     D3D12_SHADER_RESOURCE_VIEW_DESC view;
+@@ -2732,9 +2732,23 @@ const char* parse_raw_srv(std::uint64_t texture_words, std::uint64_t view_desc,
+     std::memcpy(&out.va, reinterpret_cast<const std::uint8_t*>(view_desc) + sizeof(out.view), sizeof(out.va));
+     if (out.resource.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) return "arg1 is not a buffer description";
+     if (out.view.ViewDimension != D3D12_SRV_DIMENSION_BUFFER) return "arg2 is not a buffer view";
+-    if (out.view.Format != DXGI_FORMAT_R32_TYPELESS || !(out.view.Buffer.Flags & D3D12_BUFFER_SRV_FLAG_RAW))
+-        return "arg2 is not a raw R32_TYPELESS view";
++    if (out.view.Buffer.Flags != D3D12_BUFFER_SRV_FLAG_NONE &&
++        out.view.Buffer.Flags != D3D12_BUFFER_SRV_FLAG_RAW) return "unknown buffer view flags";
++    const bool raw = out.view.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_RAW;
++    if (raw && (out.view.Format != DXGI_FORMAT_R32_TYPELESS || out.view.Buffer.StructureByteStride))
++        return "invalid raw buffer format or stride";
++    if (!raw && out.view.Format == DXGI_FORMAT_UNKNOWN &&
++        (!out.view.Buffer.StructureByteStride || out.view.Buffer.StructureByteStride > 16383))
++        return "invalid structured buffer stride";
++    if (!raw && out.view.Format != DXGI_FORMAT_UNKNOWN && out.view.Buffer.StructureByteStride)
++        return "typed buffer has a structure stride";
++    const std::uint64_t unit = raw ? 4 : out.view.Format == DXGI_FORMAT_UNKNOWN ?
++        out.view.Buffer.StructureByteStride : render_target_element_bytes(out.view.Format);
++    if (!unit) return "buffer format size is unsupported";
+     if (!out.resource.Width || !out.va) return "no width or no address";
++    if (!out.view.Buffer.NumElements || out.view.Buffer.FirstElement > out.resource.Width / unit ||
++        out.view.Buffer.NumElements > out.resource.Width / unit - out.view.Buffer.FirstElement)
++        return "buffer view exceeds the logical width";
+     return nullptr;
+ }
+ 
+@@ -2787,7 +2801,7 @@ void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words,
+                          "rd_dim=%d width=%llu rd_format=%d srv_dim=%d srv_format=%d mapping=0x%x "
+                          "first=%llu count=%u stride=%u flags=0x%x va=0x%llx dst=0x%llx->0x%llx\n",
+                          static_cast<unsigned long long>(call), static_cast<unsigned long long>(failed), category,
+-                         static_cast<unsigned long long>(category_count), why ? why : "accepted raw buffer", int(shape.resource.Dimension),
++                         static_cast<unsigned long long>(category_count), why ? why : "accepted buffer descriptor", int(shape.resource.Dimension),
+                          static_cast<unsigned long long>(shape.resource.Width), int(shape.resource.Format),
+                          int(shape.view.ViewDimension), int(shape.view.Format), shape.view.Shader4ComponentMapping,
+                          static_cast<unsigned long long>(shape.view.Buffer.FirstElement), shape.view.Buffer.NumElements,
+@@ -2801,36 +2815,56 @@ void proxy_create_srv_from_raw_x(DeviceProxy* self, std::uint64_t texture_words,
+         write_null_srv(self, destination);
+         return;
+     }
++    const bool raw = shape.view.Buffer.Flags == D3D12_BUFFER_SRV_FLAG_RAW;
++    const std::uint64_t unit = raw ? 4 : shape.view.Format == DXGI_FORMAT_UNKNOWN ?
++        shape.view.Buffer.StructureByteStride : render_target_element_bytes(shape.view.Format);
++    // The parser bounds both terms by Width / unit, so this addition and multiplication cannot overflow.
++    const std::uint64_t view_end = (shape.view.Buffer.FirstElement + shape.view.Buffer.NumElements) * unit;
+     std::uint64_t start = 0, size = 0;
+-    ID3D12Resource* resource = self->resource_provider(self->real, shape.va, shape.resource.Width, &start, &size);
++    ID3D12Resource* resource = self->resource_provider(self->real, shape.va, view_end, &start, &size);
+     if (!resource || shape.va < start || shape.va - start >= size) {
++        if (diagnostics) {
++            static std::atomic<unsigned> logged{0};
++            if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
++                std::fprintf(stderr, "[rt] slot70 unresolved buffer: va=0x%llx span=%llu start=0x%llx size=%llu\n",
++                             static_cast<unsigned long long>(shape.va), static_cast<unsigned long long>(view_end),
++                             static_cast<unsigned long long>(start), static_cast<unsigned long long>(size));
++        }
+         if (resource) resource->Release();
+         log_slot70_null_once("no buffer holds the address", texture_words, view_desc);
+         write_null_srv(self, destination);
+         return;
+     }
+     const std::uint64_t offset = shape.va - start;
+-    const std::uint64_t elements = std::min<std::uint64_t>(shape.resource.Width, size - offset) / 4;
+-    if (offset % 4 || !elements || elements > UINT32_MAX) {
++    if (view_end > size - offset || offset % unit ||
++        shape.view.Buffer.FirstElement > UINT64_MAX - offset / unit) {
++        if (diagnostics) {
++            static std::atomic<unsigned> logged{0};
++            if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
++                std::fprintf(stderr, "[rt] slot70 unrepresentable buffer alias: va=0x%llx start=0x%llx "
++                             "size=%llu delta=%llu unit=%llu span=%llu\n",
++                             static_cast<unsigned long long>(shape.va), static_cast<unsigned long long>(start),
++                             static_cast<unsigned long long>(size), static_cast<unsigned long long>(offset),
++                             static_cast<unsigned long long>(unit), static_cast<unsigned long long>(view_end));
++        }
+         resource->Release();
+-        log_slot70_null_once("address or width is not 4-byte aligned or too large", texture_words, view_desc);
++        log_slot70_null_once("buffer alias cannot represent the requested range and stride", texture_words, view_desc);
+         write_null_srv(self, destination);
+         return;
+     }
+-    D3D12_SHADER_RESOURCE_VIEW_DESC view{};
+-    view.Format = DXGI_FORMAT_R32_TYPELESS;
+-    view.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+-    view.Shader4ComponentMapping = shape.view.Shader4ComponentMapping;
+-    view.Buffer.FirstElement = offset / 4;
+-    view.Buffer.NumElements = static_cast<UINT>(elements);
+-    view.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_RAW;
++    D3D12_SHADER_RESOURCE_VIEW_DESC view = shape.view;
++    view.Buffer.FirstElement += offset / unit;
+     self->real->CreateShaderResourceView(resource, &view, D3D12_CPU_DESCRIPTOR_HANDLE{destination});
+     resource->Release();
+-    static std::atomic<bool> logged{false};
+-    if (first_call(logged))
+-        std::fprintf(stderr, "[rt] d3d12_xs: slot 70 wrote a raw buffer view (va 0x%llx, first element %llu, %u elements)\n",
+-                     static_cast<unsigned long long>(shape.va), static_cast<unsigned long long>(view.Buffer.FirstElement),
+-                     view.Buffer.NumElements);
++    const unsigned kind = raw ? 0 : view.Format == DXGI_FORMAT_UNKNOWN ? 1 : 2;
++    static std::atomic<unsigned> forwarded[3]{};
++    const unsigned count = forwarded[kind].fetch_add(1, std::memory_order_relaxed) + 1;
++    if (count <= 4)
++        std::fprintf(stderr, "[rt] slot70 forwarded %s buffer SRV: format=%d va=0x%llx start=0x%llx "
++                     "first=%llu count=%u stride=%u\n", kind == 0 ? "raw" : kind == 1 ? "structured" : "typed",
++                     int(view.Format), static_cast<unsigned long long>(shape.va), static_cast<unsigned long long>(start),
++                     static_cast<unsigned long long>(view.Buffer.FirstElement), view.Buffer.NumElements,
++                     view.Buffer.StructureByteStride);
+ }
+ 
+ // Device slot 75: ID3D12Device9::CreateCommandQueue1(desc, creator_id, riid, out), called by slot index.
+-- 
+2.54.0
+
