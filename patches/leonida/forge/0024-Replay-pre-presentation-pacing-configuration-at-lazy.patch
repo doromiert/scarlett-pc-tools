@@ -1,0 +1,72 @@
+From 3d6562e00f738a1d25af2a900e8eeeef89a5acc0 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 22:01:27 +0100
+Subject: [PATCH 24/25] Replay pre-presentation pacing configuration at lazy
+ initialization
+
+---
+ runtime/shims/d3d12_xs_device.cpp | 27 +++++++++++++++++++++++----
+ 1 file changed, 23 insertions(+), 4 deletions(-)
+
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index b3216c7dc..a2c6b9b9d 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -119,6 +119,7 @@ struct DeviceProxy {
+     // no vblank source until a presenter exists, and a bounded zero wait cannot stall the first frame.
+     std::atomic<std::uint32_t> frame_interval_us{0};
+     std::atomic<std::uint32_t> frame_latency{1};
++    std::atomic<std::uint32_t> frame_event{0}, frame_event_offset{0}, frame_event_flags{0};
+     std::atomic<bool> frame_event_scheduled{false};
+     std::shared_ptr<leonida::FrameTokenSource> frame_tokens = std::make_shared<leonida::FrameTokenSource>();
+ };
+@@ -1559,6 +1560,13 @@ PresentState* present_state_for(DeviceProxy* device) {
+         return state;
+     }
+     state->xbox = std::make_unique<rt::d3d12::XboxPresentation>(std::move(presenter), nullptr, device->frame_tokens);
++    // Configuration can precede the first PresentX and therefore the lazy presenter.
++    state->xbox->SetFrameIntervalX(nullptr, device->frame_interval_us.load(std::memory_order_relaxed),
++                                   device->frame_latency.load(std::memory_order_relaxed), 0);
++    if (device->frame_event_scheduled.load(std::memory_order_acquire))
++        state->xbox->ScheduleFrameEventX(device->frame_event.load(std::memory_order_relaxed),
++                                        device->frame_event_offset.load(std::memory_order_relaxed),
++                                        device->frame_event_flags.load(std::memory_order_relaxed));
+     std::fprintf(stderr, "[rt] d3d12_xs: PresentX ready (window %p)\n", static_cast<void*>(window));
+     return state;
+ }
+@@ -2581,7 +2589,10 @@ HRESULT proxy_set_frame_interval_x(DeviceProxy* self, std::uint64_t output, std:
+ // Xbox device slot 79 (public HLE): ScheduleFrameEventX(event, offset_us, pEvent, flags); our pacer has only the origin.
+ HRESULT proxy_schedule_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t offset_us,
+                                      std::uint64_t flags) {
+-    self->frame_event_scheduled.store(true, std::memory_order_relaxed);
++    self->frame_event.store(static_cast<UINT>(event), std::memory_order_relaxed);
++    self->frame_event_offset.store(static_cast<UINT>(offset_us), std::memory_order_relaxed);
++    self->frame_event_flags.store(static_cast<UINT>(flags), std::memory_order_relaxed);
++    self->frame_event_scheduled.store(true, std::memory_order_release);
+     if (auto* presentation = device_presentation(self))
+         return presentation->ScheduleFrameEventX(static_cast<UINT>(event), static_cast<UINT>(offset_us),
+                                                  static_cast<UINT>(flags));
+@@ -2595,9 +2606,17 @@ HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::ui
+                                  std::uint64_t flags, std::uint64_t token_word) {
+     auto* token = reinterpret_cast<std::uint64_t*>(token_word);
+     if (!token) return E_POINTER;
+-    if (auto* presentation = device_presentation(self))
+-        return presentation->WaitFrameEventX(static_cast<UINT>(event), static_cast<DWORD>(timeout_ms),
+-                                             static_cast<UINT>(flags), token);
++    if (auto* presentation = device_presentation(self)) {
++        const HRESULT hr = presentation->WaitFrameEventX(static_cast<UINT>(event), static_cast<DWORD>(timeout_ms),
++                                                        static_cast<UINT>(flags), token);
++        if (FAILED(hr)) {
++            static std::atomic<unsigned> logged{0};
++            if (logged.fetch_add(1, std::memory_order_relaxed) < 8)
++                std::fprintf(stderr, "[rt] WaitFrameEventX refused: event=%llu timeout=%llu flags=0x%llx result=0x%08lx\n",
++                             event, timeout_ms, flags, static_cast<unsigned long>(hr));
++        }
++        return hr;
++    }
+     *token = self->frame_tokens->issue();
+     return S_OK;
+ }
+-- 
+2.54.0
+

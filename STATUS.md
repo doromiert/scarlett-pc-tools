@@ -183,3 +183,18 @@ still pending. They are not evidence of a faster or playable boot yet.
 Rendered output, audio output, a playable scene, simulation speed at
 different render rates, or gyro aiming. The last two remain requirements in
 ROADMAP.md. No timing or input patches are applied to the game.
+
+## Current repository follow-up
+
+The forge source series now incorporates `4fe7db213` and actual-run fixes for the
+lazy pacing handoff and zero-time frame polls. The actual executable passed the
+new wait assertion, exceeded 1,920 native completions, and wrote a 1.05 GiB session
+pipeline cache with an explicit 2 GiB file limit. Sampled frames remained black;
+restart reuse is not yet verified.
+
+XCL `2abc562` introduced a reported first account menu in upstream commit
+`38b05b7`; that is an upstream observation, not a local settings-screen result.
+Our actual Wine run reproduced the native shared-fence identity assertion. A
+separate local XCL fence proxy cleared it and exposed the next `E_INVALIDARG` at
+`exe+0x2478b7b` during command-list creation. The allocator identity fix is being
+checked separately. No XCL implementation code is distributed in this repository.

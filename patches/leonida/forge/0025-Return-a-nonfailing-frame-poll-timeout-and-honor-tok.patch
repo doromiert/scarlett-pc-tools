@@ -1,0 +1,42 @@
+From 5141624ee9d41c6607121b038de9013a80b86108 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 22:03:19 +0100
+Subject: [PATCH 25/25] Return a nonfailing frame poll timeout and honor
+ token-on-timeout
+
+---
+ runtime/src/frame_pacer.h | 11 ++++++++---
+ 1 file changed, 8 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/src/frame_pacer.h b/runtime/src/frame_pacer.h
+index 50add106e..d97209bc0 100644
+--- a/runtime/src/frame_pacer.h
++++ b/runtime/src/frame_pacer.h
+@@ -212,16 +212,21 @@ public:
+     }
+ 
+     // WaitFrameEventX(event, timeout, ..., flags, &token). Blocks until the next origin, and while `latency` frames
+-    // are in flight. pacer_hr::timeout when `timeout_ms` passes first (infinite_timeout_ms: never); the token is left
+-    // alone then. invalid_state when nothing is registered, the pacer is suspended, or one of those happens while waiting.
++    // are in flight. A timeout is S_FALSE, not a failing HRESULT. Flag 2 asks for the current token even on timeout.
++    // The retail title polls with timeout 0 / flags 2 and asserts if the result is negative (exe+0x2482448).
++    // API observations: https://github.com/ivall/xcl/blob/main/HANDOFF.md (frame-clock call shapes, no code port).
++    // invalid_state when nothing is registered, the pacer is suspended, or one of those happens while waiting.
+     std::int32_t wait_frame_event(std::uint32_t event, std::uint32_t timeout_ms, std::uint32_t flags,
+                                   std::uint64_t* token) {
+-        (void)flags;
+         if (event != frame_event_origin || !token) return pacer_hr::invalid_arg;
+         std::unique_lock lock(mutex_);
+         ++waiters_;
+         const std::int32_t result = wait_locked(lock, timeout_ms, token);
+         if (--waiters_ == 0) cv_.notify_all();
++        if (result == pacer_hr::timeout) {
++            if (flags & 2u) *token = tokens_->issued();
++            return pacer_hr::false_;
++        }
+         return result;
+     }
+ 
+-- 
+2.54.0
+

@@ -1,0 +1,38 @@
+From 8e8fa5a8614a50a4f2162f11c6611ba4aa4fce4e Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 21:58:06 +0100
+Subject: [PATCH 22/25] Adapt upstream token adoption to the shared atomic
+ token source
+
+---
+ runtime/src/frame_pacer.h | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/runtime/src/frame_pacer.h b/runtime/src/frame_pacer.h
+index e57ee488b..50add106e 100644
+--- a/runtime/src/frame_pacer.h
++++ b/runtime/src/frame_pacer.h
+@@ -144,6 +144,11 @@ class FrameTokenSource {
+ public:
+     std::uint64_t issue() { return last_.fetch_add(1, std::memory_order_acq_rel) + 1; }
+     std::uint64_t issued() const { return last_.load(std::memory_order_acquire); }
++    void adopt(std::uint64_t token) {
++        auto last = last_.load(std::memory_order_acquire);
++        while (last < token && !last_.compare_exchange_weak(last, token, std::memory_order_acq_rel,
++                                                           std::memory_order_acquire)) {}
++    }
+ 
+ private:
+     std::atomic<std::uint64_t> last_{0};
+@@ -269,7 +274,7 @@ public:
+     // WaitFrameEventX before a presentation exists): they count as issued.
+     void adopt_issued(std::uint64_t token) {
+         std::lock_guard guard(mutex_);
+-        if (token > issued_) issued_ = token;
++        tokens_->adopt(token);
+     }
+     enum class TokenIssue { none, null_token, stale, repeated };
+     std::int32_t check_present_token(std::uint64_t token, TokenIssue* issue = nullptr) {
+-- 
+2.54.0
+

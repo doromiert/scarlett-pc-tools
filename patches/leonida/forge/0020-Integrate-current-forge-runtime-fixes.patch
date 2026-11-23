@@ -1,0 +1,2008 @@
+From 8c72196e7b1029386827f9641350d620d2274771 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 22:04:53 +0100
+Subject: [PATCH 20/25] Integrate current forge runtime fixes
+
+Source: https://git.notrexed.dev/enx/leonida/commit/4fe7db213
+Upstream provenance (runtime and tools preserved separately):
+097e9f46e enx <enx@noreply.localhost>: d3d12_xs: first present: tokens the proxy handed out are presentable, title-placed buffers found at their VA
+0c08b7363 enx <enx@noreply.localhost>: Fork PR !2: d3d12: share each VkShaderModule across the pipeline states built from it
+40756fe9d enx <enx@noreply.localhost>: d3d12_vulkan: size console depth-stencil UAV and 4 KiB console-tiled textures in slot 25
+d62ff57bd enx <enx@noreply.localhost>: Upstream PR #9035: buffer_va_index: keep insertion atomic when host allocation fails
+5b09c82e9 enx <enx@noreply.localhost>: Upstream PR #7218 (refresh): d3d12_xs: device slot 133 (CreatePlacedResourceX) makes a buffer on the title's own pages (VK_EXT_external_memory_host)
+2ac385837 enx <enx@noreply.localhost>: Upstream PR #8225: d3d12: a slot-133 buffer whose pages can't be imported is a shadow at the title's VA, re-copied before each submit
+956845acc enx <enx@noreply.localhost>: Fork PR !5: acphal: preserve shape contexts on allocation failure and validate alignment
+fdfbe5668 enx <enx@noreply.localhost>: Fork PR !6: dstorage: a status rejected by a closing queue completes with E_DSTORAGE_QUEUE_CLOSED instead of staying pending
+8075a91af enx <enx@noreply.localhost>: Fork PR !8: d3d12_xs: slot 57 reads each stage container once and shares it between pipelines
+b5163905e enx <enx@noreply.localhost>: Fork PR !9: cmake: pso_stream_test is declared with the same platform guard as the other D3D12 tests, and with /EHsc
+1167dd4dd enx <enx@noreply.localhost>: Upstream PR #8448: rdna2spirv, lane_masks: support null/exec/wave32-vcc_hi compare SDSTs and wave32 vcc_hi masks
+a467b4a10 enx <enx@noreply.localhost>: Upstream PR #6446: rdna2spirv: write the compute thread-group SGPR (TG_SIZE_EN)
+ce0a6a946 enx <enx@noreply.localhost>: Upstream PR #9106: rdna2spirv: read plain VCC pairs as scalar memory pointers
+8b24c7f8b enx <enx@noreply.localhost>: Upstream PR #3976: rdna2spirv: ds_append and ds_consume (LDS), once per wave
+4fe7db213 enx <enx@noreply.localhost>: Upstream PR #8714: translate scalar bit replication into wave64 vcc
+
+Local conflict resolution retains the UI owner thread and shared token source.
+---
+ runtime/CMakeLists.txt                    |  19 +-
+ runtime/shims/acphal.cpp                  |  19 +-
+ runtime/shims/d3d12_com.cpp               |  12 +-
+ runtime/shims/d3d12_com.h                 |   2 +-
+ runtime/shims/d3d12_vulkan_device.cpp     | 292 +++++++++++++++++++---
+ runtime/shims/d3d12_xs_device.cpp         |  53 ++--
+ runtime/shims/d3d12_xs_device.h           |   6 +-
+ runtime/shims/d3d12_xs_native_pso.h       |  51 +++-
+ runtime/shims/dstorage.cpp                |   4 +-
+ runtime/shims/xbox_present.cpp            |  24 ++
+ runtime/shims/xbox_present.h              |   7 +
+ runtime/src/buffer_va_index.h             |   7 +-
+ runtime/src/frame_pacer.h                 |   6 +
+ runtime/src/shader_module_cache.h         | 117 +++++++++
+ runtime/src/vulkan_backend.h              |  36 +++
+ runtime/src/vulkan_replay.h               |  52 +++-
+ runtime/test/acphal_test.cpp              |   8 +
+ runtime/test/buffer_va_index_test.cpp     |  72 ++++++
+ runtime/test/d3d12_existing_heap_test.cpp | 150 ++++++++---
+ runtime/test/dstorage_test.cpp            |   2 +
+ runtime/test/shader_module_cache_test.cpp | 124 +++++++++
+ runtime/test/shaders/check.py             |   5 +-
+ runtime/test/shaders/cs_w32_ds_append.asm |  63 +++++
+ runtime/test/shaders/cs_w64_ds_append.asm |  64 +++++
+ runtime/test/xs_native_pso_test.cpp       |  27 ++
+ runtime/test/xs_proxy_mock_test.cpp       |  10 +-
+ 26 files changed, 1125 insertions(+), 107 deletions(-)
+ create mode 100644 runtime/src/shader_module_cache.h
+ create mode 100644 runtime/test/shader_module_cache_test.cpp
+ create mode 100644 runtime/test/shaders/cs_w32_ds_append.asm
+ create mode 100644 runtime/test/shaders/cs_w64_ds_append.asm
+
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index e2a96d2a8..d45d7094f 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -215,6 +215,11 @@ if(WIN32 AND LEONIDA_BUILD_WINDOWS_RUNTIME)
+                                       shims/d3d12_xs_pso_stream.cpp)
+     target_compile_definitions(xs_native_pso_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+     target_compile_options(xs_native_pso_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
++    add_executable(pso_stream_test test/pso_stream_test.cpp shims/d3d12_xs_pso_stream.cpp)
++    target_include_directories(pso_stream_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
++    target_compile_definitions(pso_stream_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
++    target_compile_options(pso_stream_test PRIVATE /W4 /permissive- /utf-8 /EHsc)
++    target_link_options(pso_stream_test PRIVATE /OPT:NOREF)
+   else()
+     message(STATUS "d3d12.lib not found: root_sig_test and device_proxy_test are not built")
+   endif()
+@@ -1062,14 +1067,6 @@ if(BUILD_TESTING)
+     add_test(NAME xs_proxy_mock_env_slots_70 COMMAND xs_proxy_mock_test --env-slots-70)
+     add_test(NAME xs_proxy_mock_env_slots_74 COMMAND xs_proxy_mock_test --env-slots-74)
+   endif()
+-  add_executable(pso_stream_test
+-    test/pso_stream_test.cpp
+-    shims/d3d12_xs_pso_stream.cpp
+-  )
+-  target_include_directories(pso_stream_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/shims)
+-  target_compile_definitions(pso_stream_test PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX)
+-  target_compile_options(pso_stream_test PRIVATE /W4 /permissive- /utf-8)
+-  target_link_options(pso_stream_test PRIVATE /OPT:NOREF)
+   if(TARGET pso_stream_test)
+     add_test(NAME pso_stream COMMAND pso_stream_test)
+   endif()
+@@ -1635,6 +1632,12 @@ if(TARGET Vulkan::Headers)
+     add_test(NAME vk_fence_dispatcher_sync COMMAND vk_fence_dispatcher_sync_test)
+     set_tests_properties(vk_fence_dispatcher_sync PROPERTIES SKIP_RETURN_CODE 77)
+   endif()
++  # CPU-only: one VkShaderModule per distinct SPIR-V, shared by the pipeline states built from it (A42).
++  add_executable(shader_module_cache_test test/shader_module_cache_test.cpp)
++  target_link_libraries(shader_module_cache_test PRIVATE Vulkan::Headers)
++  if(BUILD_TESTING)
++    add_test(NAME shader_module_cache COMMAND shader_module_cache_test)
++  endif()
+   # CPU-only: the bindless set's array sizes from synthetic device limits.
+   add_executable(bindless_sizing_test test/bindless_sizing_test.cpp)
+   target_link_libraries(bindless_sizing_test PRIVATE Vulkan::Headers)
+diff --git a/runtime/shims/acphal.cpp b/runtime/shims/acphal.cpp
+index c2489aabd..09b52a68f 100644
+--- a/runtime/shims/acphal.cpp
++++ b/runtime/shims/acphal.cpp
+@@ -95,8 +95,9 @@ HRESULT ApuFree(void* va) {
+     return g_blocks.erase(static_cast<uint32_t>(p - g_heap)) ? S_OK : kEInvalidArg;
+ }
+ 
+-// TRUE when the address is inside a live block and its APU address is a multiple of `align`.
++// TRUE when the address is inside a live block and its heap offset is a multiple of `align`.
+ BOOL ApuIsVirtualAddressValid(const void* va, uint32_t align) {
++    if (align && (align & (align - 1)) != 0) return FALSE;
+     std::lock_guard lock(g_mutex);
+     auto* p = static_cast<const uint8_t*>(va);
+     if (!g_heap || p < g_heap || p >= g_heap + g_heap_size) return FALSE;
+@@ -105,7 +106,7 @@ BOOL ApuIsVirtualAddressValid(const void* va, uint32_t align) {
+     if (it == g_blocks.begin()) return FALSE;
+     --it;
+     if (offset - it->first >= it->second) return FALSE;
+-    return align == 0 || ((kApuBase + offset) & (align - 1)) == 0;
++    return align == 0 || (offset & (align - 1)) == 0;
+ }
+ 
+ uint32_t ApuMapVirtualAddress(const void* va) {
+@@ -136,11 +137,19 @@ void* g_shape[kShapeTypes] = {};
+ HRESULT AcpHalAllocateShapeContexts(ShapeContexts* s) {
+     if (!s) return kEPointer;
+     std::lock_guard lock(g_mutex);
++    void* new_shape[kShapeTypes] = {};
++    for (int i = 0; i < kShapeTypes; ++i) {
++        if (!s->count[i]) continue;
++        new_shape[i] = _aligned_malloc(s->count[i] * kShapeContextSize, 64);
++        if (!new_shape[i]) {
++            for (void* p : new_shape) _aligned_free(p);
++            return kEOutOfMemory;
++        }
++        std::memset(new_shape[i], 0, s->count[i] * kShapeContextSize);
++    }
+     for (int i = 0; i < kShapeTypes; ++i) {
+         _aligned_free(g_shape[i]);
+-        g_shape[i] = s->count[i] ? _aligned_malloc(s->count[i] * kShapeContextSize, 64) : nullptr;
+-        if (s->count[i] && !g_shape[i]) return kEOutOfMemory;
+-        if (g_shape[i]) std::memset(g_shape[i], 0, s->count[i] * kShapeContextSize);
++        g_shape[i] = new_shape[i];
+         if (s->count[i]) s->contexts[i] = g_shape[i];  // a zero count leaves its pointer alone: only +0x38 is measured
+     }
+     return S_OK;
+diff --git a/runtime/shims/d3d12_com.cpp b/runtime/shims/d3d12_com.cpp
+index ffb8db1df..412081927 100644
+--- a/runtime/shims/d3d12_com.cpp
++++ b/runtime/shims/d3d12_com.cpp
+@@ -1597,9 +1597,15 @@ public:
+         }
+         last_result_ = queue_.execute(recorded, [&graphics] { return pin_lists(graphics); });
+         d3d12_trace::record(method, last_result_ == leonida::ReplayResult::success ? "ok" : "failed");
+-        if (last_result_ != leonida::ReplayResult::success)
+-            std::fprintf(stderr, "[rt] d3d12: ExecuteCommandLists failed: %s; nothing was submitted\n",
+-                         name(last_result_));
++        if (last_result_ != leonida::ReplayResult::success) {
++            // Logged at 1, 2, 4, ... failures: a title that resubmits every frame would fill the log otherwise.
++            static std::atomic<std::uint64_t> failures{0};
++            const std::uint64_t n = failures.fetch_add(1, std::memory_order_relaxed) + 1;
++            if ((n & (n - 1)) == 0)
++                std::fprintf(stderr,
++                             "[rt] d3d12: ExecuteCommandLists failed: %s; nothing was submitted (%llu so far)\n",
++                             name(last_result_), static_cast<unsigned long long>(n));
++        }
+     }
+ 
+     // A copy list's timestamps go to COPY_QUEUE_TIMESTAMP heaps and every other list's to TIMESTAMP heaps.
+diff --git a/runtime/shims/d3d12_com.h b/runtime/shims/d3d12_com.h
+index 5fd42e216..ca461624b 100644
+--- a/runtime/shims/d3d12_com.h
++++ b/runtime/shims/d3d12_com.h
+@@ -231,7 +231,7 @@ bool device_supports_ray_tracing(ID3D12Device* device);
+ // what the GPU reads. A buffer description only; E_NOTIMPL on a device that is not the Vulkan layer, without the
+ // extension, or for a texture.
+ HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const D3D12_RESOURCE_DESC& desc,
+-                                      REFIID riid, void** out);
++                                      std::uint32_t layout, REFIID riid, void** out);
+ // The VkAccelerationStructureKHR registered for `va` on `device`, or VK_NULL_HANDLE. For tests.
+ VkAccelerationStructureKHR vulkan_acceleration_structure(ID3D12Device* device, D3D12_GPU_VIRTUAL_ADDRESS va);
+ 
+diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
+index 7c126d4e6..1e418e710 100644
+--- a/runtime/shims/d3d12_vulkan_device.cpp
++++ b/runtime/shims/d3d12_vulkan_device.cpp
+@@ -17,6 +17,7 @@
+ #include "d3d12_xs_native_pso.h"
+ #include "dxgi_com.h"
+ #include "../src/arena_size.h"
++#include "../src/shader_module_cache.h"
+ #include "../src/gfx10_descriptors.h"
+ #include "../src/host_stall.h"
+ #include "../src/depth24_fragment.h"
+@@ -45,6 +46,7 @@
+ #include <atomic>
+ #include <bit>
+ #include <cctype>
++#include <chrono>
+ #include <climits>
+ #include <cstdlib>
+ #include <filesystem>
+@@ -59,6 +61,7 @@
+ #include <string>
+ #include <type_traits>
+ #include <cwchar>
++#include <smmintrin.h>
+ #include <vector>
+ 
+ namespace rt::d3d12 {
+@@ -125,6 +128,56 @@ void log_once(const char* what, int value) {
+     if (g_log_once_seen->insert({what, value}).second) std::fprintf(stderr, "[rt] d3d12: %s %d\n", what, value);
+ }
+ 
++// memcpy that a page fault ends instead of killing the process: the title may decommit a page between the
++// VirtualQuery that saw it committed and the read. No C++ objects here: it is a __try frame.
++// `streaming` reads with MOVNTDQA, for write-combined pages: ordinary loads from them are not cached, and memcpy
++// read 64 MiB of them in 253 ms on a Core i9-13900K (253 MiB/s), MOVNTDQA in 13 to 17 ms (4 to 5 GiB/s). Paid at every submission.
++#if defined(__clang__) && defined(_M_X64)
++__attribute__((target("sse4.1")))
++#endif
++bool copy_guarded(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes, bool streaming) {
++    __try {
++        if (streaming) {
++            const std::size_t head = std::min<std::size_t>(bytes, (0 - reinterpret_cast<std::uintptr_t>(from)) & 63);
++            std::memcpy(to, from, head);
++            to += head, from += head, bytes -= head;
++            for (; bytes >= 64; to += 64, from += 64, bytes -= 64) {
++                const auto* in = reinterpret_cast<const __m128i*>(from);
++                const __m128i a = _mm_stream_load_si128(in), b = _mm_stream_load_si128(in + 1);
++                const __m128i c = _mm_stream_load_si128(in + 2), d = _mm_stream_load_si128(in + 3);
++                auto* out = reinterpret_cast<__m128i*>(to);
++                _mm_storeu_si128(out, a), _mm_storeu_si128(out + 1, b);
++                _mm_storeu_si128(out + 2, c), _mm_storeu_si128(out + 3, d);
++            }
++        }
++        std::memcpy(to, from, bytes);
++        return true;
++    } __except (EXCEPTION_EXECUTE_HANDLER) {
++        return false;
++    }
++}
++
++// Copies [from, from + bytes) of the title's address space to `to`, for a slot-133 shadow buffer. Only committed,
++// readable pages are read (xmem commits on first touch, and a read of a reserved page faults); the rest is zero.
++void copy_title_pages(std::uint8_t* to, const std::uint8_t* from, std::size_t bytes) {
++    constexpr DWORD readable = PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READ |
++                               PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
++    for (std::size_t at = 0; at < bytes;) {
++        MEMORY_BASIC_INFORMATION region{};
++        std::size_t run = bytes - at;
++        bool read = false;
++        if (VirtualQuery(from + at, &region, sizeof(region))) {
++            const auto end = reinterpret_cast<std::uintptr_t>(region.BaseAddress) + region.RegionSize;
++            run = std::min<std::size_t>(run, end - reinterpret_cast<std::uintptr_t>(from + at));
++            read = region.State == MEM_COMMIT && (region.Protect & readable) &&
++                   !(region.Protect & (PAGE_GUARD | PAGE_NOACCESS));
++        }
++        if (!read || !copy_guarded(to + at, from + at, run, (region.Protect & PAGE_WRITECOMBINE) != 0))
++            std::memset(to + at, 0, run);
++        at += run;
++    }
++}
++
+ // Two test settings that make the standalone device look like a GPU with fewer Vulkan queues, so the path where D3D12
+ // queues share a VkQueue runs on any GPU; both together give the Intel UHD 770 on Windows and lavapipe (one family,
+ // one queue). LEONIDA_VK_MAX_QUEUES_PER_FAMILY=N (1 to 16): at most N VkQueues per queue family (unset, or not a
+@@ -673,7 +726,9 @@ struct TextureCreateInfo {
+         if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET) info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+         if (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL) info.usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
+         // No B8G8R8X8 view is ever a UAV, so its typeless family needs no storage usage (not every GPU has it for BGRA8).
+-        if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !alpha_unused(desc.Format)) {
++        // Console depth-stencil textures may allow unordered access; no Vulkan depth format takes storage usage.
++        if ((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) && !alpha_unused(desc.Format) &&
++            !(format.aspects & (VK_IMAGE_ASPECT_DEPTH_BIT | VK_IMAGE_ASPECT_STENCIL_BIT))) {
+             info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+             if (!volume && info.samples == VK_SAMPLE_COUNT_1_BIT && attachment_usable)
+                 info.usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
+@@ -808,6 +863,45 @@ struct DeviceState {
+     // VK_EXT_external_memory_host; null unless info.host_pointer_alignment is set and the entry point loaded.
+     PFN_vkGetMemoryHostPointerPropertiesEXT get_host_pointer_properties = nullptr;
+ 
++    // The live shadow buffers of Xbox device slot 133 (Resource::create_shadow_buffer): title-placed buffers whose
++    // pages the driver would not import. Each is re-copied from the title's pages before every submission of
++    // command lists (VulkanContext::set_before_execute), since nothing says which pages the title wrote. The first
++    // per-submission copy of each buffer size is timed and logged, so the cost shows in a run's log.
++    struct Shadow {
++        const std::uint8_t* pages;  // the title's
++        std::uint8_t* mapped;       // the shadow's memory
++        std::size_t size;
++    };
++    std::mutex shadow_mutex;  // a leaf: nothing else is taken under it
++    std::vector<Shadow> shadows;
++    std::set<std::size_t> shadow_sizes_logged;
++
++    void add_shadow(const Shadow& shadow) {
++        std::lock_guard lock(shadow_mutex);
++        shadows.push_back(shadow);
++    }
++    void remove_shadow(const std::uint8_t* mapped) {
++        std::lock_guard lock(shadow_mutex);
++        std::erase_if(shadows, [mapped](const Shadow& s) { return s.mapped == mapped; });
++    }
++    void refresh_shadows() {
++        std::lock_guard lock(shadow_mutex);
++        for (const Shadow& s : shadows) {
++            if (!shadow_sizes_logged.insert(s.size).second) {
++                copy_title_pages(s.mapped, s.pages, s.size);
++                continue;
++            }
++            const auto start = std::chrono::steady_clock::now();
++            copy_title_pages(s.mapped, s.pages, s.size);
++            const double ms =
++                std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
++            std::fprintf(stderr, "[rt] d3d12: slot-133 shadow buffer of %llu KiB: copied from the title's pages in "
++                                 "%.3f ms (%.0f MiB/s), paid at every submission\n",
++                         static_cast<unsigned long long>(s.size / 1024), ms,
++                         ms > 0 ? double(s.size) / (1024.0 * 1024.0) / (ms / 1000.0) : 0.0);
++        }
++    }
++
+     // WriteToSubresource/ReadFromSubresource without host image copy: one staging copy at a time, submitted to
+     // the device's VkQueue and waited for. Created on first use.
+     std::mutex staging_mutex;
+@@ -1205,6 +1299,25 @@ struct DeviceState {
+         std::uint64_t address;
+     };
+     std::unique_ptr<leonida::BindlessSet> bindless;
++    // A42: every PipelineState takes its VkShaderModules from here, one per distinct SPIR-V (src/shader_module_cache.h).
++    std::once_flag shader_modules_once;
++    std::unique_ptr<leonida::ShaderModuleCache> shader_modules_cache;
++    leonida::ShaderModuleCache& shader_modules() {
++        std::call_once(shader_modules_once, [this] {
++            shader_modules_cache = std::make_unique<leonida::ShaderModuleCache>(
++                [this](const std::vector<std::uint32_t>& words) {
++                    VkShaderModuleCreateInfo create{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
++                    create.codeSize = words.size() * 4;
++                    create.pCode = words.data();
++                    VkShaderModule module = VK_NULL_HANDLE;
++                    if (context->vk.vkCreateShaderModule(info.device, &create, nullptr, &module) != VK_SUCCESS)
++                        return VkShaderModule(VK_NULL_HANDLE);
++                    return module;
++                },
++                [this](VkShaderModule module) { context->vk.vkDestroyShaderModule(info.device, module, nullptr); });
++        });
++        return *shader_modules_cache;
++    }
+     std::mutex descriptor_mutex;  // the set and the containers below
+     // vkDeviceWaitIdle calls made for the bindless set (none, unless LEONIDA_BINDLESS_IDLE_WAIT restores the old wait).
+     std::atomic<std::uint64_t> bindless_idle_waits{0};
+@@ -1914,6 +2027,9 @@ public:
+         }
+         if (image_address_) device_.forget_image(image_address_);
+         device_.context->remove_resource(id());
++        if (title_alias_) device_.context->remove_resource(id() | 1);
++        // Before the memory goes to the deferred queue: no submission copies into it after this.
++        if (shadow_) device_.remove_shadow(shadow_);
+         if (host_import_) {
+             // VK_EXT_external_memory_host needs the caller's pages to stay valid for the imported memory's whole
+             // lifetime, and a title may free them right after releasing the resource. So the memory is not left to
+@@ -2190,6 +2306,77 @@ public:
+         return S_OK;
+     }
+ 
++    // A buffer the title placed on its own pages that the driver would not import: it is also found at that VA, so a
++    // draw or copy that names the title's address resolves. Its contents are the buffer's, not the title's pages.
++    bool alias_title_va(std::uint64_t va) {
++        if ((id() & 1) || !device_.context->alias_buffer(id(), id() | 1, va)) return false;
++        title_alias_ = true;
++        return true;
++    }
++
++    // The fallback of create_host_buffer, for pages the driver will not import: write-combined or uncached ones (in
++    // retail 74 MiB of the title's 182 MiB range), pages not committed yet, a device without
++    // VK_EXT_external_memory_host, or a driver past its import budget (an RTX 3070 Ti answers
++    // VK_ERROR_OUT_OF_DEVICE_MEMORY after about 64 MiB of imports). The buffer has its own host-visible memory, a
++    // shadow of the title's pages, but keeps the title's VA as its console VA, so the descriptors and views the title
++    // builds from that VA still find it (an ordinary buffer here had another VA and none of the data: slot 70 wrote
++    // a null SRV and the UI draws sampled nothing). It is filled from the pages now and again before every
++    // submission of command lists (DeviceState::refresh_shadows).
++    // One way only: what the GPU writes to the shadow is NOT copied back to the title's pages, and the next
++    // submission's copy overwrites it. A title that reads GPU output at `address` needs the import.
++    HRESULT create_shadow_buffer(void* address) {
++        auto& vk = device_.context->vk;
++        if (!address || !desc_.Width || desc_.Width > ~UINT64(0) - D3D12_DEFAULT_RESOURCE_PLACEMENT_ALIGNMENT)
++            return E_INVALIDARG;
++        const bool need_bda = device_.info.buffer_device_address || device_.arena.buffer != VK_NULL_HANDLE;
++        VkBufferCreateInfo info{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
++        info.size = desc_.Width;
++        info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
++                     VK_BUFFER_USAGE_VERTEX_BUFFER_BIT | VK_BUFFER_USAGE_INDEX_BUFFER_BIT |
++                     VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT |
++                     VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT;
++        if (device_.info.conditional_rendering) info.usage |= VK_BUFFER_USAGE_CONDITIONAL_RENDERING_BIT_EXT;
++        if (need_bda) info.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
++        device_.share(info);
++        if (vk.vkCreateBuffer(device_.info.device, &info, nullptr, &buffer_) != VK_SUCCESS) return E_OUTOFMEMORY;
++        VkMemoryRequirements requirements{};
++        vk.vkGetBufferMemoryRequirements(device_.info.device, buffer_, &requirements);
++        // As an upload buffer (D3D-96): the CPU writes it at every submission and the GPU reads it, so VRAM through
++        // Resizable BAR where there is one, system memory otherwise.
++        memory_ = device_.allocate(requirements,
++                                   VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT,
++                                   device_.upload_in_vram ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : 0, &memory_flags_,
++                                   need_bda);
++        void* shadow = nullptr;
++        if (!memory_ || vk.vkBindBufferMemory(device_.info.device, buffer_, memory_, 0) != VK_SUCCESS ||
++            vk.vkMapMemory(device_.info.device, memory_, 0, VK_WHOLE_SIZE, 0, &shadow) != VK_SUCCESS)
++            return E_OUTOFMEMORY;
++        shadow_ = static_cast<std::uint8_t*>(shadow);
++        const auto* pages = static_cast<const std::uint8_t*>(address);
++        copy_title_pages(shadow_, pages, std::size_t(desc_.Width));
++        // Map() answers the title's own pages, as the imported buffer does: a write to the shadow's memory would be
++        // overwritten by the next copy.
++        mapped_ = address;
++        va_ = reinterpret_cast<std::uintptr_t>(address);
++        if (need_bda && vk.vkGetBufferDeviceAddress) {
++            VkBufferDeviceAddressInfo bda{VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
++            bda.buffer = buffer_;
++            buffer_va_ = vk.vkGetBufferDeviceAddress(device_.info.device, &bda);
++            gpu_va_ = buffer_va_;
++        }
++        device_.log_va("title-placed buffer (shadow)", va_, desc_.Width);
++        leonida::ResourceBinding binding{};
++        binding.buffer = buffer_;
++        binding.size = desc_.Width;
++        // CPU-side reads take the shadow, not the title's pages: it is as fresh as what the GPU reads and every byte
++        // of it can be read, which the pages do not promise. Not host_readable: GPU writes are not handed back.
++        binding.host = shadow_;
++        binding.va = va_;
++        device_.context->add_resource(id(), binding);
++        device_.add_shadow({pages, shadow_, std::size_t(desc_.Width)});
++        return S_OK;
++    }
++
+     HRESULT create_sparse_buffer() {
+         constexpr std::uint64_t tile_bytes = leonida::tile_size_in_bytes;
+         if (!desc_.Width || desc_.Width > UINT64_MAX - tile_bytes ||
+@@ -2724,6 +2911,8 @@ private:
+     std::uint64_t buffer_va_ = 0;
+     std::uint64_t gpu_va_ = 0;
+     bool host_import_ = false;  // memory_ is the caller's pages (create_host_buffer): freed at once, not deferred
++    bool title_alias_ = false;  // also registered at the title's VA as id() | 1 (alias_title_va)
++    std::uint8_t* shadow_ = nullptr;  // create_shadow_buffer: memory_ mapped, in DeviceState::shadows
+     bool reserved_ = false;
+     bool sparse_image_ = false;
+     bool placed_ = false;
+@@ -3452,11 +3641,11 @@ public:
+         if (registered_) device_.context->remove_pipeline(id());
+         if (pipeline_.pipeline) vk.vkDestroyPipeline(dev, pipeline_.pipeline, nullptr);
+         if (pipeline_.layout) vk.vkDestroyPipelineLayout(dev, pipeline_.layout, nullptr);
+-        if (module_) vk.vkDestroyShaderModule(dev, module_, nullptr);
++        if (module_) device_.shader_modules().release(module_);
+         if (graphics_.pipeline) vk.vkDestroyPipeline(dev, graphics_.pipeline, nullptr);
+         for (const auto& [unbound, built] : variants_) vk.vkDestroyPipeline(dev, built, nullptr);
+         if (graphics_.layout) vk.vkDestroyPipelineLayout(dev, graphics_.layout, nullptr);
+-        for (VkShaderModule module : modules_) vk.vkDestroyShaderModule(dev, module, nullptr);
++        for (VkShaderModule module : modules_) device_.shader_modules().release(module);
+         if (code_bytes_) device_.arena_release(code_base_, code_bytes_, DeviceState::arena_shader);
+     }
+ 
+@@ -3748,11 +3937,8 @@ public:
+                     stage.words = std::move(patched);
+                 }
+             }
+-            VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+-            module_info.codeSize = stage.words.size() * 4;
+-            module_info.pCode = stage.words.data();
+-            VkShaderModule module = VK_NULL_HANDLE;
+-            if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS) return E_FAIL;
++            const VkShaderModule module = device_.shader_modules().acquire(stage.words);
++            if (module == VK_NULL_HANDLE) return E_FAIL;
+             modules_.push_back(module);
+             VkPipelineShaderStageCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+             info.stage = stage.bit;
+@@ -3763,12 +3949,8 @@ public:
+         }
+         if (depth24_fragment && !ps_stage.entry) {  // no pixel shader: a built-in one writes the depth
+             const std::vector<std::uint32_t> words = leonida::depth24_depth_only_fragment(depth24_bias);
+-            VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+-            module_info.codeSize = words.size() * 4;
+-            module_info.pCode = words.data();
+-            VkShaderModule module = VK_NULL_HANDLE;
+-            if (words.empty() || vk.vkCreateShaderModule(dev, &module_info, nullptr, &module) != VK_SUCCESS)
+-                return E_FAIL;
++            const VkShaderModule module = words.empty() ? VK_NULL_HANDLE : device_.shader_modules().acquire(words);
++            if (module == VK_NULL_HANDLE) return E_FAIL;
+             modules_.push_back(module);
+             VkPipelineShaderStageCreateInfo info{VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO};
+             info.stage = VK_SHADER_STAGE_FRAGMENT_BIT;
+@@ -4160,10 +4342,8 @@ public:
+             return E_FAIL;
+         }
+ 
+-        VkShaderModuleCreateInfo module_info{VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO};
+-        module_info.codeSize = words.size() * 4;
+-        module_info.pCode = words.data();
+-        if (vk.vkCreateShaderModule(dev, &module_info, nullptr, &module_) != VK_SUCCESS) return E_FAIL;
++        module_ = device_.shader_modules().acquire(words);
++        if (module_ == VK_NULL_HANDLE) return E_FAIL;
+         const VkPushConstantRange push{VK_SHADER_STAGE_COMPUTE_BIT, 0, sizeof(leonida::ShaderUserData)};
+         VkPipelineLayoutCreateInfo layout_info{VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+         layout_info.pushConstantRangeCount = 1;
+@@ -5263,6 +5443,7 @@ public:
+                                                                   info.conditional_rendering, info.ray_tracing,
+                                                                   info.xdxr_acceleration_structures &&
+                                                                       info.buffer_device_address);
++        state_.context->set_before_execute([this] { state_.refresh_shadows(); });
+         if (info.physical && state_.format_properties) {
+             state_.context->set_color_attachment_format(
+                 [physical = info.physical, get_props = state_.format_properties](VkFormat format) {
+@@ -7251,7 +7432,26 @@ public:
+ 
+     // create_buffer_at_host_address (Xbox device slot 133). The heap the resource reports is CUSTOM / WRITE_BACK / L0,
+     // what OpenExistingHeapFromAddress gives the same pages, since the CPU keeps writing them.
+-    HRESULT create_at_host_address(void* address, const D3D12_RESOURCE_DESC& desc, REFIID riid, void** out) {
++    // A D3D12_BARRIER_LAYOUT (what Xbox slot 133 passes, as PC CreatePlacedResource2 does) as the legacy initial state
++    // of an equivalent committed resource. UNDEFINED (0xFFFFFFFF) and anything unlisted give COMMON.
++    static D3D12_RESOURCE_STATES state_for_barrier_layout(std::uint32_t layout) {
++        switch (layout) {
++            case 1: return D3D12_RESOURCE_STATE_GENERIC_READ;
++            case 2: return D3D12_RESOURCE_STATE_RENDER_TARGET;
++            case 3: return D3D12_RESOURCE_STATE_UNORDERED_ACCESS;
++            case 4: return D3D12_RESOURCE_STATE_DEPTH_WRITE;
++            case 5: return D3D12_RESOURCE_STATE_DEPTH_READ;
++            case 6: return D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
++            case 7: return D3D12_RESOURCE_STATE_COPY_SOURCE;
++            case 8: return D3D12_RESOURCE_STATE_COPY_DEST;
++            case 9: return D3D12_RESOURCE_STATE_RESOLVE_SOURCE;
++            case 10: return D3D12_RESOURCE_STATE_RESOLVE_DEST;
++            default: return D3D12_RESOURCE_STATE_COMMON;
++        }
++    }
++
++    HRESULT create_at_host_address(void* address, const D3D12_RESOURCE_DESC& desc, std::uint32_t layout, REFIID riid,
++                                   void** out) {
+         constexpr auto method = "Xbox CreatePlacedResourceX (device slot 133)";
+         if (desc.Dimension != D3D12_RESOURCE_DIMENSION_BUFFER) {
+             // A texture is not placed on the title's pages yet: it gets an ordinary committed DEFAULT texture of the
+@@ -7260,9 +7460,15 @@ public:
+             log_once("a title-placed texture (device slot 133) is an ordinary committed texture, not the title's pages; "
+                      "dimension",
+                      int(desc.Dimension));
++            // The initial state follows the title's barrier layout (slot 133's third argument, measured by
++            // @dracbat); a state the description refuses (or UNDEFINED) gives COMMON, so the title still gets it.
+             const D3D12_HEAP_PROPERTIES fallback{D3D12_HEAP_TYPE_DEFAULT};
+-            return d3d12_trace::result(method, create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc,
+-                                                                D3D12_RESOURCE_STATE_COMMON, 0, nullptr, riid, out));
++            const D3D12_RESOURCE_STATES initial = state_for_barrier_layout(layout);
++            HRESULT hr = create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc, initial, 0, nullptr, riid, out);
++            if (FAILED(hr) && initial != D3D12_RESOURCE_STATE_COMMON)
++                hr = create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, 0, nullptr,
++                                      riid, out);
++            return d3d12_trace::result(method, hr);
+         }
+         D3D12_HEAP_PROPERTIES heap{};
+         heap.Type = D3D12_HEAP_TYPE_CUSTOM;
+@@ -7278,16 +7484,34 @@ public:
+         if (FAILED(hr)) {
+             // The driver would not import these pages: RADV refuses a view of a pagefile-backed section, the form
+             // xmem's physical pages take (found in review on an RX 9070 XT under Wine), and a device without
+-            // VK_EXT_external_memory_host has no import at all. The boot goes on with an ordinary DEFAULT buffer
+-            // of the same description, as #6915's stand-in did: the title gets a resource, but its writes at
+-            // `address` do not reach it.
++            // VK_EXT_external_memory_host has no import at all; write-combined and uncommitted pages are not tried,
++            // and some drivers stop importing after a budget (create_shadow_buffer). The title then gets a shadow
++            // buffer at its VA, copied from its pages before every submission.
+             resource->Release();
+-            log_once("a title-placed buffer (device slot 133) could not import its pages, so it is an ordinary buffer "
+-                     "the title's writes do not reach; HRESULT",
+-                     int(hr));
++            resource = new Resource(state_, desc, heap, D3D12_HEAP_FLAG_NONE);
++            resource->attach_device(identity());
++            const HRESULT shadow = resource->create_shadow_buffer(address);
++            if (SUCCEEDED(shadow)) {
++                log_once("a title-placed buffer (device slot 133) could not import its pages, so it is a shadow "
++                         "copied from them before every submission; HRESULT",
++                         int(hr));
++                return d3d12_trace::result(method, hand_out(resource, riid, out));
++            }
++            // No memory for the shadow either: an ordinary DEFAULT buffer, also found at the title's VA so draws
++            // resolve; the title's writes at `address` do not reach it.
++            resource->Release();
++            log_once("a title-placed buffer (device slot 133) could neither import its pages nor get a shadow, so it "
++                     "is an ordinary buffer the title's writes do not reach, found at the title's VA; HRESULT",
++                     int(shadow));
+             const D3D12_HEAP_PROPERTIES fallback{D3D12_HEAP_TYPE_DEFAULT};
+-            return d3d12_trace::result(method, create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc,
+-                                                                D3D12_RESOURCE_STATE_COMMON, 0, nullptr, riid, out));
++            const HRESULT created = create_committed(&fallback, D3D12_HEAP_FLAG_NONE, &desc,
++                                                     D3D12_RESOURCE_STATE_COMMON, 0, nullptr, riid, out);
++            if (SUCCEEDED(created) && out && *out) {
++                Resource* placed = Resource::from<Resource>(static_cast<IUnknown*>(*out));
++                if (!placed || !placed->alias_title_va(reinterpret_cast<std::uintptr_t>(address)))
++                    log_once("a title-placed fallback buffer could not be registered at the title's VA", 0);
++            }
++            return d3d12_trace::result(method, created);
+         }
+         return d3d12_trace::result(method, hand_out(resource, riid, out));
+     }
+@@ -8417,6 +8641,12 @@ private:
+         if (((desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS) && (depth_stencil || samples > 1)) ||
+             (volume && depth_stencil))
+             return kInvalidAllocation;
++        // The title asks for 4 KiB alignment on small console-tiled textures: size those as the standard layout.
++        if (is_xbox_tiled_layout(desc.Layout) && desc.Alignment == align_4k) {
++            D3D12_RESOURCE_DESC standard = desc;
++            standard.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
++            return allocation(standard);
++        }
+         const bool tiled = is_tiled_layout(desc.Layout);
+         if (tiled) {
+             if (one_d || (samples > 1 && samples != 4)) return kInvalidAllocation;
+@@ -8962,13 +9192,13 @@ const VulkanDeviceInfo* vulkan_device_info(ID3D12Device* device) {
+ }
+ 
+ HRESULT create_buffer_at_host_address(ID3D12Device* device, void* address, const D3D12_RESOURCE_DESC& desc,
+-                                      REFIID riid, void** out) {
++                                      std::uint32_t layout, REFIID riid, void** out) {
+     if (out) *out = nullptr;
+     if (!device || !out) return E_POINTER;
+     ID3D12Device* real = rt::d3d12_xs::device_proxy_real_device(device);
+     auto* d = Device::from<Device>(real ? real : device);
+     if (!d) return E_NOTIMPL;
+-    return d->create_at_host_address(address, desc, riid, out);
++    return d->create_at_host_address(address, desc, layout, riid, out);
+ }
+ 
+ bool device_supports_ray_tracing(ID3D12Device* device) {
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index fd2056b03..bb704a8ff 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -1563,11 +1563,20 @@ PresentState* present_state_for(DeviceProxy* device) {
+     return state;
+ }
+ 
++// The device's presentation once the first PresentX has built it (building it earlier, at SetFrameIntervalX, made the
++// retail title fault at boot); null before. The frame-event slots go to it from then on.
++rt::d3d12::XboxPresentation* device_presentation(DeviceProxy* device) {
++    auto* state = device ? static_cast<PresentState*>(device->present_state) : nullptr;
++    return state ? state->xbox.get() : nullptr;
++}
++
+ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::uint64_t planes,
+                               std::uint64_t params) {
+     PresentState* state = self->device ? present_state_for(self->device) : nullptr;
+     if (state) state->finish_close();
+     if (!state || !state->xbox) return hr_to_u64(S_OK);  // a title still runs with nothing presented
++    // The tokens the proxy handed out before the presentation existed are ones PresentX must accept.
++    state->xbox->adopt_frame_tokens(self->device->frame_next_token.load(std::memory_order_relaxed) - 1);
+     const HRESULT result = state->xbox->PresentX(
+         static_cast<UINT>(plane_count),
+         reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(planes),
+@@ -1584,6 +1593,13 @@ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::
+ 
+ void destroy_present_state(void*) {}
+ 
++struct NoPresentation {
++    HRESULT SetFrameIntervalX(IUnknown*, UINT, UINT, UINT) { return S_OK; }
++    HRESULT ScheduleFrameEventX(UINT, UINT, UINT) { return S_OK; }
++    HRESULT WaitFrameEventX(UINT, DWORD, UINT, std::uint64_t*) { return S_OK; }
++};
++NoPresentation* device_presentation(DeviceProxy*) { return nullptr; }
++
+ std::uint64_t queue_present_x(ChildProxy*, std::uint64_t, std::uint64_t, std::uint64_t) {
+     return hr_to_u64(S_OK);
+ }
+@@ -2554,20 +2570,21 @@ HRESULT proxy_create_command_queue_xbox(DeviceProxy* self, const std::uint32_t*
+ // 60 Hz), and latency is the allowed frames in flight. S_OK even for 0: a boot must not abort here, and nothing paces.
+ HRESULT proxy_set_frame_interval_x(DeviceProxy* self, std::uint64_t output, std::uint64_t interval_us,
+                                    std::uint64_t latency, std::uint64_t flags) {
+-    (void)output;
+-    (void)flags;
+     self->frame_interval_us.store(static_cast<std::uint32_t>(interval_us), std::memory_order_relaxed);
+     self->frame_latency.store(static_cast<std::uint32_t>(latency ? latency : 1), std::memory_order_relaxed);
++    if (auto* presentation = device_presentation(self))
++        return presentation->SetFrameIntervalX(reinterpret_cast<IUnknown*>(output), static_cast<UINT>(interval_us),
++                                               static_cast<UINT>(latency), static_cast<UINT>(flags));
+     return S_OK;
+ }
+ 
+ // Xbox device slot 79 (public HLE): ScheduleFrameEventX(event, offset_us, pEvent, flags); our pacer has only the origin.
+ HRESULT proxy_schedule_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t offset_us,
+                                      std::uint64_t flags) {
+-    (void)event;
+-    (void)offset_us;
+-    (void)flags;
+     self->frame_event_scheduled.store(true, std::memory_order_relaxed);
++    if (auto* presentation = device_presentation(self))
++        return presentation->ScheduleFrameEventX(static_cast<UINT>(event), static_cast<UINT>(offset_us),
++                                                 static_cast<UINT>(flags));
+     return S_OK;
+ }
+ 
+@@ -2576,11 +2593,11 @@ HRESULT proxy_schedule_frame_event_x(DeviceProxy* self, std::uint64_t event, std
+ // a zero wait cannot stall the title. A null token pointer is E_POINTER, as a _Out_ parameter.
+ HRESULT proxy_wait_frame_event_x(DeviceProxy* self, std::uint64_t event, std::uint64_t timeout_ms,
+                                  std::uint64_t flags, std::uint64_t token_word) {
+-    (void)event;
+-    (void)timeout_ms;
+-    (void)flags;
+     auto* token = reinterpret_cast<std::uint64_t*>(token_word);
+     if (!token) return E_POINTER;
++    if (auto* presentation = device_presentation(self))
++        return presentation->WaitFrameEventX(static_cast<UINT>(event), static_cast<DWORD>(timeout_ms),
++                                             static_cast<UINT>(flags), token);
+     *token = self->frame_tokens->issue();
+     return S_OK;
+ }
+@@ -3419,7 +3436,7 @@ HRESULT create_committed_through_xmem(DeviceProxy* self, unsigned slot, std::uin
+         return create_pc();
+     }
+     if (!(heap_flags & D3D12_HEAP_FLAG_CREATE_NOT_ZEROED)) std::memset(memory, 0, size);
+-    HRESULT hr = handler(self->real, memory, desc, riid, out);
++    HRESULT hr = handler(self->real, memory, desc, 0xFFFFFFFFu, riid, out);
+     if (SUCCEEDED(hr)) {
+         static std::atomic<bool> logged{false};
+         if (first_call(logged))
+@@ -3649,7 +3666,7 @@ HRESULT proxy_create_placed_resource_x(DeviceProxy* self, void* va, const D3D12_
+                      va, static_cast<int>(pc_desc.Dimension), static_cast<unsigned long long>(pc_desc.Width),
+                      xbox_flags, state);
+     }
+-    return handler(self->real, va, pc_desc, *riid, out);
++    return handler(self->real, va, pc_desc, state, *riid, out);
+ }
+ 
+ // Slot 74: the retail title calls it once with (pointer, u32, pointer) (kapitche, issue 7231). The PC slot 74 is
+@@ -4100,15 +4117,17 @@ void* WINAPI proxy_get_resource_allocation_info(std::uint64_t a0, std::uint64_t
+     }
+     const UINT mask = static_cast<UINT>(visible_mask);
+     D3D12_RESOURCE_ALLOCATION_INFO info = real->GetResourceAllocationInfo(mask, desc_count, descs);
+-    if (info.SizeInBytes == UINT64_MAX && descs && desc_count) {
+-        const auto& d = descs[0];
+-        std::fprintf(stderr, "[rt] allocation refusal: count=%u dim=%u width=%llu height=%u depth=%u format=%u flags=0x%x layout=0x%x\n",
+-                     desc_count, static_cast<unsigned>(d.Dimension), static_cast<unsigned long long>(d.Width),
+-                     d.Height, static_cast<unsigned>(d.DepthOrArraySize), static_cast<unsigned>(d.Format),
+-                     static_cast<unsigned>(d.Flags), static_cast<unsigned>(d.Layout));
+-    }
+     apply_console_placement(descs, desc_count, info, nullptr,
+                             [&](UINT i) { return real->GetResourceAllocationInfo(mask, 1, &descs[i]); }, 25);
++    static std::atomic<int> logged_invalid{0};
++    if ((info.SizeInBytes >> 32) && descs && logged_invalid.fetch_add(1, std::memory_order_relaxed) < 16)
++        for (UINT i = 0; i < desc_count; ++i)
++            std::fprintf(stderr, "[rt] d3d12_xs: slot 25: size 0x%llx; desc %u: dimension %d format %d %llux%ux%u "
++                         "mips %u samples %u layout 0x%x flags 0x%x\n",
++                         static_cast<unsigned long long>(info.SizeInBytes), i, int(descs[i].Dimension),
++                         int(descs[i].Format), static_cast<unsigned long long>(descs[i].Width), descs[i].Height,
++                         unsigned(descs[i].DepthOrArraySize), unsigned(descs[i].MipLevels),
++                         descs[i].SampleDesc.Count, unsigned(descs[i].Layout), unsigned(descs[i].Flags));
+     *static_cast<D3D12_RESOURCE_ALLOCATION_INFO*>(call.ret) = info;
+     return call.ret;
+ }
+diff --git a/runtime/shims/d3d12_xs_device.h b/runtime/shims/d3d12_xs_device.h
+index 290a8bd33..aea2ca612 100644
+--- a/runtime/shims/d3d12_xs_device.h
++++ b/runtime/shims/d3d12_xs_device.h
+@@ -183,8 +183,10 @@ ID3D12Device* device_proxy_real_device(const void* device);
+ // not create it itself: the device behind it does, through this handler, which the Vulkan layer registers
+ // (rt::d3d12::create_buffer_at_host_address). With none registered, or a PC device behind the proxy, the slot
+ // answers E_NOTIMPL.
+-using PlacedAtVaHandler = HRESULT (*)(ID3D12Device* real, void* va, const D3D12_RESOURCE_DESC& desc, REFIID riid,
+-                                      void** out);
++// `layout` is the title's third argument, a D3D12_BARRIER_LAYOUT (0xFFFFFFFF = UNDEFINED), measured on a retail
++// boot: 0x6 SHADER_RESOURCE, 0x3 UNORDERED_ACCESS, as PC CreatePlacedResource2 takes it.
++using PlacedAtVaHandler = HRESULT (*)(ID3D12Device* real, void* va, const D3D12_RESOURCE_DESC& desc,
++                                      std::uint32_t layout, REFIID riid, void** out);
+ void set_placed_at_va_handler(PlacedAtVaHandler handler);
+ std::shared_ptr<leonida::FrameTokenSource> device_frame_tokens(const void* device);
+ 
+diff --git a/runtime/shims/d3d12_xs_native_pso.h b/runtime/shims/d3d12_xs_native_pso.h
+index 3a2ecaf12..6d0486d90 100644
+--- a/runtime/shims/d3d12_xs_native_pso.h
++++ b/runtime/shims/d3d12_xs_native_pso.h
+@@ -33,6 +33,7 @@
+ #include <fstream>
+ #include <iterator>
+ #include <string>
++#include <unordered_map>
+ #include <vector>
+ 
+ namespace rt::d3d12_xs {
+@@ -124,6 +125,44 @@ inline bool read_container(const std::filesystem::path& dir, const std::string&
+     }
+ }
+ 
++// A container read from disk, shared by every pipeline that names it. Many pipelines reuse one stage, and the title
++// creates thousands of them, so each file is read once. Not cached: a failed read (the file may appear later), and
++// anything past the byte budget (read again on each use, as before).
++using Container = std::shared_ptr<const std::vector<std::uint8_t>>;
++inline constexpr std::size_t kContainerCacheBudget = std::size_t(256) << 20;
++inline std::unordered_map<std::string, Container>* g_containers = nullptr;  // under g_lock; null until first use
++inline std::size_t g_container_bytes = 0;                                    // under g_lock
++
++inline Container load_container(const std::filesystem::path& dir, const std::string& relative) {
++    AcquireSRWLockExclusive(&g_lock);
++    if (g_containers) {
++        const auto hit = g_containers->find(relative);
++        if (hit != g_containers->end()) {
++            Container found = hit->second;
++            ReleaseSRWLockExclusive(&g_lock);
++            return found;
++        }
++    }
++    ReleaseSRWLockExclusive(&g_lock);
++
++    auto bytes = std::make_shared<std::vector<std::uint8_t>>();
++    if (!read_container(dir, relative, *bytes)) return nullptr;
++    Container loaded = std::move(bytes);
++
++    AcquireSRWLockExclusive(&g_lock);
++    if (!g_containers) g_containers = new std::unordered_map<std::string, Container>();
++    const auto [slot, inserted] = g_containers->try_emplace(relative, loaded);
++    if (!inserted) {
++        loaded = slot->second;  // another thread read it first: share its copy
++    } else if (g_container_bytes + loaded->size() > kContainerCacheBudget) {
++        g_containers->erase(slot);
++    } else {
++        g_container_bytes += loaded->size();
++    }
++    ReleaseSRWLockExclusive(&g_lock);
++    return loaded;
++}
++
+ inline bool log_this(std::uint64_t n) { return (n & (n - 1)) == 0; }
+ 
+ // Blend and culling off; a depth target is written with ALWAYS (blob A is not decoded).
+@@ -320,12 +359,15 @@ inline NativePsoStats native_pso_stats() {
+     return {g_calls.load(), g_created.load(), g_stubbed.load(), g_refused.load()};
+ }
+ 
+-// Test helper: forgets the loaded map and the counters, so the next call reads the provider again.
++// Test helper: forgets the loaded map, the cached containers and the counters, so the next call reads the provider again.
+ inline void reset_native_pso_state() {
+     using namespace native_pso_detail;
+     AcquireSRWLockExclusive(&g_lock);
+     delete g_map;
+     delete g_dir;
++    delete g_containers;
++    g_containers = nullptr;
++    g_container_bytes = 0;
+     g_map = nullptr;
+     g_dir = nullptr;
+     g_loaded = false;
+@@ -373,14 +415,15 @@ inline HRESULT create_native_graphics_pipeline(PipelineStreamCreator create, voi
+         return unresolved(create, context, desc, &plan.state, *riid, out, call,
+                           map ? status_name(plan.status) : "no native_hashes.txt", plan.failed_block);
+ 
+-    std::vector<std::uint8_t> code[np::kStageBlocks];
++    Container code[np::kStageBlocks];  // keeps each stage's bytes alive until the device has the pipeline
+     D3D12_GRAPHICS_PIPELINE_STATE_DESC pc{};
+     D3D12_SHADER_BYTECODE ms{};
+     for (const np::PlannedStage& s : plan.stages) {
+-        if (!read_container(*dir, s.shader->path, code[s.block]))
++        code[s.block] = load_container(*dir, s.shader->path);
++        if (!code[s.block])
+             return unresolved(create, context, desc, &plan.state, *riid, out, call, "container not readable",
+                               s.block);
+-        const D3D12_SHADER_BYTECODE bc{code[s.block].data(), code[s.block].size()};
++        const D3D12_SHADER_BYTECODE bc{code[s.block]->data(), code[s.block]->size()};
+         const std::string& stage = s.shader->stage;
+         (stage == "vs" ? pc.VS : stage == "ps" ? pc.PS : stage == "gs" ? pc.GS : ms) = bc;
+     }
+diff --git a/runtime/shims/dstorage.cpp b/runtime/shims/dstorage.cpp
+index 81abaea3d..14fedb9ab 100644
+--- a/runtime/shims/dstorage.cpp
++++ b/runtime/shims/dstorage.cpp
+@@ -675,7 +675,9 @@ private:
+         f.HResult = E_DSTORAGE_QUEUE_CLOSED;
+         describe(e, f);
+         record_failure(f);
+-        log_once("closed", "an entry was enqueued on a closed queue (E_DSTORAGE_QUEUE_CLOSED); it never completes");
++        if (e.type == Entry::Type::Status && SUCCEEDED(e.enqueue_error))
++            e.status->complete(e.index, E_DSTORAGE_QUEUE_CLOSED);
++        log_once("closed", "an entry was enqueued on a closed queue (E_DSTORAGE_QUEUE_CLOSED)");
+         release_references(e);
+     }
+ 
+diff --git a/runtime/shims/xbox_present.cpp b/runtime/shims/xbox_present.cpp
+index 003b0d3fe..0f0f6f672 100644
+--- a/runtime/shims/xbox_present.cpp
++++ b/runtime/shims/xbox_present.cpp
+@@ -105,6 +105,21 @@ HRESULT XboxPresentation::GetFrameStatisticsX(std::uint64_t token, UINT type_mas
+ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParameters* planes,
+                                    const XboxPresentParameters* params) {
+     std::lock_guard serialise(present_mutex_);
++    const HRESULT hr = present_x(plane_count, planes, params);
++    // Logged at 1, 2, 4, ... calls and at the first of each failure: the first thing to check on a boot.
++    const std::uint64_t call = ++present_calls_;
++    const bool new_failure = FAILED(hr) && hr != last_failure_;
++    if (FAILED(hr)) last_failure_ = hr;
++    if ((call & (call - 1)) == 0 || new_failure)
++        std::fprintf(stderr,
++                     "[rt] xbox_present: PresentX call %llu (%u planes) returned 0x%08lx, %llu presented so far\n",
++                     static_cast<unsigned long long>(call), plane_count, static_cast<unsigned long>(hr),
++                     static_cast<unsigned long long>(presents_.load()));
++    return hr;
++}
++
++HRESULT XboxPresentation::present_x(UINT plane_count, const XboxPresentPlaneParameters* planes,
++                                    const XboxPresentParameters* params) {
+     if (plane_count > 2 || (plane_count && !planes)) return E_INVALIDARG;
+     if (pacer_.suspended()) return from_pacer(hr::invalid_state);
+     // A zero, negative or NaN threshold never tears.
+@@ -128,6 +143,15 @@ HRESULT XboxPresentation::PresentX(UINT plane_count, const XboxPresentPlaneParam
+         return result;
+     }
+ 
++    if (!logged_plane_words_) {  // the console layout is unmeasured: its first plane's words, once
++        logged_plane_words_ = true;
++        const auto* w = reinterpret_cast<const std::uint64_t*>(planes);
++        std::fprintf(stderr, "[rt] xbox_present: first plane words %llx %llx %llx %llx %llx %llx %llx %llx\n",
++                     static_cast<unsigned long long>(w[0]), static_cast<unsigned long long>(w[1]),
++                     static_cast<unsigned long long>(w[2]), static_cast<unsigned long long>(w[3]),
++                     static_cast<unsigned long long>(w[4]), static_cast<unsigned long long>(w[5]),
++                     static_cast<unsigned long long>(w[6]), static_cast<unsigned long long>(w[7]));
++    }
+     // All planes carry the token of one frame.
+     const std::uint64_t token = planes[0].Token;
+     for (UINT i = 0; i < plane_count; ++i) {
+diff --git a/runtime/shims/xbox_present.h b/runtime/shims/xbox_present.h
+index f9d0fbd9a..e490ec000 100644
+--- a/runtime/shims/xbox_present.h
++++ b/runtime/shims/xbox_present.h
+@@ -109,6 +109,8 @@ public:
+     // (INFINITE waits for ever); `*token` is untouched then. E_INVALIDARG for a null token pointer or another event;
+     // HRESULT_FROM_WIN32(ERROR_INVALID_STATE) when nothing is registered (not yet, or since SuspendX).
+     HRESULT WaitFrameEventX(UINT event, DWORD timeout_ms, UINT flags, std::uint64_t* token);
++    // Frame tokens up to `token` were handed out before this presentation existed (the device proxy's).
++    void adopt_frame_tokens(std::uint64_t token) { pacer_.adopt_issued(token); }
+     // See FramePacer::get_frame_statistics: S_FALSE and count 0 when nothing is available.
+     HRESULT GetFrameStatisticsX(std::uint64_t token, UINT type_mask, UINT* count, leonida::FrameStatistic* out);
+ 
+@@ -168,6 +170,11 @@ private:
+     leonida::FramePacer pacer_;
+     std::mutex present_mutex_;  // PresentX, SuspendX and ResumeX one at a time
+     std::atomic<std::uint64_t> presents_{0};
++    std::uint64_t present_calls_ = 0;  // under present_mutex_
++    HRESULT last_failure_ = S_OK;      // under present_mutex_
++    bool logged_plane_words_ = false;  // under present_mutex_
++    // PresentX's body, called under present_mutex_.
++    HRESULT present_x(UINT plane_count, const XboxPresentPlaneParameters* planes, const XboxPresentParameters* params);
+     bool logged_planes_ = false, logged_threshold_ = false, logged_display_ = false, logged_color_space_ = false,
+          logged_extras_ = false, logged_resource_count_ = false;
+     std::atomic<float> sdr_white_override_{0.0f};  // > 0: set_sdr_white_nits
+diff --git a/runtime/src/buffer_va_index.h b/runtime/src/buffer_va_index.h
+index 5096771c7..2ea0f9380 100644
+--- a/runtime/src/buffer_va_index.h
++++ b/runtime/src/buffer_va_index.h
+@@ -30,11 +30,16 @@ public:
+     void insert(std::uint64_t va, std::uint64_t size, Id id) {
+         if (!va || !size) return;
+         const auto [it, added] = ranges_.try_emplace({va, id}, size);
++        try {
++            sizes_.insert(size);
++        } catch (...) {
++            if (added) ranges_.erase(it);
++            throw;
++        }
+         if (!added) {  // the same (va, id) again: its new size replaces the old one
+             drop_size(it->second);
+             it->second = size;
+         }
+-        sizes_.insert(size);
+         longest_ = *sizes_.rbegin();
+     }
+ 
+diff --git a/runtime/src/frame_pacer.h b/runtime/src/frame_pacer.h
+index c36c421ea..e57ee488b 100644
+--- a/runtime/src/frame_pacer.h
++++ b/runtime/src/frame_pacer.h
+@@ -265,6 +265,12 @@ public:
+     // must not freeze. So the only refusal is a token that was never handed out (invalid_arg, which is a bug in the
+     // caller); null, stale (older than the last presented) and repeated tokens return ok and say which kind they
+     // were in `issue`, so the caller can log it. invalid_state while suspended.
++    // Tokens up to `token` were handed out by someone else on this pacer's behalf (the device proxy answers
++    // WaitFrameEventX before a presentation exists): they count as issued.
++    void adopt_issued(std::uint64_t token) {
++        std::lock_guard guard(mutex_);
++        if (token > issued_) issued_ = token;
++    }
+     enum class TokenIssue { none, null_token, stale, repeated };
+     std::int32_t check_present_token(std::uint64_t token, TokenIssue* issue = nullptr) {
+         std::lock_guard guard(mutex_);
+diff --git a/runtime/src/shader_module_cache.h b/runtime/src/shader_module_cache.h
+new file mode 100644
+index 000000000..0faaacb8e
+--- /dev/null
++++ b/runtime/src/shader_module_cache.h
+@@ -0,0 +1,117 @@
++#pragma once
++
++// One VkShaderModule per distinct SPIR-V, shared by every pipeline state built from it.
++//
++// A title creates tens of thousands of graphics pipeline states up front, most of them from a few thousand vertex and
++// pixel shaders (measured on the retail boot under Wine: 50,468 graphics PSOs in the first tenth of the run, about
++// 12.7 GB resident, #8851 A37/A42). A PipelineState keeps its modules for the variants it builds at draw time, so
++// one module per PSO and stage kept a copy of the same shader per PSO. Here a module is created on the first acquire
++// of its words and destroyed with the last release; a module that holds per-PSO edits (the depth24 patch, the f16
++// link) has other words and gets its own module, so sharing never changes what a pipeline runs.
++//
++// Thread-safe: PSOs are created and released from any thread.
++
++#include <vulkan/vulkan.h>
++
++#include <cstddef>
++#include <cstdint>
++#include <functional>
++#include <mutex>
++#include <unordered_map>
++#include <vector>
++
++namespace leonida {
++
++class ShaderModuleCache {
++public:
++    // `create` returns VK_NULL_HANDLE when vkCreateShaderModule fails; `destroy` is vkDestroyShaderModule.
++    using Create = std::function<VkShaderModule(const std::vector<std::uint32_t>& words)>;
++    using Destroy = std::function<void(VkShaderModule)>;
++
++    ShaderModuleCache(Create create, Destroy destroy) : create_(std::move(create)), destroy_(std::move(destroy)) {}
++    ShaderModuleCache(const ShaderModuleCache&) = delete;
++    ShaderModuleCache& operator=(const ShaderModuleCache&) = delete;
++
++    // Releases nothing a caller still holds: every PipelineState releases its modules before the device goes.
++    // Modules left over (a leaked PSO) are destroyed here, with the device still alive.
++    ~ShaderModuleCache() {
++        for (auto& [hash, bucket] : by_hash_)
++            for (Entry& entry : bucket) destroy_(entry.module);
++    }
++
++    // The module for these words, created on first use. VK_NULL_HANDLE when creation fails (nothing is cached).
++    VkShaderModule acquire(const std::vector<std::uint32_t>& words) {
++        const std::uint64_t hash = hash_words(words);
++        std::lock_guard lock(mutex_);
++        std::vector<Entry>& bucket = by_hash_[hash];
++        for (Entry& entry : bucket) {
++            if (entry.words == words) {
++                ++entry.references;
++                ++shared_;
++                return entry.module;
++            }
++        }
++        const VkShaderModule module = create_(words);
++        if (module == VK_NULL_HANDLE) {
++            if (bucket.empty()) by_hash_.erase(hash);
++            return VK_NULL_HANDLE;
++        }
++        bucket.push_back(Entry{words, module, 1});
++        owner_[module] = hash;
++        return module;
++    }
++
++    // One release per acquire that returned `module`; the last one destroys it. Unknown modules are ignored.
++    void release(VkShaderModule module) {
++        if (module == VK_NULL_HANDLE) return;
++        std::lock_guard lock(mutex_);
++        const auto owner = owner_.find(module);
++        if (owner == owner_.end()) return;
++        const auto bucket = by_hash_.find(owner->second);
++        for (auto entry = bucket->second.begin(); entry != bucket->second.end(); ++entry) {
++            if (entry->module != module) continue;
++            if (--entry->references == 0) {
++                destroy_(module);
++                bucket->second.erase(entry);
++                if (bucket->second.empty()) by_hash_.erase(bucket);
++                owner_.erase(owner);
++            }
++            return;
++        }
++    }
++
++    // Distinct modules alive, and acquires answered with an existing module (for the device's statistics line).
++    std::size_t live() const {
++        std::lock_guard lock(mutex_);
++        return owner_.size();
++    }
++    std::uint64_t shared() const {
++        std::lock_guard lock(mutex_);
++        return shared_;
++    }
++
++private:
++    struct Entry {
++        std::vector<std::uint32_t> words;
++        VkShaderModule module;
++        std::uint32_t references;
++    };
++
++    static std::uint64_t hash_words(const std::vector<std::uint32_t>& words) {
++        std::uint64_t hash = 14695981039346656037ull;  // FNV-1a over the words
++        for (const std::uint32_t word : words) {
++            hash ^= word;
++            hash *= 1099511628211ull;
++        }
++        return hash ^ words.size();
++    }
++
++    Create create_;
++    Destroy destroy_;
++    mutable std::mutex mutex_;
++    std::unordered_map<std::uint64_t, std::vector<Entry>> by_hash_;
++    std::unordered_map<VkShaderModule, std::uint64_t> owner_;
++    std::uint64_t shared_ = 0;
++};
++
++}  // namespace leonida
+diff --git a/runtime/src/vulkan_backend.h b/runtime/src/vulkan_backend.h
+index 73d830ac1..e26d88fc9 100644
+--- a/runtime/src/vulkan_backend.h
++++ b/runtime/src/vulkan_backend.h
+@@ -1124,6 +1124,17 @@ public:
+         std::unique_lock lock(resource_mutex_);
+         set_resource_locked(id, binding);
+     }
++    // Registers `alias` as `id`'s buffer at another VA too (a title-placed buffer the driver would not import is found
++    // at the title's VA). False when `id` is not a registered buffer. remove_resource(alias) drops it.
++    bool alias_buffer(ResourceId id, ResourceId alias, std::uint64_t va) {
++        std::unique_lock lock(resource_mutex_);
++        const auto it = resources_.find(id);
++        if (it == resources_.end() || !it->second.buffer) return false;
++        ResourceBinding binding = it->second;
++        binding.va = va;
++        set_resource_locked(alias, binding);
++        return true;
++    }
+     void add_resource(ResourceId id, const ResourceBinding& binding, VkImageLayout current_layout) {
+         std::unique_lock rlock(resource_mutex_);
+         set_resource_locked(id, binding);
+@@ -1168,6 +1179,8 @@ public:
+             img = it->second.image;
+             unindex_buffer(id, it->second);
+             resources_.erase(it);
++            if (removed_.size() >= 65536) removed_.clear();  // diagnostics only (unknown-resource log)
++            removed_.insert(id);
+             if (auto sparse = sparse_resources_.find(id); sparse != sparse_resources_.end()) {
+                 sparse_resource = std::move(sparse->second);
+                 sparse_resources_.erase(sparse);
+@@ -1379,6 +1392,11 @@ public:
+     // and records what the set needs first. When it fails, nothing of that call is executed.
+     void set_transfer_only_family(std::uint32_t family) { transfer_only_family_ = family; }
+ 
++    // `before` is called at the start of every submission of command lists (a held batch: when it is released),
++    // before any lock here is taken: the device re-copies its slot-133 shadow buffers from the title's pages there.
++    // Set once, before the first queue exists.
++    void set_before_execute(std::function<void()> before) { before_execute_ = std::move(before); }
++
+     void set_bindless_prepare(std::function<bool(VkCommandBuffer)> prepare) {
+         std::unique_lock lock(resource_mutex_);
+         bindless_prepare_ = std::move(prepare);
+@@ -1554,6 +1572,10 @@ private:
+         if (addressable(binding)) buffer_vas_.insert(binding.va, binding.size, id);
+     }
+ 
++    // Whether `id` was registered and released since the last clear (diagnostics). Called, as resolve, under the
++    // shared resource lock prepare holds.
++    bool was_removed(ResourceId id) const { return removed_.count(id) != 0; }
++
+     const ResourceBinding* resolve(ResourceId id) const {
+         const auto it = resources_.find(id);
+         return it == resources_.end() ? nullptr : &it->second;
+@@ -1659,6 +1681,7 @@ private:
+     std::unique_ptr<FenceWaitDispatcher> fence_dispatcher_;
+     QueueHolds<VkSemaphore> holds_;
+     std::unordered_map<ResourceId, ResourceBinding> resources_;
++    std::unordered_set<ResourceId> removed_;  // recently released ids, for the unknown-resource log
+     BufferVaIndex<ResourceId> buffer_vas_;  // the addressable buffers of resources_, by VA range (buffer_at)
+     std::unordered_map<ResourceId, std::shared_ptr<SparseResource>> sparse_resources_;
+     std::unordered_map<std::uintptr_t, ComputePipeline> pipelines_;
+@@ -1683,6 +1706,7 @@ private:
+     std::map<std::tuple<VkFormat, std::uint32_t, VkImageLayout, VkImageLayout, VkResolveModeFlagBits>, VkRenderPass>
+         resolve_passes_;
+     std::map<std::tuple<VkImage, VkImage, VkImageView, VkImageView, VkRenderPass>, VkFramebuffer> resolve_framebuffers_;
++    std::function<void()> before_execute_;
+     std::function<bool(VkCommandBuffer)> bindless_prepare_;
+     std::function<VkDescriptorSet()> bindless_current_;
+     bool bindless_upload_pending_ = false;  // tracker_mutex_
+@@ -2171,6 +2195,7 @@ private:
+ 
+     ReplayResult execute_now(std::span<const CommandList* const> lists) {
+         if (context_.is_device_lost() || !wait_for_room()) return ReplayResult::unsupported;
++        if (context_.before_execute_) context_.before_execute_();
+         if (kind_ != QueueKind::direct)
+             for (const auto* list : lists)
+                 for (const auto& command : list->commands())
+@@ -2319,6 +2344,17 @@ private:
+         bool has_queries = false;
+         for (std::size_t i = 0; i < lists.size(); ++i) {
+             const auto result = prepare(*lists[i], resolve, replay, prepared[i], can_resolve_occlusion);
++            if (result == ReplayResult::unresolved_resource) {
++                // Once per command kind: which command named a resource the context does not know.
++                static std::atomic<std::uint64_t> logged{0};
++                const PreparedList& p = prepared[i];
++                const std::uint64_t bit = std::uint64_t(1) << (p.unresolved_kind % 64);
++                if (!(logged.fetch_or(bit) & bit))
++                    std::fprintf(stderr,
++                                 "[rt] d3d12: unknown resource: list %zu command %zu (kind %zu) names id 0x%llx (%s)\n", i, p.unresolved_command, p.unresolved_kind,
++                                 static_cast<unsigned long long>(p.unresolved_id),
++                                 context_.was_removed(p.unresolved_id) ? "released earlier" : "never registered");
++            }
+             if (result != ReplayResult::success) return result;
+             if (prepared[i].segment_count > UINT32_MAX - segments ||
+                 prepared[i].statistics_segment_count > UINT32_MAX - statistics_segments)
+diff --git a/runtime/src/vulkan_replay.h b/runtime/src/vulkan_replay.h
+index b73b14621..8a0bc6c80 100644
+--- a/runtime/src/vulkan_replay.h
++++ b/runtime/src/vulkan_replay.h
+@@ -2297,6 +2297,10 @@ public:
+     // Set when any command writes to a host_readable (READBACK) buffer so VulkanQueue only flushes to HOST_BIT when needed.
+     bool wrote_readback = false;
+     VkPipelineStageFlags2 readback_src_stages = 0;
++    // The first command whose resource did not resolve: its index, its Command alternative and the id it named.
++    std::size_t unresolved_command = SIZE_MAX;
++    std::size_t unresolved_kind = 0;
++    ResourceId unresolved_id = 0;
+ };
+ 
+ inline ReplayResult plan_occlusion_segments(PreparedList& out) {
+@@ -2578,6 +2582,7 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
+     bool overlaps = false, statistics_overlaps = false, statistics_active = false;
+     out.wrote_readback = false;
+     out.readback_src_stages = 0;
++    out.unresolved_command = SIZE_MAX;
+ 
+     for (std::size_t i = 0; i < commands.size(); ++i) {
+         const auto& command = commands[i];
+@@ -2585,6 +2590,11 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
+         const auto bind = [&](ResourceId id) {
+             const ResourceBinding* binding = resolve(id);
+             if (binding) p.binding = *binding;
++            else if (out.unresolved_command == SIZE_MAX) {
++                out.unresolved_command = i;
++                out.unresolved_kind = command.index();
++                out.unresolved_id = id;
++            }
+             return binding != nullptr;
+         };
+         const auto rect_view = [&](std::span<const Rect> rects, const TargetView& target, VkImageAspectFlags view_aspects) {
+@@ -3089,8 +3099,48 @@ ReplayResult prepare(const CommandList& list, Resolve&& resolve, const ReplayFun
+             auto& prepared_draw = out.draws[out.draw_count];
+             prepared_draw.reset();
+             p.draw = std::uint32_t(out.draw_count++);
+-            if (const auto r = detail::prepare_draw(*draw, resolve, vk, prepared_draw); r != ReplayResult::success)
++            if (const auto r = detail::prepare_draw(*draw, resolve, vk, prepared_draw); r != ReplayResult::success) {
++                if (r == ReplayResult::unresolved_resource && out.unresolved_command == SIZE_MAX) {
++                    // Which part did not resolve: kind 1000 is the pipeline, 1001 a colour target, 1002 the depth.
++                    const GraphicsPipeline* pipeline = vk.graphics_pipeline(draw->pipeline);
++                    out.unresolved_command = i;
++                    out.unresolved_kind = 1000;
++                    out.unresolved_id = static_cast<ResourceId>(draw->pipeline);
++                    if (pipeline && pipeline->pipeline) {
++                        // 1001 a colour target, 1002 the depth target, 1003 a vertex buffer VA, 1004 the index VA.
++                        out.unresolved_kind = 1005;
++                        out.unresolved_id = 0;
++                        const auto miss = [&](std::size_t kind, ResourceId id) {
++                            if (out.unresolved_kind != 1005) return;
++                            out.unresolved_kind = kind;
++                            out.unresolved_id = id;
++                        };
++                        const std::uint32_t n = draw->views ? draw->views->render_target_count : 0;
++                        for (std::uint32_t t = 0; t < n; ++t) {
++                            const ResourceId id = draw->views->render_targets[t].resource;
++                            if (id && !resolve(id)) miss(1001, id);
++                        }
++                        if (draw->depth.resource && pipeline->depth_format != VK_FORMAT_UNDEFINED &&
++                            !resolve(draw->depth.resource))
++                            miss(1002, draw->depth.resource);
++                        if (draw->views) {
++                            for (const VertexBufferView& v : draw->views->vertex_buffers) {
++                                VkBuffer buffer = VK_NULL_HANDLE;
++                                VkDeviceSize offset = 0;
++                                std::uint64_t size = v.size;
++                                if (v.va && !vk.buffer_at(v.va, size, buffer, offset)) miss(1003, v.va);
++                            }
++                        }
++                        if (draw->indexed && draw->index.va) {
++                            VkBuffer buffer = VK_NULL_HANDLE;
++                            VkDeviceSize offset = 0;
++                            std::uint64_t size = draw->index.size;
++                            if (!vk.buffer_at(draw->index.va, size, buffer, offset)) miss(1004, draw->index.va);
++                        }
++                    }
++                }
+                 return r;
++            }
+         }
+     }
+     if (ordinary_active || binary_active) return ReplayResult::invalid_query;
+diff --git a/runtime/test/acphal_test.cpp b/runtime/test/acphal_test.cpp
+index 9b78bf2b6..7950db520 100644
+--- a/runtime/test/acphal_test.cpp
++++ b/runtime/test/acphal_test.cpp
+@@ -74,6 +74,8 @@ int main() {
+     uint8_t* inner = static_cast<uint8_t*>(big) + 0x1900;
+     check(valid(inner, 0x40) && valid(inner, 0x80) && valid(inner, 0x800) == FALSE,
+           "ApuIsVirtualAddressValid checks the alignment");
++    check(valid(big, 3) == FALSE, "ApuIsVirtualAddressValid rejects non-power-of-two alignment");
++    check(valid(big, 0) && valid(big, 0x800), "zero and power-of-two alignments remain valid");
+     check(valid(static_cast<uint8_t*>(big) + 0x222E00, 0x40) == FALSE, "an address past the block is not valid");
+     int local = 0;
+     check(valid(&local, 1) == FALSE && map_va(&local) == 0, "memory outside the heap is not valid and maps to 0");
+@@ -91,6 +93,12 @@ int main() {
+     check(alloc(&again, nullptr, 0x1000, 0x800, 2) == S_OK && again == big, "freed space is reused");
+     check(free_mem(again) == S_OK && free_mem(small) == S_OK, "ApuFree of the remaining blocks");
+ 
++    void* highly_aligned = nullptr;
++    check(alloc(&highly_aligned, nullptr, 0x100, 0x80000000u, 0) == S_OK && highly_aligned,
++          "ApuAlloc accepts alignment above 64 KiB");
++    check(valid(highly_aligned, 0x80000000u), "validity uses the same offset alignment as ApuAlloc");
++    check(free_mem(highly_aligned) == S_OK, "ApuFree releases the highly aligned block");
++
+     // Shape contexts: 6 counts then 6 pointers; the caller sets the fifth count and clears count * 64 bytes.
+     struct {
+         uint32_t count[6];
+diff --git a/runtime/test/buffer_va_index_test.cpp b/runtime/test/buffer_va_index_test.cpp
+index b5b5e997f..8abf4462d 100644
+--- a/runtime/test/buffer_va_index_test.cpp
++++ b/runtime/test/buffer_va_index_test.cpp
+@@ -9,7 +9,9 @@
+ #include <chrono>
+ #include <cstdint>
+ #include <cstdio>
++#include <cstdlib>
+ #include <cstring>
++#include <new>
+ #include <random>
+ #include <unordered_map>
+ #include <vector>
+@@ -17,6 +19,23 @@
+ using leonida::BufferVaIndex;
+ using Index = BufferVaIndex<std::uintptr_t>;
+ 
++// Single-threaded test: arm only around insert(), after constructing the index and its existing ranges.
++static int allocations_before_failure = -1;
++void* operator new(std::size_t size) {
++    if (allocations_before_failure == 0) {
++        allocations_before_failure = -1;
++        throw std::bad_alloc();
++    }
++    if (allocations_before_failure > 0) --allocations_before_failure;
++    if (void* p = std::malloc(size ? size : 1)) return p;
++    throw std::bad_alloc();
++}
++void* operator new[](std::size_t size) { return operator new(size); }
++void operator delete(void* p) noexcept { std::free(p); }
++void operator delete[](void* p) noexcept { std::free(p); }
++void operator delete(void* p, std::size_t) noexcept { std::free(p); }
++void operator delete[](void* p, std::size_t) noexcept { std::free(p); }
++
+ namespace {
+ 
+ int failures = 0;
+@@ -107,6 +126,58 @@ void fixed_cases() {
+     check(bound.longest() == 0 && bound.size() == 0, "an empty index has no bound");
+ }
+ 
++void allocation_failures() {
++    for (bool replace : {false, true}) {
++        for (std::uint64_t size : {0x40u, 0x100u, 0x400u}) {
++            // New entries allocate a range and a size node; replacement only needs a size node.
++            for (int fail_after = 0; fail_after < (replace ? 1 : 2); ++fail_after) {
++                Index index;
++                index.insert(0x1000, 0x100, 1);
++                index.insert(0x2000, 0x100, 2);  // equal sizes must retain separate multiset entries
++                const std::uint64_t va = replace ? 0x1000 : 0x3000;
++                const std::uintptr_t id = replace ? 1 : 3;
++                bool threw = false;
++                allocations_before_failure = fail_after;
++                try {
++                    index.insert(va, size, id);
++                } catch (const std::bad_alloc&) {
++                    threw = true;
++                }
++                allocations_before_failure = -1;
++                check(threw, "injected insert allocation failure reached");
++                Index::Hit first{}, second{};
++                const bool unchanged = index.size() == 2 && index.longest() == 0x100 &&
++                    index.find(0x1000, first) && first.id == 1 && first.size == 0x100 &&
++                    index.find(0x2000, second) && second.id == 2 && second.size == 0x100 &&
++                    at(index, 0x10ff) == 1 && at(index, 0x1100) == 0 && at(index, 0x3000) == 0;
++                check(unchanged, "failed insert preserves ranges and lookup bound");
++                if (!unchanged) continue;  // do not erase an inconsistent index in the negative control
++
++                if (replace && size == 0x100) {
++                    // A failed same-size replacement can look unchanged while silently dropping a size node.
++                    index.erase(0x2000, 2);
++                    const bool counted = index.size() == 1 && index.longest() == 0x100;
++                    check(counted, "failed same-size replacement retains both size entries");
++                    if (!counted) continue;
++                    index.insert(0x2000, 0x100, 2);
++                }
++
++                index.insert(va, size, id);
++                Index::Hit retried{};
++                check(index.size() == (replace ? 2u : 3u) && index.find(va, retried) &&
++                      retried.id == id && retried.size == size, "insert succeeds after allocation failure");
++                check(index.longest() == (size > 0x100 ? size : 0x100), "retry updates the lookup bound");
++                index.erase(va, id);
++                check(index.longest() == 0x100 && at(index, 0x20ff) == 2,
++                      "erasing retried range keeps the other size entry");
++                index.erase(0x1000, 1);
++                index.erase(0x2000, 2);
++                check(index.size() == 0 && index.longest() == 0, "all size entries disappear after erase");
++            }
++        }
++    }
++}
++
+ // The rule BufferVaIndex follows, by a scan: among the ranges that hold all of [va, va + bytes), the greatest
+ // (start, id); when none does, the greatest among those that hold va.
+ struct Range {
+@@ -252,6 +323,7 @@ void time_miss_after_free() {
+ 
+ int main(int argc, char** argv) {
+     fixed_cases();
++    allocation_failures();
+     random_tables();
+     if (failures) {
+         std::printf("%d failure(s)\n", failures);
+diff --git a/runtime/test/d3d12_existing_heap_test.cpp b/runtime/test/d3d12_existing_heap_test.cpp
+index 26d0a7e84..854dd697d 100644
+--- a/runtime/test/d3d12_existing_heap_test.cpp
++++ b/runtime/test/d3d12_existing_heap_test.cpp
+@@ -174,7 +174,11 @@ int check_import(ID3D12Device* device, bool supported) {
+ // pattern is written after the buffer exists and read back through a READBACK buffer. Checked on a VirtualAlloc range
+ // and on a view of a pagefile-backed section, the form xmem's physical pages are mapped in. A texture is E_NOTIMPL
+ // and an address off the import alignment E_INVALIDARG.
+-int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT64 size) {
++// `may_refuse`: the driver is allowed to refuse importing these pages, and the layer then answers with its fallback.
++// RADV imports host memory through amdgpu userptr, which takes anonymous memory only, so it refuses a view of a
++// pagefile-backed section with EPERM (measured on an RX 9060 XT under Wine, found in review), while NVIDIA and
++// AMD's Windows driver import it. The fallback is checked to exist; the readback below needs the import.
++int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT64 size, bool may_refuse = false) {
+     const char* who = "vulkan slot-133 buffer";
+     D3D12_RESOURCE_DESC desc{};
+     desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+@@ -183,7 +187,12 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
+     desc.SampleDesc.Count = 1;
+     desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+     Ref<ID3D12Resource> buffer;
+-    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, IID_PPV_ARGS(&buffer.p)), S_OK);
++    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&buffer.p)), S_OK);
++    if (may_refuse && buffer->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(pages)) {
++        std::printf("%s: %s, %llu bytes: this driver refused the import; the fallback resource answered\n", who, kind,
++                    static_cast<unsigned long long>(size));
++        return 0;
++    }
+     EXPECT(buffer->GetGPUVirtualAddress() == reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(pages));
+     auto* bytes = static_cast<std::uint8_t*>(pages);
+     for (UINT64 i = 0; i < size; ++i) bytes[i] = static_cast<std::uint8_t>(i * 131u + 7u);
+@@ -225,17 +234,91 @@ int check_title_placed(ID3D12Device* device, const char* kind, void* pages, UINT
+     texture.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+     // A texture isn't placed on the pages yet: the title gets an ordinary committed texture instead of a refusal.
+     Ref<ID3D12Resource> placed_texture;
+-    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, texture, IID_PPV_ARGS(&placed_texture.p)), S_OK);
++    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, texture, 0x6u, IID_PPV_ARGS(&placed_texture.p)), S_OK);
+     EXPECT(placed_texture.p != nullptr && placed_texture->GetDesc().Dimension == D3D12_RESOURCE_DIMENSION_TEXTURE2D);
+-    // An address off the buffer alignment can't be bound inside the import: the ordinary-buffer fallback answers.
++    // An address off the buffer alignment can't be bound inside the import: a shadow buffer answers, at the same VA
++    // (a driver whose buffer alignment is 1 imports it; the VA is the address either way).
+     Ref<ID3D12Resource> fallback;
+-    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, bytes + 1, desc, IID_PPV_ARGS(&fallback.p)), S_OK);
+-    EXPECT(fallback->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(bytes + 1));
++    desc.Width = size - 1;
++    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, bytes + 1, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&fallback.p)), S_OK);
++    EXPECT(fallback->GetGPUVirtualAddress() == reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(bytes + 1));
+     std::printf("%s: %s, %llu bytes: GPU VA is the address, a GPU copy reads the CPU's writes\n", who, kind,
+                 static_cast<unsigned long long>(size));
+     return 0;
+ }
+ 
++std::uint8_t pattern_byte(UINT64 i, unsigned seed) {
++    return static_cast<std::uint8_t>(i * 131u + (i >> 8) * 7u + seed);
++}
++
++// The shadow fallback of slot 133: pages the driver does not import (write-combined, uncached, not all committed)
++// still give a buffer whose GPU VA is the address. It is a copy of the pages, made again before every submission:
++// a pattern written to the first `committed` bytes after the buffer exists is what a GPU copy in the next
++// ExecuteCommandLists reads, and so is a second pattern in the submission after. Bytes past `committed` are not
++// committed: they are never read, and the GPU sees zeros there. The same holds where the range was imported after
++// all (a Wine that drops the cache modifier), so the caller need not know which path answered.
++int check_title_placed_shadow(ID3D12Device* device, const char* kind, void* pages, UINT64 committed, UINT64 size) {
++    const char* who = "vulkan slot-133 shadow";
++    D3D12_RESOURCE_DESC desc{};
++    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
++    desc.Width = size;
++    desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
++    desc.SampleDesc.Count = 1;
++    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
++    Ref<ID3D12Resource> buffer;
++    EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, pages, desc, 0xFFFFFFFFu, IID_PPV_ARGS(&buffer.p)), S_OK);
++    EXPECT(buffer->GetGPUVirtualAddress() == reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(pages));
++    D3D12_HEAP_PROPERTIES readback_heap{D3D12_HEAP_TYPE_READBACK};
++    Ref<ID3D12Resource> readback;
++    EXPECT(SUCCEEDED(device->CreateCommittedResource(&readback_heap, D3D12_HEAP_FLAG_NONE, &desc,
++                                                     D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
++                                                     IID_PPV_ARGS(&readback.p))));
++    D3D12_COMMAND_QUEUE_DESC queue_desc{D3D12_COMMAND_LIST_TYPE_DIRECT};
++    Ref<ID3D12CommandQueue> queue;
++    Ref<ID3D12CommandAllocator> allocator;
++    Ref<ID3D12GraphicsCommandList> list;
++    Ref<ID3D12Fence> fence;
++    EXPECT(SUCCEEDED(device->CreateCommandQueue(&queue_desc, IID_PPV_ARGS(&queue.p))));
++    EXPECT(SUCCEEDED(device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&allocator.p))));
++    EXPECT(SUCCEEDED(device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.p, nullptr,
++                                               IID_PPV_ARGS(&list.p))));
++    EXPECT(SUCCEEDED(list->Close()));
++    EXPECT(SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(&fence.p))));
++    HANDLE done = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++    EXPECT(done != nullptr);
++    auto* bytes = static_cast<std::uint8_t*>(pages);
++    UINT64 fence_value = 0;
++    for (const unsigned seed : {7u, 93u}) {
++        // Written after the buffer exists (and, the second time, after a submission read the first pattern).
++        for (UINT64 i = 0; i < committed; ++i) bytes[i] = pattern_byte(i, seed);
++        EXPECT(SUCCEEDED(allocator->Reset()));
++        EXPECT(SUCCEEDED(list->Reset(allocator.p, nullptr)));
++        list->CopyBufferRegion(readback.p, 0, buffer.p, 0, size);
++        EXPECT(SUCCEEDED(list->Close()));
++        ID3D12CommandList* lists[] = {list.p};
++        queue->ExecuteCommandLists(1, lists);
++        EXPECT(SUCCEEDED(queue->Signal(fence.p, ++fence_value)));
++        EXPECT(SUCCEEDED(fence->SetEventOnCompletion(fence_value, done)));
++        EXPECT(WaitForSingleObject(done, 30000) == WAIT_OBJECT_0);
++        void* mapped = nullptr;
++        EXPECT(SUCCEEDED(readback->Map(0, nullptr, &mapped)));
++        const auto* got = static_cast<const std::uint8_t*>(mapped);
++        UINT64 wrong = size;
++        for (UINT64 i = 0; i < size && wrong == size; ++i)
++            if (got[i] != (i < committed ? pattern_byte(i, seed) : 0)) wrong = i;
++        readback->Unmap(0, nullptr);
++        if (wrong != size)
++            std::fprintf(stderr, "%s: %s: pattern %u: first wrong byte at %llu\n", who, kind, seed,
++                         static_cast<unsigned long long>(wrong));
++        EXPECT(wrong == size);
++    }
++    CloseHandle(done);
++    std::printf("%s: %s, %llu bytes (%llu committed): GPU VA is the address, each submission reads the pages' "
++                "latest bytes\n",
++                who, kind, static_cast<unsigned long long>(size), static_cast<unsigned long long>(committed));
++    return 0;
++}
++
+ int check_title_placed_all(ID3D12Device* device) {
+     constexpr SIZE_T size = 4 * 0x10000;
+     int failures = 0;
+@@ -249,38 +332,47 @@ int check_title_placed_all(ID3D12Device* device) {
+     HANDLE section = CreateFileMappingW(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0, DWORD(size), nullptr);
+     void* view = section ? MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, size) : nullptr;
+     if (!view) return failures + 1;
+-    failures += check_title_placed(device, "section view", view, size);
++    failures += check_title_placed(device, "section view", view, size, /*may_refuse=*/true);
+     UnmapViewOfFile(view);
+     CloseHandle(section);
+ 
+-    // Not imported: a write-combined range (an RTX 5090 imported it but read wrong bytes back, found in review)
+-    // falls back to an ordinary buffer, so the resource exists but is not at the pages' address; so does a range only
+-    // partly committed.
++    // Cache-modified ranges are not imported (WC imports read wrong bytes on an RTX 5090 in review): a shadow buffer
++    // answers at the same VA. Some Wine versions report a requested WC allocation as plain read-write memory; check
++    // the protection actually supplied. PAGE_NOCACHE also exercises the fallback on those hosts, rather than
++    // dropping the cache-protection check.
+     const char* who = "vulkan slot-133 buffer";
+-    D3D12_RESOURCE_DESC desc{};
+-    desc.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+-    desc.Width = size;
+-    desc.Height = desc.DepthOrArraySize = desc.MipLevels = 1;
+-    desc.SampleDesc.Count = 1;
+-    desc.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+-    void* combined = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_WRITECOMBINE);
+-    EXPECT(combined != nullptr);
++    for (DWORD modifier : {DWORD(PAGE_WRITECOMBINE), DWORD(PAGE_NOCACHE)}) {
++        void* cached_pages = VirtualAlloc(nullptr, size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | modifier);
++        EXPECT(cached_pages != nullptr);
++        MEMORY_BASIC_INFORMATION region{};
++        EXPECT(VirtualQuery(cached_pages, &region, sizeof(region)) == sizeof(region));
++        const bool cache_modified = (region.Protect & (PAGE_WRITECOMBINE | PAGE_NOCACHE)) != 0;
++        if (!cache_modified) EXPECT(region.Protect == PAGE_READWRITE);
++        const int failed = check_title_placed_shadow(device, modifier == PAGE_WRITECOMBINE ? "write-combined range"
++                                                                                           : "uncached range",
++                                                     cached_pages, size, size);
++        std::printf("%s: cache modifier 0x%lx, reported protection 0x%lx: %s\n", who, modifier, region.Protect,
++                    failed ? "FAILED"
++                           : cache_modified ? "shadow buffer verified"
++                                            : "modifier not reported; read-write import verified");
++        failures += failed;
++        VirtualFree(cached_pages, 0, MEM_RELEASE);
++    }
+     {
+-        Ref<ID3D12Resource> fallback;
+-        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, combined, desc, IID_PPV_ARGS(&fallback.p)), S_OK);
+-        EXPECT(fallback->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(combined));
++        // A larger write-combined range, so the per-submission copy the layer logs is measured on more than a few
++        // pages (retail places 182 MiB, 74 MiB of it write-combined).
++        constexpr SIZE_T large = 64u << 20;
++        void* large_pages = VirtualAlloc(nullptr, large, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_WRITECOMBINE);
++        EXPECT(large_pages != nullptr);
++        failures += check_title_placed_shadow(device, "64 MiB write-combined range", large_pages, large, large);
++        VirtualFree(large_pages, 0, MEM_RELEASE);
+     }
+-    VirtualFree(combined, 0, MEM_RELEASE);
+     char* partial = static_cast<char*>(VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_READWRITE));
+     EXPECT(partial != nullptr && VirtualAlloc(partial, size / 2, MEM_COMMIT, PAGE_READWRITE) == partial);
+-    {
+-        // Pages not committed yet (xmem commits on first touch) are not imported either: the fallback answers.
+-        Ref<ID3D12Resource> fallback;
+-        EXPECT_HR(rt::d3d12::create_buffer_at_host_address(device, partial, desc, IID_PPV_ARGS(&fallback.p)), S_OK);
+-        EXPECT(fallback->GetGPUVirtualAddress() != reinterpret_cast<D3D12_GPU_VIRTUAL_ADDRESS>(partial));
+-    }
++    // Pages not committed yet (xmem commits on first touch) are not imported either: the shadow copies the committed
++    // half and never reads the other, which a GPU copy sees as zeros.
++    failures += check_title_placed_shadow(device, "half-committed range", partial, size / 2, size);
+     VirtualFree(partial, 0, MEM_RELEASE);
+-    std::printf("%s: a write-combined range and a partly committed one fall back to an ordinary buffer\n", who);
+     return failures;
+ }
+ 
+diff --git a/runtime/test/dstorage_test.cpp b/runtime/test/dstorage_test.cpp
+index 1e8ea7318..96df203f5 100644
+--- a/runtime/test/dstorage_test.cpp
++++ b/runtime/test/dstorage_test.cpp
+@@ -710,6 +710,8 @@ void test_close_and_release(Env& env) {
+     DSTORAGE_REQUEST r = file_request(big, 0, tmp.data(), 8);
+     q->EnqueueRequest(&r);
+     q->EnqueueStatus(s, 0);
++    check(s->IsComplete(0), "a status enqueued after Close completes");
++    check_hr(s->GetHResult(0), E_DSTORAGE_QUEUE_CLOSED, "a status enqueued after Close reports the closed queue");
+     q->Submit();
+     q->Close();  // a second Close is harmless
+     Sleep(20);
+diff --git a/runtime/test/shader_module_cache_test.cpp b/runtime/test/shader_module_cache_test.cpp
+new file mode 100644
+index 000000000..0d86d449c
+--- /dev/null
++++ b/runtime/test/shader_module_cache_test.cpp
+@@ -0,0 +1,124 @@
++// leonida::ShaderModuleCache (src/shader_module_cache.h): one module per distinct SPIR-V, shared by the pipeline
++// states built from it and destroyed with the last of them. CPU only: the create and destroy callbacks hand out and
++// take back fake handles, so the test counts what a device would have created.
++#include "../src/shader_module_cache.h"
++
++#include <cstdint>
++#include <cstdio>
++#include <set>
++#include <thread>
++#include <vector>
++
++namespace {
++
++int failures = 0;
++
++#define CHECK(condition)                                                     \
++    do {                                                                     \
++        if (!(condition)) {                                                  \
++            std::fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #condition); \
++            ++failures;                                                      \
++        }                                                                    \
++    } while (0)
++
++struct FakeDevice {
++    std::uintptr_t next = 1;
++    std::set<VkShaderModule> alive;
++    std::size_t created = 0;
++    bool fail = false;
++
++    leonida::ShaderModuleCache cache() {
++        return leonida::ShaderModuleCache(
++            [this](const std::vector<std::uint32_t>&) {
++                if (fail) return VkShaderModule(VK_NULL_HANDLE);
++                const auto module = reinterpret_cast<VkShaderModule>(next++);
++                alive.insert(module);
++                ++created;
++                return module;
++            },
++            [this](VkShaderModule module) { alive.erase(module); });
++    }
++};
++
++}  // namespace
++
++int main() {
++    const std::vector<std::uint32_t> vs = {0x07230203, 0x00010500, 0, 10, 0, 1, 2};
++    const std::vector<std::uint32_t> ps = {0x07230203, 0x00010500, 0, 10, 0, 3, 4};
++    std::vector<std::uint32_t> ps_patched = ps;  // a per-PSO edit (the depth24 patch): other words, its own module
++    ps_patched.back() = 5;
++
++    // 1,000 pipeline states from one vertex and one pixel shader: two modules, not 2,000.
++    {
++        FakeDevice device;
++        auto cache = device.cache();
++        std::vector<VkShaderModule> held;
++        for (int i = 0; i < 1000; ++i) {
++            held.push_back(cache.acquire(vs));
++            held.push_back(cache.acquire(ps));
++        }
++        CHECK(device.created == 2);
++        CHECK(cache.live() == 2 && device.alive.size() == 2);
++        CHECK(cache.shared() == 1998);
++        CHECK(held[0] == held[2] && held[1] == held[3] && held[0] != held[1]);
++        // Different words never share, whatever their hash.
++        const VkShaderModule patched = cache.acquire(ps_patched);
++        CHECK(patched != held[1] && device.created == 3);
++        cache.release(patched);
++        CHECK(device.alive.size() == 2);
++        // Released one by one: alive until the last pipeline state goes.
++        for (std::size_t i = 0; i + 2 < held.size(); ++i) cache.release(held[i]);
++        CHECK(device.alive.size() == 2);
++        cache.release(held[held.size() - 2]);
++        CHECK(device.alive.size() == 1);
++        cache.release(held.back());
++        CHECK(device.alive.empty() && cache.live() == 0);
++        // A released module is gone: the same words create a new one.
++        cache.release(cache.acquire(vs));
++        CHECK(device.created == 4 && device.alive.empty());
++        // Unknown and null handles are ignored.
++        cache.release(VK_NULL_HANDLE);
++        cache.release(reinterpret_cast<VkShaderModule>(std::uintptr_t(0x9999)));
++        CHECK(device.alive.empty());
++    }
++
++    // A failed creation caches nothing; the next acquire tries again.
++    {
++        FakeDevice device;
++        auto cache = device.cache();
++        device.fail = true;
++        CHECK(cache.acquire(vs) == VK_NULL_HANDLE && cache.live() == 0);
++        device.fail = false;
++        const VkShaderModule module = cache.acquire(vs);
++        CHECK(module != VK_NULL_HANDLE && cache.live() == 1);
++        cache.release(module);
++    }
++
++    // The destructor destroys what a leaked pipeline state still held.
++    {
++        FakeDevice device;
++        {
++            auto cache = device.cache();
++            cache.acquire(vs);
++            cache.acquire(ps);
++        }
++        CHECK(device.alive.empty());
++    }
++
++    // Concurrent acquires and releases from several threads (PSOs are created on the title's job threads).
++    {
++        FakeDevice device;
++        auto cache = device.cache();
++        std::vector<std::thread> threads;
++        for (int t = 0; t < 8; ++t)
++            threads.emplace_back([&] {
++                for (int i = 0; i < 2000; ++i) cache.release(cache.acquire(i % 2 ? vs : ps));
++            });
++        for (auto& thread : threads) thread.join();
++        CHECK(cache.live() == 0 && device.alive.empty());
++    }
++
++    if (failures) return 1;
++    std::printf("shader_module_cache: ok\n");
++    return 0;
++}
+diff --git a/runtime/test/shaders/check.py b/runtime/test/shaders/check.py
+index 8fb4c88bb..729e3e0a4 100644
+--- a/runtime/test/shaders/check.py
++++ b/runtime/test/shaders/check.py
+@@ -106,7 +106,7 @@ SIGNED_ZERO_NAN = [0x80000000, 0x80000000, 0x80008000, 0x00008000, 1, 1, 1, 0x00
+ WAVE32_DUMPS = ("cs_store", "cs_signed_zero_nan", "cs_smem_soffset_imm", "cs_wqm_w32", "cs_w32_lane_wrap", "cs_movrelsd_2", "cs_w32_permute",
+                 "cs_barrier_divergent", "cs_barrier_early_end", "cs_barrier_loop", "cs_w32_lds_u8_d16", "cs_bpermute32",
+                 "cs_w32_lds_subdword", "cs_w32_lds_wide",
+-                "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext",
++                "cs_w32_partial_scmp", "cs_exec_const", "cs_w32_mask_imm", "cs_w32_int_ext", "cs_w32_ds_append",
+                 "cs_w32_salu64", "cs_w32_misc_ext", "cs_w32_new_ops", "cs_w32_sincos", "cs_lds_b64_cmpst", "cs_w32_andn2_exec",
+                 "cs_mask_vgpr_exec", "cs_w32_buffer_sub16", "cs_w32_buffer_store_sub", "cs_w32_fcmpswap", "cs_w32_permlane_fi")
+ # Wave32 lane-mask dumps: their EXEC/VCC masks and lane selects cover 32 lanes, so a device whose widest subgroup is
+@@ -162,6 +162,9 @@ CS_DUMPS = [*CS_DPP, ("cs_store", CS_STORE), ("cs_smem_soffset_imm", CS_SMEM),
+             # not bit 0 for every lane; word = set lanes | lowest lane << 8 (derivations in each .asm header)
+             ("cs_w32_mask_imm", [2056, 20, 2, 6152, 2050, 4112, 258, 32]),
+             ("cs_w64_mask_imm", [2056, 1084, 828, 2052, 319, 2104, 516, 2064]),
++            # ds_append / ds_consume (derivations in cs_w32/w64_ds_append.asm)
++            ("cs_w32_ds_append", [100, 0xDEAD, 200, 0xDEAD, 108, 197, 108, 140]),
++            ("cs_w64_ds_append", [100, 100, 0xDEAD, 103, 200, 199, 103, 167]),
+             # SHADER-99: -0 and NaN survive translation (SignedZeroInfNanPreserve); words 0, 2, 3 on Apple: see below
+             ("cs_signed_zero_nan", SIGNED_ZERO_NAN),
+             # s_andn2_saveexec_b32 / s_andn2_wrexec_b32: EXEC = S0 & ~EXEC, D old / new EXEC, SCC (cs_w32_andn2_exec.asm)
+diff --git a/runtime/test/shaders/cs_w32_ds_append.asm b/runtime/test/shaders/cs_w32_ds_append.asm
+new file mode 100644
+index 000000000..3ef9dc704
+--- /dev/null
++++ b/runtime/test/shaders/cs_w32_ds_append.asm
+@@ -0,0 +1,63 @@
++; ds_append / ds_consume (LDS): one add (append) or subtract (consume) of the number of lanes on in EXEC, for the whole
++; wave, at the byte address in the offset field; every active lane gets the value before the op, inactive lanes keep
++; vD. Measured natively on RDNA2 gfx1036 (tools/hw_oracle raw kernels): EXEC 0xf0 appends 4 and returns the old 100
++; to lanes 4-7 only; M0 (0x4, 0x100, 0x10000, 0x40000, 0x80000) does not move the address. Until this change both
++; raised Unsupported.
++; LDS words: [0] = 100, [2] (byte 8) = 200, written by every lane first.
++;   EXEC = 0xf0f0 (8 lanes):  ds_append v8          -> v8 = 100 in lanes 4-7, 12-15; LDS[0] = 108
++;   EXEC = 0x7 (3 lanes):     ds_consume v9 offset:8 -> v9 = 200 in lanes 0-2;      LDS[2] = 197
++;   EXEC = all (32 lanes):    ds_append v10          -> v10 = 108 everywhere;       LDS[0] = 140
++; Lane 0 stores:
++;   out[0] v8 of lane 4 = 100       out[1] v8 of lane 0 (off) = 0xdead   out[2] v9 of lane 2 = 200
++;   out[3] v9 of lane 3 (off) = 0xdead   out[4] LDS[0] read by lane 4 after its append = 108
++;   out[5] LDS[2] read by lane 0 after its consume = 197   out[6] v10 of lane 31 = 108   out[7] LDS[0] = 140
++; Done once per lane instead of once per wave, the first append alone would leave 100 + 8 * 8.
++; rsrc2: 0x40088
++; group: 32,1,1
++; Run: vk_compute_test cs_w32_ds_append.spv 1 dump -> out[0..7] = 100 57005 200 57005 108 197 108 140
++; mattr: +wavefrontsize32,-wavefrontsize64
++v_mov_b32_e32 v8, 0xdead
++v_mov_b32_e32 v9, 0xdead
++v_mov_b32_e32 v1, 0
++v_mov_b32_e32 v2, 100
++v_mov_b32_e32 v3, 200
++ds_write_b32 v1, v2
++ds_write_b32 v1, v3 offset:8
++s_waitcnt lgkmcnt(0)
++s_mov_b32 exec_lo, 0xf0f0
++ds_append v8
++s_waitcnt lgkmcnt(0)
++ds_read_b32 v11, v1
++s_waitcnt lgkmcnt(0)
++s_mov_b32 exec_lo, 7
++ds_consume v9 offset:8
++s_waitcnt lgkmcnt(0)
++ds_read_b32 v12, v1 offset:8
++s_waitcnt lgkmcnt(0)
++s_mov_b32 exec_lo, -1
++ds_append v10
++s_waitcnt lgkmcnt(0)
++ds_read_b32 v13, v1
++s_waitcnt lgkmcnt(0)
++v_readlane_b32 s20, v8, 4
++v_readlane_b32 s21, v8, 0
++v_readlane_b32 s22, v9, 2
++v_readlane_b32 s23, v9, 3
++v_readlane_b32 s24, v11, 4
++v_readlane_b32 s25, v12, 0
++v_readlane_b32 s26, v10, 31
++v_readlane_b32 s27, v13, 0
++v_mov_b32_e32 v14, s20
++v_mov_b32_e32 v15, s21
++v_mov_b32_e32 v16, s22
++v_mov_b32_e32 v17, s23
++v_mov_b32_e32 v18, s24
++v_mov_b32_e32 v19, s25
++v_mov_b32_e32 v20, s26
++v_mov_b32_e32 v21, s27
++v_cmpx_eq_u32_e32 0, v0
++v_mov_b32_e32 v22, 0
++buffer_store_dwordx4 v[14:17], v22, s[0:3], 0 offen
++v_mov_b32_e32 v22, 16
++buffer_store_dwordx4 v[18:21], v22, s[0:3], 0 offen
++s_endpgm
+diff --git a/runtime/test/shaders/cs_w64_ds_append.asm b/runtime/test/shaders/cs_w64_ds_append.asm
+new file mode 100644
+index 000000000..ce986774c
+--- /dev/null
++++ b/runtime/test/shaders/cs_w64_ds_append.asm
+@@ -0,0 +1,64 @@
++; ds_append / ds_consume (LDS) in a wave64: one add / subtract of the wave's active-lane count (both halves) at the
++; offset address, the old value to every active lane. Measured natively on RDNA2 gfx1036 (tools/hw_oracle raw
++; kernels): EXEC = lanes 0, 32 and 63 appends 3 and returns 100 to those three lanes. The translator has the first
++; active lane do it and sends the old value to the others (a subgroup shuffle on a 64-wide subgroup, an exchange
++; round under --wave64-emulate). Until this change both raised Unsupported.
++; LDS words: [0] = 100, [2] (byte 8) = 200, written by every lane first.
++;   EXEC = lanes 0, 32, 63:   ds_append v8          -> v8 = 100 in those lanes;       LDS[0] = 103
++;   EXEC = lane 33:           ds_consume v9 offset:8 -> v9 = 200 in lane 33;          LDS[2] = 199
++;   EXEC = all (64 lanes):    ds_append v10          -> v10 = 103 everywhere;         LDS[0] = 167
++; Lane 0 stores:
++;   out[0] v8 of lane 63 = 100     out[1] v8 of lane 32 = 100     out[2] v8 of lane 1 (off) = 0xdead
++;   out[3] LDS[0] read by lane 0 after its append = 103   out[4] v9 of lane 33 = 200
++;   out[5] LDS[2] read by lane 33 after its consume = 199   out[6] v10 of lane 40 = 103   out[7] LDS[0] = 167
++; rsrc2: 0x40088
++; Run: VKC_SUBGROUP_SIZE=64 vk_compute_test cs_w64_ds_append.spv 1 dump --require-wave64
++;   (or translated with --wave64-emulate, on any subgroup size) -> out[0..7] = 100 100 57005 103 200 199 103 167
++; mattr: +wavefrontsize64,-wavefrontsize32
++v_mov_b32_e32 v8, 0xdead
++v_mov_b32_e32 v9, 0xdead
++v_mov_b32_e32 v1, 0
++v_mov_b32_e32 v2, 100
++v_mov_b32_e32 v3, 200
++ds_write_b32 v1, v2
++ds_write_b32 v1, v3 offset:8
++s_waitcnt lgkmcnt(0)
++s_mov_b32 exec_lo, 1
++s_mov_b32 exec_hi, 0x80000001
++ds_append v8
++s_waitcnt lgkmcnt(0)
++ds_read_b32 v11, v1
++s_waitcnt lgkmcnt(0)
++s_mov_b32 exec_lo, 0
++s_mov_b32 exec_hi, 2
++ds_consume v9 offset:8
++s_waitcnt lgkmcnt(0)
++ds_read_b32 v12, v1 offset:8
++s_waitcnt lgkmcnt(0)
++s_mov_b64 exec, -1
++ds_append v10
++s_waitcnt lgkmcnt(0)
++ds_read_b32 v13, v1
++s_waitcnt lgkmcnt(0)
++v_readlane_b32 s20, v8, 63
++v_readlane_b32 s21, v8, 32
++v_readlane_b32 s22, v8, 1
++v_readlane_b32 s23, v11, 0
++v_readlane_b32 s24, v9, 33
++v_readlane_b32 s25, v12, 33
++v_readlane_b32 s26, v10, 40
++v_readlane_b32 s27, v13, 0
++v_mov_b32_e32 v14, s20
++v_mov_b32_e32 v15, s21
++v_mov_b32_e32 v16, s22
++v_mov_b32_e32 v17, s23
++v_mov_b32_e32 v18, s24
++v_mov_b32_e32 v19, s25
++v_mov_b32_e32 v20, s26
++v_mov_b32_e32 v21, s27
++v_cmpx_eq_u32_e32 0, v0
++v_mov_b32_e32 v22, 0
++buffer_store_dwordx4 v[14:17], v22, s[0:3], 0 offen
++v_mov_b32_e32 v22, 16
++buffer_store_dwordx4 v[18:21], v22, s[0:3], 0 offen
++s_endpgm
+diff --git a/runtime/test/xs_native_pso_test.cpp b/runtime/test/xs_native_pso_test.cpp
+index cd3f4b2ad..bfe9f0e75 100644
+--- a/runtime/test/xs_native_pso_test.cpp
++++ b/runtime/test/xs_native_pso_test.cpp
+@@ -390,6 +390,32 @@ void test_vs_ps() {
+     EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == S_OK && mock->stream_calls == 2);
+ }
+ 
++// A container is read from disk once: a later pipeline naming it gets the same bytes even if the file is gone.
++void test_container_read_once() {
++    fresh();
++    MockDevice* mock = new_device();
++    void* device = proxy_over(mock);
++    Desc d;
++    d.stage(0, kVs).stage(1, kPs);
++    void* out = nullptr;
++    EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == S_OK && mock->last.vs == kVsBytes);
++
++    const std::filesystem::path vs = g_root / L"dxbc" / L"vs one.dxbc", moved = g_root / L"dxbc" / L"vs one.moved";
++    std::filesystem::rename(vs, moved);
++    out = nullptr;
++    const HRESULT again = call57(device, &d.desc, &kPipelineIid, &out);
++    std::filesystem::rename(moved, vs);
++    EXPECT(again == S_OK && mock->stream_calls == 2 && mock->last.vs == kVsBytes && mock->last.ps == kPsBytes);
++
++    // A container that could not be read is not remembered as missing: once the file is there, it resolves.
++    fresh();
++    std::filesystem::rename(vs, moved);
++    out = nullptr;
++    EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == E_NOTIMPL);
++    std::filesystem::rename(moved, vs);
++    EXPECT(call57(device, &d.desc, &kPipelineIid, &out) == S_OK && mock->last.vs == kVsBytes);
++}
++
+ void test_mesh() {
+     fresh();
+     MockDevice* mock = new_device();
+@@ -522,6 +548,7 @@ void test_directory() {
+ int main() {
+     make_tree();
+     test_vs_ps();
++    test_container_read_once();
+     test_mesh();
+     test_derive_from_slot57();
+     test_unresolved();
+diff --git a/runtime/test/xs_proxy_mock_test.cpp b/runtime/test/xs_proxy_mock_test.cpp
+index 1cbc729f2..9ef1cc451 100644
+--- a/runtime/test/xs_proxy_mock_test.cpp
++++ b/runtime/test/xs_proxy_mock_test.cpp
+@@ -701,9 +701,11 @@ int check_levels() {
+             static void* seen_va = nullptr;
+             static D3D12_RESOURCE_DESC seen_desc{};
+             static GUID seen_iid{};
++            static std::uint32_t seen_layout = 0;
+             const xs::PlacedAtVaHandler handler = [](ID3D12Device* real_device, void* va,
+-                                                     const D3D12_RESOURCE_DESC& desc, REFIID iid,
+-                                                     void** out) -> HRESULT {
++                                                     const D3D12_RESOURCE_DESC& desc, std::uint32_t layout,
++                                                     REFIID iid, void** out) -> HRESULT {
++                seen_layout = layout;
+                 seen_real = real_device;
+                 seen_va = va;
+                 seen_desc = desc;
+@@ -730,6 +732,7 @@ int check_levels() {
+             EXPECT(static_cast<std::uint32_t>(seen_desc.Flags) == 0x4);
+             EXPECT(seen_desc.Layout == D3D12_TEXTURE_LAYOUT_ROW_MAJOR && seen_desc.Width == 0x10000);
+             EXPECT(std::memcmp(&seen_iid, &resource_iid, sizeof(GUID)) == 0);
++            EXPECT(seen_layout == 0xFFFFFFFFu);  // the title's third word, passed through as the barrier layout
+             EXPECT(xs::device_slot_overridden(133));
+         }
+ 
+@@ -2829,7 +2832,8 @@ struct PlacedHandlerState {
+     HRESULT result = S_OK;
+ } g_placed;
+ 
+-HRESULT mock_placed_handler(ID3D12Device* real, void* va, const D3D12_RESOURCE_DESC& desc, REFIID riid, void** out) {
++HRESULT mock_placed_handler(ID3D12Device* real, void* va, const D3D12_RESOURCE_DESC& desc, std::uint32_t,
++                           REFIID riid, void** out) {
+     ++g_placed.calls;
+     g_placed.real = real;
+     g_placed.va = va;
+-- 
+2.54.0
+

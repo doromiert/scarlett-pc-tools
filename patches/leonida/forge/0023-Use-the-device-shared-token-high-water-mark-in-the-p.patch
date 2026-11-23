@@ -1,0 +1,26 @@
+From eaf99985c0514800d059b259ee283e1fde39a764 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 21:58:50 +0100
+Subject: [PATCH 23/25] Use the device shared-token high-water mark in the
+ presentation handoff
+
+---
+ runtime/shims/d3d12_xs_device.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index bb704a8ff..b3216c7dc 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -1576,7 +1576,7 @@ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::
+     if (state) state->finish_close();
+     if (!state || !state->xbox) return hr_to_u64(S_OK);  // a title still runs with nothing presented
+     // The tokens the proxy handed out before the presentation existed are ones PresentX must accept.
+-    state->xbox->adopt_frame_tokens(self->device->frame_next_token.load(std::memory_order_relaxed) - 1);
++    state->xbox->adopt_frame_tokens(self->device->frame_tokens->issued());
+     const HRESULT result = state->xbox->PresentX(
+         static_cast<UINT>(plane_count),
+         reinterpret_cast<const rt::d3d12::XboxPresentPlaneParameters*>(planes),
+-- 
+2.54.0
+

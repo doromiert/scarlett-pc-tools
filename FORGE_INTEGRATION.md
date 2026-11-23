@@ -7,7 +7,8 @@ and generated file remains outside this repository.
 The maintainers' integration is on their
 [forge](https://git.notrexed.dev/enx/leonida), ahead of the GitHub branch used by
 the earlier experiments. This recipe pins
-`70bc8a25e1c69c3f058cf550a8db9397c6a89d0c`. It includes native graphics pipeline
+`70bc8a25e1c69c3f058cf550a8db9397c6a89d0c` as the patch base and incorporates
+forge changes through `4fe7db213`, retaining their commit provenance. It includes native graphics pipeline
 handling at Xbox device slot 57 and requires its private shader-digest catalog.
 
 With `TOOLS` pointing at this tools checkout:
@@ -19,13 +20,15 @@ git switch -c local/scarlett-forge 70bc8a25e1c69c3f058cf550a8db9397c6a89d0c
 git am "$TOOLS"/patches/leonida/forge/*.patch
 ```
 
-The nineteen attributed source patches add the CPU descriptor-handle fix,
+The twenty-five attributed source patches add the CPU descriptor-handle fix,
 presentation diagnostics, visible windows with an independent message pump,
 monitor fitting, loading captions, console stream-stage mapping, shared frame
 tokens, the current descriptor-cleaning experiment, optional local native-shader
-capture, and session pipeline-cache persistence/checkpoints. The last cache and
-capture ports have been built separately; a restart exercising those ports is
-still pending. The ongoing actual run uses the preceding tested runtime.
+capture, session pipeline-cache persistence/checkpoints, newer title-memory
+buffer handling, shared shader modules, and frame-poll compatibility. The current
+series builds and has been exercised with the actual executable. The local
+slot-67 capture and a 1.05 GiB session-cache checkpoint have been verified;
+cache reuse on restart still needs checking.
 
 Build the `gta6rt` target. Linux cross-toolchain details and the opt-in RADV
 file-backed host-memory adapter are in
@@ -91,7 +94,10 @@ that the frame contains useful content.
 For the checkpoint-enabled build, `LEONIDA_STARTUP_CACHE_CHECKPOINTS=1` requests
 session-cache writes after slow successful compiles. The opaque cache remains
 beside the external runtime binary. It is also private game-derived output.
-Checkpoint writes and reuse still need verification through an actual restart.
+The actual game exceeded the default 256 MiB save limit. A local run with
+`LEONIDA_PIPELINE_CACHE_BYTES=2147483648` successfully wrote 1,126,351,504 bytes.
+This raises only the external cache-file limit. Reuse still needs verification
+through an actual restart.
 
 ## Observed limits
 
@@ -99,8 +105,12 @@ On Wine 11.0, Linux 6.18.48, Mesa/RADV 26.1.8 and an RX 6900 XT, the forge
 integration has passed the previous allocation assertion, resolved its graphics
 catalog, created native graphics pipelines, and presented black frames. An
 actual-run CPU profile found 96.6% of sampled work in RADV compute compilation;
-progress advanced beyond 1,500 native completions without a reported API failure.
-This is ongoing startup work, not gameplay.
+progress advanced beyond 1,920 native completions without a reported API failure.
+This is ongoing startup work, not gameplay. The current frame-pacing handoff
+replays configuration made before the first presentation; zero-time frame polls
+return a nonfailing timeout and honor the observed token-on-timeout flag. This
+cleared a newly observed assertion at `exe+0x2482452`. It does not detach simulation
+speed from the frame rate.
 
 The private compute-library build now has 2,683 validated modules out of 2,684.
 The hardware-halt program remains refused. Validation establishes module
