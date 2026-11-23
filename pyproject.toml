@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68,<81"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "scarlett-pc-tools"
+version = "0.1.0"
+description = "Local inspection and experimental boot diagnostics for user-supplied Xbox Series packages"
+requires-python = ">=3.11,<4"
+license = {text = "GPL-3.0-or-later"}
+dependencies = ["pefile==2024.8.26"]
+
+[project.optional-dependencies]
+boot = ["unicorn==2.1.4"]
+
+[project.scripts]
+scarlett-pc-tools = "scarlett_pc_tools:main"
+
+[tool.setuptools]
+py-modules = ["scarlett_pc_tools", "scarlett_boot_worker"]

@@ -1,0 +1,33 @@
+# Local software environments and generated files
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Game content and private diagnostics never belong in this repository.
+*.exe
+*.dll
+*.pdb
+*.rpf
+*.ttpf
+*.xvd
+*.xvc
+*.bin
+*.key
+*.pem
+*.zip
+*.7z
+*.iso
+*.json
+*.log
+*.jsonl
+*.spv
+*.dxbc
+*.fssm
+*.asm
+dumps/
+reports/
+artifacts/
