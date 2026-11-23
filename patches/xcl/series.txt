@@ -12,3 +12,8 @@
 0012-Register-Xbox-allocator-command-memory-callbacks-at-slot-nine.patch
 0013-D3D12.X-unwrap-title-texture-uploads-for-native-PC-lists.patch
 0014-D3D12.X-keep-command-list-identity-native-behind-title-dispatch.patch
+0015-Add-sampled-register-only-hardware-probe-diagnostics.patch
+0016-Retain-source-file-metadata-for-refused-DirectStorage-requests.patch
+0017-DirectStorage-a-destination-page-array-entry-that-is-0-at-enqueue-is-read-at-the-request-s-turn.patch
+0018-dstorage-add-opt-in-opaque-BC7-texture-placeholders.patch
+0019-Extend-opt-in-texture-placeholders-to-observed-BC5-loading-requests.patch

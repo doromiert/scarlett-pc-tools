@@ -1,0 +1,60 @@
+From 81355418d40c09fa3e4e5baeff5a117eb3697a9c Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Tue, 24 Nov 2026 00:01:44 +0100
+Subject: [PATCH] Retain source file metadata for refused DirectStorage
+ requests
+
+---
+ crates/xcl/src/hle/dstorage.rs | 28 ++++++++++++++++++----------
+ 1 file changed, 18 insertions(+), 10 deletions(-)
+
+diff --git a/crates/xcl/src/hle/dstorage.rs b/crates/xcl/src/hle/dstorage.rs
+index 9a457b3..3f804ed 100644
+--- a/crates/xcl/src/hle/dstorage.rs
++++ b/crates/xcl/src/hle/dstorage.rs
+@@ -975,6 +975,18 @@ unsafe extern "system" fn queue_release(p: *mut c_void) -> u32 {
+     n
+ }
+ 
++/// Retain only a file this factory opened; format validation errors keep their original HRESULT.
++unsafe fn request_file(r: &Request) -> Result<Option<Arc<FileInner>>, HRESULT> {
++    if r.memory_source() {
++        return Ok(None);
++    }
++    let f = r.source as *mut c_void;
++    if !crate::gpu::shader::readable(f as usize, 8) || *(f as *const *const usize) != file_vtbl().as_ptr() {
++        return Err(E_FILE_HANDLE);
++    }
++    Ok(Some(Arc::clone(inner::<FileInner>(f))))
++}
++
+ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8) {
+     let q = queue(p);
+     if q.closed.load(Ordering::Acquire) || req.is_null() {
+@@ -983,17 +995,13 @@ unsafe extern "system" fn queue_enqueue_request(p: *mut c_void, req: *const u8)
+     let r = Request::parse(&*(req as *const [u8; REQUEST_BYTES]));
+     if let Err(hr) = r.check(q.source_memory) {
+         warn_once("EnqueueRequest", format_args!("refused ({hr:#x}): {r:x?}"));
+-        return q.enqueue(Entry::Refused { hr, req: r, file: None });
++        // Keep the source name in the error record without reading a refused payload.
++        let file = request_file(&r).ok().flatten();
++        return q.enqueue(Entry::Refused { hr, req: r, file });
+     }
+-    let file = if r.memory_source() {
+-        None
+-    } else {
+-        // only a file this factory opened
+-        let f = r.source as *mut c_void;
+-        if !crate::gpu::shader::readable(f as usize, 8) || *(f as *const *const usize) != file_vtbl().as_ptr() {
+-            return q.enqueue(Entry::Refused { hr: E_FILE_HANDLE, req: r, file: None });
+-        }
+-        Some(Arc::clone(inner::<FileInner>(f)))
++    let file = match request_file(&r) {
++        Ok(file) => file,
++        Err(hr) => return q.enqueue(Entry::Refused { hr, req: r, file: None }),
+     };
+     let dest_pages = if r.dest_physical_pages() {
+         match snapshot_page_array(r.destination, r.destination_page_offset, r.destination_size) {
+-- 
+2.54.0
+

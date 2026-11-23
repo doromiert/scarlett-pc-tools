@@ -8,7 +8,7 @@ See [STATUS.md](STATUS.md) for the actual-run evidence and remaining blocker.
 
 ## Source and license
 
-The [14 XCL patches](patches/xcl/README.md) form an independent GPL-2.0-only
+The [19 XCL patches](patches/xcl/README.md) form an independent GPL-2.0-only
 component, separate from the GPL-3.0-or-later original tools and Leonida series.
 Keep XCL's license and third-party notices with derived source/builds.
 
@@ -23,7 +23,9 @@ done < patches/xcl/series.txt
 git -C /external/tools/xcl rev-parse 'HEAD^{tree}'
 ```
 
-The resulting tree must be `347aecd3e4b04a8d3b7b1c55ea6bce0a39cce78d`.
+The resulting candidate tree must be `7a0240d69b9929ee86448b3e86baf6bf21984913`.
+The setup baseline is the first 14 patches; current candidate verification is
+described in the patch-directory README.
 These are native-object identity/ABI fixes, not executable patches. The allocator
 command-memory callback registration retains the supplied callback and context;
 invoking custom allocator policy remains unimplemented. Assertions remain enabled.
@@ -98,3 +100,18 @@ that window does not change internal 4K rendering. A private Wine virtual deskto
 can contain both windows, but it still shares the GPU. That configuration is
 prepared locally and has not yet been run or verified to prevent the reset.
 Do not interpret it as a proven stability fix. See the latest STATUS entry.
+
+## Temporary texture placeholders
+
+`XCL_TEXTURE_PLACEHOLDERS=1` opts into valid constant BC7 and BC5 blocks for
+unsupported compressed texture requests. It is default-off, explicitly trades
+texture accuracy for loading progress, and does not affect other archive data.
+BC7 uses opaque magenta; BC5 uses two channels with byte value 128. The original
+file read, size checks, physical-page writes and failure/status reporting remain.
+Hardware swizzle and other BCPack modes are still refused.
+
+This was requested for reaching first gameplay with temporary texture artifacts.
+The actual BC7-enabled run registered A, advanced through more loading and then
+suffered a game-context GPU timeout. BC5 support has compiled but has not been
+run. Neither this switch nor the private desktop proves GPU stability or gameplay.
+No assertion, executable instruction, simulation timing, or gyro change is included.

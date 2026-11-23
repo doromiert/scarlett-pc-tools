@@ -1,0 +1,115 @@
+From 09b089b4be9cae04c8a9c8669f32d1deec84dad8 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Tue, 24 Nov 2026 00:16:20 +0100
+Subject: [PATCH] dstorage: add opt-in opaque BC7 texture placeholders
+
+---
+ crates/xcl/src/hle/dstorage.rs | 48 ++++++++++++++++++++++++++--------
+ 1 file changed, 37 insertions(+), 11 deletions(-)
+
+diff --git a/crates/xcl/src/hle/dstorage.rs b/crates/xcl/src/hle/dstorage.rs
+index 2db42c9..835226b 100644
+--- a/crates/xcl/src/hle/dstorage.rs
++++ b/crates/xcl/src/hle/dstorage.rs
+@@ -26,7 +26,8 @@
+ //! Each queue has a worker thread: submitted requests run in order (file reads through the
+ //! VFS like the title's own, memory copies, zlib), a status entry gets the first failure of
+ //! the requests since the previous one, a signal sets the fence from the CPU. Methods not
+-//! listed are logged and answer E_NOTIMPL; BCPack and other console formats are refused.
++//! listed are logged and answer E_NOTIMPL; BCPack and other console formats are refused,
++//! except for an opt-in BC7 texture placeholder for debugging progression.
+ 
+ #![allow(non_snake_case)]
+ 
+@@ -451,6 +452,16 @@ impl Request {
+         self.options & SOURCE_PHYS_PAGES_BIT != 0
+     }
+ 
++    fn texture_placeholder(&self) -> bool {
++        static ENABLED: OnceLock<bool> = OnceLock::new();
++        self.bcpack() == 7
++            && self.swizzle() == 0
++            && self.destination_size != 0
++            && self.destination_size % 16 == 0
++            && (!self.zlib() || self.intermediate_size != 0)
++            && *ENABLED.get_or_init(|| std::env::var("XCL_TEXTURE_PLACEHOLDERS").as_deref() == Ok("1"))
++    }
++
+     /// What a queue of `source_memory` refuses at enqueue.
+     fn check(&self, source_memory: bool) -> Result<(), HRESULT> {
+         if self.memory_source() != source_memory || (self.source_physical_pages() && !self.memory_source()) {
+@@ -484,24 +495,28 @@ impl Request {
+                     return Err(E_DESTINATION_SIZE);
+                 }
+             }
+-            // Two-stage zlib -> BCPack: validate intermediate bounds when supplied, then refuse BCPack.
++            // Two-stage zlib -> BCPack: validate intermediate bounds before any placeholder.
+             (true, bc) => {
+                 if self.intermediate_size != 0 && (self.intermediate_size <= self.source_size || self.destination_size <= self.intermediate_size) {
+                     return Err(E_DESTINATION_SIZE);
+                 }
+-                warn_once(
+-                    "BCPack",
+-                    format_args!("zlib + BCPack mode {bc} unsupported (src={}, intermediate={}, dst={})", self.source_size, self.intermediate_size, self.destination_size),
+-                );
+-                return Err(E_DECOMPRESSION);
++                if !self.texture_placeholder() {
++                    warn_once(
++                        "BCPack",
++                        format_args!("zlib + BCPack mode {bc} unsupported (src={}, intermediate={}, dst={})", self.source_size, self.intermediate_size, self.destination_size),
++                    );
++                    return Err(E_DECOMPRESSION);
++                }
+             }
+             // Single-stage BCPack: `intermediate_size` must be 0, then refuse BCPack.
+             (false, bc) => {
+                 if self.intermediate_size != 0 {
+                     return Err(E_DESTINATION_SIZE);
+                 }
+-                warn_once("BCPack", format_args!("BCPack mode {bc} unsupported (src={}, dst={})", self.source_size, self.destination_size));
+-                return Err(E_DECOMPRESSION);
++                if !self.texture_placeholder() {
++                    warn_once("BCPack", format_args!("BCPack mode {bc} unsupported (src={}, dst={})", self.source_size, self.destination_size));
++                    return Err(E_DECOMPRESSION);
++                }
+             }
+         }
+         Ok(())
+@@ -619,7 +634,8 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
+         b
+     };
+ 
+-    if r.swizzle() != 0 || r.bcpack() != 0 {
++    let placeholder = r.texture_placeholder();
++    if r.swizzle() != 0 || (r.bcpack() != 0 && !placeholder) {
+         return Err(E_DECOMPRESSION);
+     }
+ 
+@@ -629,13 +645,23 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
+         if d.len() != stage1_len {
+             return Err(E_ZLIB_DATA);
+         }
+-        if d.len() < n {
++        if !placeholder && d.len() < n {
+             d.resize(n, 0);
+         }
+         d
+     } else {
+         src
+     };
++    let payload = if placeholder {
++        // BC7 mode 5, rotation 0: RGB endpoints (127,0,127), alpha endpoints 255,
++        // both index sets 0. Seven-bit RGB expansion gives opaque (255,0,255,255).
++        // Bit allocation: https://learn.microsoft.com/en-us/windows/win32/direct3d11/bc7-format-mode-reference#mode-5
++        const MAGENTA_BC7: [u8; 16] = [0x20, 0xff, 0x3f, 0x00, 0xf0, 0xff, 0xff, 0xff, 0x03, 0, 0, 0, 0, 0, 0, 0];
++        warn_once("BC7Placeholder", format_args!("XCL_TEXTURE_PLACEHOLDERS=1: substituting opaque magenta BC7 textures; original texture decoding remains unsupported"));
++        MAGENTA_BC7.repeat(n / MAGENTA_BC7.len())
++    } else {
++        payload
++    };
+ 
+     if r.dest_physical_pages() {
+         let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
+-- 
+2.54.0
+

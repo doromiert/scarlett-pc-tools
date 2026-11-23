@@ -1,0 +1,40 @@
+From 4b4f706dcd06568d663af5abc58acdf7df8093d0 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Tue, 24 Nov 2026 00:24:59 +0100
+Subject: [PATCH] Extend opt-in texture placeholders to observed BC5 loading
+ requests
+
+---
+ crates/xcl/src/hle/dstorage.rs | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/crates/xcl/src/hle/dstorage.rs b/crates/xcl/src/hle/dstorage.rs
+index 835226b..0abe64c 100644
+--- a/crates/xcl/src/hle/dstorage.rs
++++ b/crates/xcl/src/hle/dstorage.rs
+@@ -454,7 +454,7 @@ impl Request {
+ 
+     fn texture_placeholder(&self) -> bool {
+         static ENABLED: OnceLock<bool> = OnceLock::new();
+-        self.bcpack() == 7
++        matches!(self.bcpack(), 5 | 7)
+             && self.swizzle() == 0
+             && self.destination_size != 0
+             && self.destination_size % 16 == 0
+@@ -657,8 +657,11 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
+         // both index sets 0. Seven-bit RGB expansion gives opaque (255,0,255,255).
+         // Bit allocation: https://learn.microsoft.com/en-us/windows/win32/direct3d11/bc7-format-mode-reference#mode-5
+         const MAGENTA_BC7: [u8; 16] = [0x20, 0xff, 0x3f, 0x00, 0xf0, 0xff, 0xff, 0xff, 0x03, 0, 0, 0, 0, 0, 0, 0];
+-        warn_once("BC7Placeholder", format_args!("XCL_TEXTURE_PLACEHOLDERS=1: substituting opaque magenta BC7 textures; original texture decoding remains unsupported"));
+-        MAGENTA_BC7.repeat(n / MAGENTA_BC7.len())
++        // BC5 stores two independent BC4 channels: equal endpoints 128, all indices 0.
++        const NEUTRAL_BC5: [u8; 16] = [128, 128, 0, 0, 0, 0, 0, 0, 128, 128, 0, 0, 0, 0, 0, 0];
++        let (kind, block) = if r.bcpack() == 5 { ("BC5Placeholder", &NEUTRAL_BC5) } else { ("BC7Placeholder", &MAGENTA_BC7) };
++        warn_once(kind, format_args!("XCL_TEXTURE_PLACEHOLDERS=1: substituting BC{} texture placeholders; original texture decoding remains unsupported", r.bcpack()));
++        block.repeat(n / block.len())
+     } else {
+         payload
+     };
+-- 
+2.54.0
+

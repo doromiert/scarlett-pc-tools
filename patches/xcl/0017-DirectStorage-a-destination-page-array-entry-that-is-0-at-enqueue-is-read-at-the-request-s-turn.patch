@@ -1,0 +1,124 @@
+From 429ed322a25ebbe48e5042e015c53b793404a990 Mon Sep 17 00:00:00 2001
+From: theaustinayers <153482135+theaustinayers@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 17:23:28 -0500
+Subject: [PATCH] DirectStorage: a destination page array entry that is 0 at
+ enqueue is read at the request's turn
+
+A retail title keeps its destination page arrays in its own tables and fills an entry after EnqueueRequest. The array is snapshotted at enqueue (titles also pass it on the stack), so such a request wrote to page 0 and was refused with E_ACCESS_VIOLATION: over 8,000 of them in the first 100 s of the title's streaming, and what they carried never arrived. An entry that is 0 in the snapshot (no page has that number) is read again when the request runs; entries that had a page keep the snapshot's.
+
+Measured on the title (RTX 5090, 170 s): 16,384 such requests found their page at their turn, 2,227 still had 0 and are refused as before.
+
+Assisted-by: Claude Code (Claude Fable 5.2)
+(cherry picked from commit d0b6079c404da7865fc8fe25e783e132670e1534)
+---
+ crates/xcl/src/hle/dstorage.rs | 87 ++++++++++++++++++++++++++++++++++
+ 1 file changed, 87 insertions(+)
+
+diff --git a/crates/xcl/src/hle/dstorage.rs b/crates/xcl/src/hle/dstorage.rs
+index 3f804ed..2db42c9 100644
+--- a/crates/xcl/src/hle/dstorage.rs
++++ b/crates/xcl/src/hle/dstorage.rs
+@@ -639,6 +639,18 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
+ 
+     if r.dest_physical_pages() {
+         let pages = dest_pages.ok_or(E_ACCESS_VIOLATION)?;
++        // A page number of 0 in the snapshot taken at enqueue (no page has it): the entry is
++        // read again now. A retail title keeps its page arrays in its own tables and fills an
++        // entry after EnqueueRequest – its streaming requests were refused by the thousand
++        // with page 0. An array that had its pages at enqueue stays as it was snapshotted
++        // (titles also pass arrays on the stack).
++        let late: Vec<usize>;
++        let pages = if pages.contains(&0) && crate::gpu::shader::readable(r.destination as usize, std::mem::size_of_val(pages)) {
++            late = (0..pages.len()).map(|k| if pages[k] != 0 { pages[k] } else { (r.destination as *const usize).add(k).read_unaligned() }).collect();
++            &late[..]
++        } else {
++            pages
++        };
+         if !crate::hle::kernelx::write_physical_pages(pages, r.destination_page_offset as usize, &payload[..n]) {
+             return Err(E_ACCESS_VIOLATION);
+         }
+@@ -1649,6 +1661,81 @@ mod tests {
+         }
+     }
+ 
++    /// A destination page array whose entry is still 0 at EnqueueRequest and gets its page
++    /// before the request's turn: the data arrives (a retail title's streaming).
++    #[test]
++    fn a_destination_page_filled_in_after_enqueue() {
++        use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages, MapTitlePhysicalPages, PHYS_PAGE_SIZE};
++        if crate::gpu::uma::get().is_none() {
++            return;
++        }
++        unsafe {
++            let mut count = 2usize;
++            let mut pages = [0usize; 2];
++            assert_eq!(AllocateTitlePhysicalPages(std::ptr::null_mut(), 0, &mut count, pages.as_mut_ptr()), 1);
++
++            let mut f = std::ptr::null_mut();
++            assert_eq!(DStorageGetFactory(&IID_FACTORY, &mut f), S_OK);
++            let vt = *(f as *const *const usize);
++            let create_queue: unsafe extern "system" fn(*mut c_void, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(3));
++            let create_status: unsafe extern "system" fn(*mut c_void, u32, *const u8, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*vt.add(5));
++            let mut desc = [0u8; 0x18];
++            desc[0..4].copy_from_slice(&1u32.to_le_bytes());
++            desc[8..10].copy_from_slice(&16u16.to_le_bytes());
++            desc[10] = 2;
++            let mut q = std::ptr::null_mut();
++            assert_eq!(create_queue(f, desc.as_ptr(), &IID_QUEUE, &mut q), S_OK);
++            let mut s = std::ptr::null_mut();
++            assert_eq!(create_status(f, 2, std::ptr::null(), &IID_STATUS_ARRAY, &mut s), S_OK);
++            let qv = *(q as *const *const usize);
++            let enqueue: unsafe extern "system" fn(*mut c_void, *const u8) = std::mem::transmute(*qv.add(3));
++            let status: unsafe extern "system" fn(*mut c_void, *mut c_void, u32) = std::mem::transmute(*qv.add(4));
++            let submit: unsafe extern "system" fn(*mut c_void) = std::mem::transmute(*qv.add(6));
++            let sv = *(s as *const *const usize);
++            let complete: unsafe extern "system" fn(*mut c_void, u32) -> bool = std::mem::transmute(*sv.add(3));
++            let hresult: unsafe extern "system" fn(*mut c_void, u32) -> HRESULT = std::mem::transmute(*sv.add(4));
++
++            // where the pages can be read back: mapped into a reservation
++            let reserved = windows_sys::Win32::System::Memory::VirtualAlloc(
++                std::ptr::null(),
++                2 * PHYS_PAGE_SIZE,
++                windows_sys::Win32::System::Memory::MEM_RESERVE,
++                windows_sys::Win32::System::Memory::PAGE_READWRITE,
++            );
++            assert!(!reserved.is_null());
++            assert_eq!(MapTitlePhysicalPages(reserved, 2, 0, 4, pages.as_mut_ptr()), reserved);
++
++            // 0. the title's table: the second entry has no page yet when the request is enqueued
++            let data: Vec<u8> = (0..0x1800u32).map(|i| (i * 13 + 5) as u8).collect();
++            let page_off = (PHYS_PAGE_SIZE - 0x800) as u16;
++            let mut table = Box::new([pages[0], 0usize]);
++            enqueue(q, request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT, table.as_ptr() as u64, page_off, data.len() as u32, data.as_ptr() as u64, 0, data.len() as u32, 0, 0).as_ptr());
++            std::ptr::write_volatile(&mut table[1], pages[1]);
++            status(q, s, 0);
++
++            // 1. an entry that is still 0 at the request's turn is refused as before
++            let empty = Box::new([0usize]);
++            enqueue(q, request_ex(SOURCE_MEMORY_BIT | DEST_PHYS_PAGES_BIT, empty.as_ptr() as u64, 0, 16, data.as_ptr() as u64, 0, 16, 0, 0).as_ptr());
++            status(q, s, 1);
++
++            submit(q);
++            let t = std::time::Instant::now();
++            while !complete(s, 1) && t.elapsed().as_secs() < 5 {
++                std::thread::yield_now();
++            }
++            assert_eq!((hresult(s, 0), hresult(s, 1)), (S_OK, E_ACCESS_VIOLATION));
++            let got = std::slice::from_raw_parts((reserved as *const u8).add(page_off as usize), data.len());
++            assert_eq!(got, &data[..], "the bytes cross from the page that was there into the one filled in later");
++
++            MapTitlePhysicalPages(reserved, 2, 0, 4, std::ptr::null_mut());
++            windows_sys::Win32::System::Memory::VirtualFree(reserved, 0, windows_sys::Win32::System::Memory::MEM_RELEASE);
++            assert_eq!(FreeTitlePhysicalPages(std::ptr::null_mut(), 2, pages.as_mut_ptr()), 1);
++            queue_close(q);
++            queue_release(q);
++            status_release(s);
++        }
++    }
++
+     #[test]
+     fn physical_page_destinations_and_sources() {
+         use crate::hle::kernelx::{AllocateTitlePhysicalPages, FreeTitlePhysicalPages, MapTitlePhysicalPages, PHYS_PAGE_SIZE};
+-- 
+2.54.0
+

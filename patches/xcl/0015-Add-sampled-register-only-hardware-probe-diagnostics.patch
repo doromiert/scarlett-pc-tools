@@ -1,0 +1,70 @@
+From 1c59a0c2542c1bf99693cf5504cb4cf12ac33b30 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 23:42:04 +0100
+Subject: [PATCH] Add sampled register-only hardware probe diagnostics
+
+---
+ crates/xcl/src/eh.rs | 21 ++++++++++++++++-----
+ 1 file changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/crates/xcl/src/eh.rs b/crates/xcl/src/eh.rs
+index 57b7153..df90550 100644
+--- a/crates/xcl/src/eh.rs
++++ b/crates/xcl/src/eh.rs
+@@ -706,12 +706,20 @@ unsafe extern "system" fn probe_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+     let n = PROBE_HITS[k].fetch_add(1, Ordering::Relaxed) + 1;
+     // at a function's entry: arguments 5 and 6 above the return address and the home area
+     let stack = |i: u64| probe_bytes(ctx.Rsp + 8 * i, 8).map_or(0, |b| u64::from_le_bytes(b.try_into().unwrap()));
+-    let (s5, s6) = (stack(5), stack(6));
+-    let at_r8 = probe_bytes(ctx.R8, 24);
+-    let at_rcx = probe_bytes(ctx.Rcx, 48);
++    static REGISTERS_ONLY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    let registers_only = *REGISTERS_ONLY.get_or_init(|| std::env::var_os("XCL_PROBE_REGISTERS_ONLY").is_some());
++    let (s5, s6) = if registers_only { (0, 0) } else { (stack(5), stack(6)) };
++    let at_r8 = if registers_only { None } else { probe_bytes(ctx.R8, 24) };
++    let at_rcx = if registers_only { None } else { probe_bytes(ctx.Rcx, 48) };
++    static SAMPLE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
++    let sample = *SAMPLE.get_or_init(|| std::env::var("XCL_PROBE_SAMPLE_INTERVAL").ok().and_then(|s| s.parse().ok()).unwrap_or(1).clamp(1, 1024));
++    if n % sample != 0 && !n.is_power_of_two() { return -1; }
+     // values that tell calls apart (pointers left out: they differ per call)
+     let mut h = std::collections::hash_map::DefaultHasher::new();
+     std::hash::Hash::hash(&(ctx.Rax as u32, ctx.Rdx as u32 & 0xFF, ctx.R9 as u32, s5 as u8, s6 as u8, &at_r8, &at_rcx), &mut h);
++    if registers_only {
++        std::hash::Hash::hash(&(ctx.Rcx, ctx.Rbx, ctx.R8), &mut h);
++    }
+     let key = std::hash::Hasher::finish(&h);
+     let new = {
+         let mut g = PROBE_LAST.lock().unwrap_or_else(|e| e.into_inner());
+@@ -719,7 +727,7 @@ unsafe extern "system" fn probe_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+     };
+     if (new || n.is_power_of_two()) && PROBE_LINES[k].fetch_add(1, Ordering::Relaxed) < 200 {
+         crate::xlog_info!(
+-            "probe {}: hit #{n} (thread {}): rcx {:#x} rdx {:#x} r8 {:#x} r9 {:#x} rax {:#x}, stack args 5/6 {s5:#x} {s6:#x}; at r8 {:x?}; at rcx {:x?}; from {}",
++            "probe {}: hit #{n} (thread {}, registers-only {registers_only}): rcx {:#x} rdx {:#x} r8 {:#x} r9 {:#x} rax {:#x} rbx {:#x}, stack args 5/6 {s5:#x} {s6:#x}; at r8 {:x?}; at rcx {:x?}; from {}",
+             modules::describe_address(ctx.Rip as usize),
+             windows_sys::Win32::System::Threading::GetCurrentThreadId(),
+             ctx.Rcx,
+@@ -727,9 +735,10 @@ unsafe extern "system" fn probe_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+             ctx.R8,
+             ctx.R9,
+             ctx.Rax,
++            ctx.Rbx,
+             at_r8,
+             at_rcx,
+-            modules::describe_address(stack(0) as usize)
++            if registers_only { "omitted".into() } else { modules::describe_address(stack(0) as usize) }
+         );
+     }
+     -1
+@@ -739,6 +748,8 @@ unsafe extern "system" fn probe_handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+ /// instructions in every thread; each hit with new argument values is logged (registers,
+ /// stack arguments 5 and 6, the bytes at rcx and r8) and the title goes on – which of the
+ /// title's code runs, with what, without changing it.
++/// `XCL_PROBE_REGISTERS_ONLY=1` omits argument memory; `XCL_PROBE_SAMPLE_INTERVAL=N`
++/// samples every Nth hit (and powers of two), retaining the existing 200-line/site cap.
+ pub fn start_probes() {
+     // `XCL_WATCH=rva` (hex, in the title's exe): every write to those 8 bytes is logged with
+     // the writing code (`watch_writes`) – who fills a field the title later trips over
+-- 
+2.54.0
+

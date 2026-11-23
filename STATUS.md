@@ -279,3 +279,33 @@ each and consumed exactly the source length. Strict reconstruction refused an
 unknown built-in endpoint-history entry (17). No provisional table entries or
 zero-filled substitutes were accepted. This narrows a real loading blocker;
 it does not establish correct texture output or rule out unrelated failures.
+
+## Contained continuation with temporary textures
+
+The user prioritized first gameplay and explicitly accepted temporary texture
+artifacts. Source `09b089b4be9cae04c8a9c8669f32d1deec84dad8` includes the upstream
+late physical-page correction and an opt-in valid BC7 placeholder. Its first
+contained run still hit the stream assertion at 47.059 seconds without a logged
+controller button. Both title and presenter were children of a named Wine desktop;
+Wine enlarged it beyond the requested 1600x900 size.
+
+A retry with scripted A reached the placeholder path and exposed unsupported BC5
+requests. It then failed with D3D12 device loss `0x887a0005`. The kernel named the
+game's timed-out graphics queue and RADV identified its context as guilty. The
+existing GNOME process survived this reset. Window containment therefore did not
+fix the GPU execution problem. No agent-issued stop was used.
+
+Source `4b4f706dcd06568d663af5abc58acdf7df8093d0` extends the same opt-in path to
+valid BC5 blocks. Its release build passed; actual loading efficacy is unverified.
+The 19-patch source recipe reproduces this exact candidate tree.
+
+A separate community BC7 decoder covered the identified chunk's required presets
+and emitted 65,536 bytes with no missing-history, invalid-block or normalization
+counters. An independent parser accepted all 4,096 blocks, and Linux/Windows
+console helper outputs matched. This is structural evidence, not verified texture
+accuracy; the helper is private and has not been integrated into the game runtime.
+
+World rendering remains unverified. Source inspection found two-pass shader
+metadata without a corresponding game draw-path executor. The current trace does
+not prove that such a pipeline was bound or caused the GPU hang. Further work is
+bounded draw/pipeline metadata and an instrumented GPU backend before another run.
