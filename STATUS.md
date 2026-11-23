@@ -180,8 +180,8 @@ still pending. They are not evidence of a faster or playable boot yet.
 
 ## Not verified
 
-Rendered output, audio output, a playable scene, simulation speed at
-different render rates, or gyro aiming. The last two remain requirements in
+Audio output, a playable scene, simulation speed at different render rates,
+or gyro aiming. Rendered setup UI is verified only in the later XCL run below. The last two remain requirements in
 ROADMAP.md. No timing or input patches are applied to the game.
 
 ## Current repository follow-up
@@ -220,3 +220,25 @@ descriptor-heap, root-signature, pipeline-state and memory-heap identity checks.
 A later execute-null crash identified allocator Xbox slot9 by exact guest
 callsite/PDB; its registration candidate is under actual-run verification.
 No XCL implementation source is included in this GPL-3.0 recipe.
+
+## XCL: locally rendered setup UI
+
+Separate local XCL `0cb3173bbc47e3aa05cb288cb462005a0f16fff9` with
+Wine 11.0, VKD3D-Proton 3.1, native DXVK 3.1.1 DXGI, Mesa/RADV 26.1.8
+and an RX 6900 XT rendered the setup/account-picker UI. Private frame captures
+and the user's observation agree. This is not a verified title screen, startup
+animation, or playable scene.
+
+Native DXVK DXGI cleared the measured Wine builtin-DXGI crash. The actual game
+subsequently presented at approximately 30 frames per second and issued draws,
+compute dispatches and DirectStorage reads. It then stopped on its own bounded
+stream assertion: a 96 KiB channel had 80 bytes remaining for a 1,728-byte write.
+Why the channel fails to drain remains under investigation; no assertion or
+capacity check was disabled. Repeating with register-only diagnostic XCL
+`1c59a0c2542c1bf99693cf5504cb4cf12ac33b30` reproduced the same stop.
+
+These runs have no automatic stop timer. The dump remains private, with writes
+redirected to an external overlay and networking disabled. The XCL implementation
+remains a separate GPL-2.0-only checkout; this repository distributes no XCL code,
+game files, frame captures, or private runtime logs. Leonida's sampled output
+remains black.
