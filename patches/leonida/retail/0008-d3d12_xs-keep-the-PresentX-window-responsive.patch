@@ -1,0 +1,94 @@
+From b840df36993662975b0a497b95047ad65a847659 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 20:20:49 +0100
+Subject: [PATCH 08/10] d3d12_xs: keep the PresentX window responsive
+
+---
+ runtime/shims/d3d12_xs_device.cpp | 41 ++++++++++++++++++++++++++++---
+ 1 file changed, 38 insertions(+), 3 deletions(-)
+
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index 121522fda..d66a71e01 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -1296,11 +1296,27 @@ LONG CALLBACK table_overrun_handler(EXCEPTION_POINTERS* info) {
+ 
+ struct PresentState {
+     ~PresentState() {
+-        if (window) DestroyWindow(window);  // the presentation and its window die with the device proxy
++        xbox.reset();  // release the surface before its HWND
++        if (!window) return;
++        const HWND owned_window = window;
++        window = nullptr;
++        SetWindowLongPtrW(owned_window, GWLP_USERDATA, 0);
++        if (GetWindowThreadProcessId(owned_window, nullptr) == GetCurrentThreadId())
++            DestroyWindow(owned_window);
++        else
++            PostMessageW(owned_window, WM_CLOSE, 0, 0);
+     }
+     HWND window = nullptr;
+     std::unique_ptr<rt::d3d12::XboxPresentation> xbox;
+     bool tried = false;  // creation is attempted once; a null xbox means this device cannot present
++
++    void pump_messages() {
++        MSG message{};
++        while (window && PeekMessageW(&message, window, 0, 0, PM_REMOVE)) {
++            TranslateMessage(&message);
++            DispatchMessageW(&message);
++        }
++    }
+ };
+ 
+ void destroy_present_state(void* present_state) {
+@@ -1308,6 +1324,22 @@ void destroy_present_state(void* present_state) {
+ }
+ 
+ LRESULT CALLBACK present_window_proc(HWND window, UINT message, WPARAM wparam, LPARAM lparam) {
++    auto* state = reinterpret_cast<PresentState*>(GetWindowLongPtrW(window, GWLP_USERDATA));
++    if (message == WM_NCCREATE) {
++        state = static_cast<PresentState*>(reinterpret_cast<CREATESTRUCTW*>(lparam)->lpCreateParams);
++        SetWindowLongPtrW(window, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(state));
++    } else if (message == WM_CLOSE) {
++        if (state) {
++            state->xbox.reset();  // the Vulkan surface must die before the HWND
++            state->window = nullptr;
++            SetWindowLongPtrW(window, GWLP_USERDATA, 0);
++        }
++        DestroyWindow(window);
++        return 0;
++    } else if (message == WM_NCDESTROY && state) {
++        state->window = nullptr;
++        SetWindowLongPtrW(window, GWLP_USERDATA, 0);
++    }
+     return DefWindowProcW(window, message, wparam, lparam);
+ }
+ 
+@@ -1327,13 +1359,15 @@ PresentState* present_state_for(DeviceProxy* device) {
+         std::fprintf(stderr, "[rt] d3d12_xs: PresentX window class failed (error %lu)\n", GetLastError());
+         return state;
+     }
+-    state->window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW, CW_USEDEFAULT,
++    state->window = CreateWindowExW(0, window_class.lpszClassName, L"Leonida", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
++                                  CW_USEDEFAULT,
+                                   CW_USEDEFAULT, CW_USEDEFAULT, CW_USEDEFAULT, nullptr, nullptr,
+-                                  window_class.hInstance, nullptr);
++                                  window_class.hInstance, state);
+     if (!state->window) {
+         std::fprintf(stderr, "[rt] d3d12_xs: PresentX window failed (error %lu)\n", GetLastError());
+         return state;
+     }
++    UpdateWindow(state->window);
+     auto presenter = rt::d3d12::create_window_presenter(device->real, state->window);
+     if (!presenter) {
+         std::fprintf(stderr, "[rt] d3d12_xs: no window presenter on this device; PresentX is a no-op\n");
+@@ -1348,6 +1382,7 @@ PresentState* present_state_for(DeviceProxy* device) {
+ std::uint64_t queue_present_x(ChildProxy* self, std::uint64_t plane_count, std::uint64_t planes,
+                               std::uint64_t params) {
+     PresentState* state = self->device ? present_state_for(self->device) : nullptr;
++    if (state) state->pump_messages();
+     if (!state || !state->xbox) return hr_to_u64(S_OK);  // a title still runs with nothing presented
+     const HRESULT result = state->xbox->PresentX(
+         static_cast<UINT>(plane_count),
+-- 
+2.54.0
+

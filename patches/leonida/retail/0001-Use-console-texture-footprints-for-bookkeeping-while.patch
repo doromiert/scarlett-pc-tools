@@ -1,0 +1,35 @@
+From ef02a6c35da593151cf2ecaeccfdb73e14a96680 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 19:58:02 +0100
+Subject: [PATCH 01/10] Use console texture footprints for bookkeeping while
+ preserving native buffer backing
+
+---
+ runtime/shims/d3d12_xs_device.cpp | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index 2c1ba1bac..85b932917 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -2894,13 +2894,15 @@ D3D12_RESOURCE_DESC desc_of(const D3D12_RESOURCE_DESC1& desc1) {
+     return desc;
+ }
+ 
+-// The PC allocation size of `desc`, or 0 when the device has none to give.
++// Native buffer backing size, or the console footprint for a texture's bookkeeping-only lease.
+ std::size_t xmem_size(DeviceProxy* self, const D3D12_RESOURCE_DESC& desc) {
+     const D3D12_RESOURCE_ALLOCATION_INFO info = self->real->GetResourceAllocationInfo(0, 1, &desc);
+     if (info.SizeInBytes == 0 || info.SizeInBytes == UINT64_MAX ||
+         info.SizeInBytes > (std::numeric_limits<std::size_t>::max)())
+         return 0;
+-    return static_cast<std::size_t>(info.SizeInBytes);
++    // RADV's image metadata must not overflow the title's console accounting arena; textures keep native backing.
++    const UINT64 console_size = console_render_target_size(desc);
++    return static_cast<std::size_t>(console_size ? console_size : info.SizeInBytes);
+ }
+ 
+ // Ties hook memory to `resource` as private data, so it goes back through the hook's free when the resource dies. A
+-- 
+2.54.0
+

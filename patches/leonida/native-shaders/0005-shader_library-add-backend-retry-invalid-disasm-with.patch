@@ -1,0 +1,137 @@
+From b1bfc876d68128e2ff2e35bbdd76e24f82119797 Mon Sep 17 00:00:00 2001
+From: Davi Andrei <67552001+SaymonMaster14@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 15:52:19 -0300
+Subject: [PATCH 5/7] shader_library: add --backend, retry invalid disasm with
+ rdna2_decode, and pass wave32
+
+---
+ docs/shader_library.md       |  7 ++--
+ tests/test_shader_library.py | 63 ++++++++++++++++++++++++++++++++++++
+ tools/shader_library.py      | 12 ++++++-
+ 3 files changed, 78 insertions(+), 4 deletions(-)
+
+diff --git a/docs/shader_library.md b/docs/shader_library.md
+index f8224ffdd..4f0b77e3d 100644
+--- a/docs/shader_library.md
++++ b/docs/shader_library.md
+@@ -114,9 +114,10 @@ python -I tools/rdna2spirv.py <work>/library/disasm --out <work>/library/spirv
+   reads (`native_blob`, `cs_dispatch_state`). It also writes `index.json` with each program's stage, and
+   `library.json` with the header and both pipeline tables, stage to program name. Programs are named
+   `lib_<stage>_<index>`.
+-* `--disasm` writes `disasm/<name>.s` for the code after the prologue, as `fspx_unpack.py --disasm` does.
+-  Use llvm-mc 23 (`scripts/build_llvm_mc.ps1 -Version 23.1.5`, or the `llvm-23` package): older versions can't
+-  decode the `vcc` tuples these programs use (§5).
++* `--disasm` writes `disasm/<name>.s` for the code after the prologue, as `fspx_unpack.py --disasm` does. If
++  `llvm-mc` reports invalid instructions, the unpacker retries with the built-in RDNA2 decoder (`--backend python`),
++  passing the program's `wave32` flag, and uses its listing after a complete decode.
++  LLVM 23 can decode vcc register tuples that older LLVM releases reject (§5).
+ * `--carve` names each program's source shaders. It copies the first source container to `<name>.dxbc`, because
+   the translator reads the stage's signatures and `PSV0` from there. Pipeline compilation keeps the D3D12 stage
+   interface.
+diff --git a/tests/test_shader_library.py b/tests/test_shader_library.py
+index 385280aa0..54b1b5d94 100644
+--- a/tests/test_shader_library.py
++++ b/tests/test_shader_library.py
+@@ -339,6 +339,69 @@ class Main(unittest.TestCase):
+             finally:
+                 rdna2spirv._STAGES = None
+ 
++    def test_disasm_python_backend_passes_wave32_from_kind0(self):
++        """--disasm --backend python decodes without llvm-mc and passes the compute record's wave32 flag."""
++        # v_cmp_class_f16_e64 sdst=10, 0x7c01, v13: s10 in wave32, s[10:11] in wave64.
++        vcmp_e64 = bytes.fromhex("0a008fd4ff1a0200017c0000")
++        code = prologue(0x77778888) + vcmp_e64 + ENDPGM
++        code += CODE_END * ((-len(code)) % 256 // 4)
++        for wave32, expected in ((False, "s[10:11]"), (True, "s10,")):
++            rsrc_z = 1 | (0x10 << 16 if wave32 else 0)
++            k0 = struct.pack("<7I", 0x4005CF00, 0x6C090102, 0, 8 | 8 << 16, rsrc_z, 0x402C0343, 0xB8A)
++            lib_bytes = build([], [(0, 1, 0, 2)], [k0, b"\x01" * 20, layout_blob(3, D_CS)], [code])
++            with tempfile.TemporaryDirectory() as tmp:
++                src = os.path.join(tmp, "lib.bin")
++                with open(src, "wb") as f:
++                    f.write(lib_bytes)
++                out = os.path.join(tmp, "out")
++                rc, _ = self.run_main(src, "--out", out, "--stages", "cs", "--disasm", "--backend", "python")
++                self.assertEqual(rc, 0)
++                with open(os.path.join(out, "disasm", "lib_cs_00000.s"), encoding="utf-8") as f:
++                    listing = f.read()
++                self.assertIn("0 invalid words", listing)
++                self.assertIn(expected, listing)
++                with open(os.path.join(out, "index.json"), encoding="utf-8") as f:
++                    idx = json.load(f)
++                self.assertEqual(idx[0]["invalid_words"], 0)
++                self.assertEqual(idx[0]["wave32"], wave32)
++
++    def test_disasm_retries_invalid_words_with_python_decoder_and_rejects_empty_output(self):
++        """When llvm-mc reports invalid words, --disasm retries with the Python decoder; empty output raises LibraryError."""
++        import shader_disasm
++        with tempfile.TemporaryDirectory() as tmp:
++            src = os.path.join(tmp, "lib.bin")
++            with open(src, "wb") as f:
++                f.write(sample())
++            calls = []
++            real_disasm = shader_disasm.disasm
++
++            def fake_invalid(code, mcpu, backend="llvm-mc", wave32=True):
++                calls.append((backend, wave32))
++                if backend == "llvm-mc":
++                    return "\ts_endpgm\n", 2, "warning: invalid instruction encoding\n"
++                return real_disasm(code, mcpu, backend="python", wave32=wave32)
++
++            old = shader_disasm.disasm
++            shader_disasm.disasm = fake_invalid
++            try:
++                out = os.path.join(tmp, "out_retry")
++                rc, _ = self.run_main(src, "--out", out, "--stages", "cs", "--disasm", "--jobs", "1")
++                self.assertEqual(rc, 0)
++                self.assertEqual(calls, [("llvm-mc", False), ("python", False)])
++                with open(os.path.join(out, "disasm", "lib_cs_00003.s"), encoding="utf-8") as f:
++                    listing = f.read()
++                self.assertIn("0 invalid words", listing)
++                self.assertIn("v_mov_b32", listing)
++                self.assertNotIn("warning: invalid instruction encoding", listing)
++
++                shader_disasm.disasm = lambda code, mcpu, backend="llvm-mc", wave32=True: ("   ", 0, "llvm-mc failed\n")
++                out_fail = os.path.join(tmp, "out_fail")
++                with self.assertRaisesRegex(sl.LibraryError, "lib_cs_00003: llvm-mc failed"):
++                    self.run_main(src, "--out", out_fail, "--stages", "cs", "--disasm", "--jobs", "1")
++                self.assertEqual(os.listdir(os.path.join(out_fail, "disasm")), [])
++            finally:
++                shader_disasm.disasm = old
++
+ 
+ if __name__ == "__main__":
+     unittest.main()
+diff --git a/tools/shader_library.py b/tools/shader_library.py
+index 519ba00a2..2f06a65ce 100644
+--- a/tools/shader_library.py
++++ b/tools/shader_library.py
+@@ -261,6 +261,8 @@ def main(argv=None) -> int:
+                     help="stages whose programs to write (default cs,ps,vs,ms; 'all' adds the unidentified slot)")
+     ap.add_argument("--disasm", action="store_true", help="also write disasm/<name>.s (needs llvm-mc, see LLVM_MC)")
+     ap.add_argument("--mcpu", default="gfx1013", help="llvm-mc CPU for --disasm (default gfx1013)")
++    ap.add_argument("--backend", choices=("llvm-mc", "python"), default="llvm-mc",
++                    help="disassembler backend for --disasm: llvm-mc (default) or pure-Python RDNA2 decoder (#1901)")
+     ap.add_argument("--carve", help="a tools/shader_carve.py output folder: name each program's source shader by the "
+                                     "digest its resource-layout blob ends with (the container's HASH part), and "
+                                     "copy that container to <name>.dxbc for the translator's signature reads")
+@@ -341,7 +343,15 @@ def main(argv=None) -> int:
+ 
+     def one(job):
+         entry, name, code, start, end = job
+-        asm, invalid, err = disasm.disasm(code, a.mcpu)
++        wave32 = entry.get("wave32", True)
++        asm, invalid, err = disasm.disasm(code, a.mcpu, backend=a.backend, wave32=wave32)
++        if a.backend == "llvm-mc" and asm.strip() and invalid:
++            decoded, remaining, _ = disasm.disasm(code, a.mcpu, backend="python", wave32=wave32)
++            if decoded.strip() and remaining == 0:
++                asm, invalid, err = decoded, 0, ""
++        if not asm.strip():
++            reason = (err.strip().splitlines() or ["no output"])[0]
++            raise LibraryError(f"{name}: {reason}")
+         entry["invalid_words"] = invalid
+         with open(os.path.join(a.out, "disasm", name + ".s"), "w", encoding="utf-8", newline="\n") as f:
+             f.write(f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n")
+-- 
+2.54.0
+

@@ -1,0 +1,984 @@
+From 7383f8bc7185ba790431a4622c1e9893e4453fc6 Mon Sep 17 00:00:00 2001
+From: Vadson159 <vad.sofr@gmail.com>
+Date: Mon, 23 Nov 2026 19:44:55 +0100
+Subject: [PATCH 4/7] rdna2spirv, lane_masks: support null/exec/wave32-vcc_hi
+ compare SDSTs and wave32 vcc_hi masks
+
+---
+ docs/design.md                               |   1 +
+ tests/semantic/test_vcmp_dst_wave32_vcchi.py | 490 +++++++++++++++++++
+ tests/test_lane_masks.py                     |  59 +++
+ tools/lane_masks.py                          |  65 +--
+ tools/rdna2spirv.py                          | 111 ++---
+ 5 files changed, 639 insertions(+), 87 deletions(-)
+ create mode 100644 tests/semantic/test_vcmp_dst_wave32_vcchi.py
+
+diff --git a/docs/design.md b/docs/design.md
+index 9e4648c3c..c1cc4bc5e 100644
+--- a/docs/design.md
++++ b/docs/design.md
+@@ -493,6 +493,7 @@ How the generated SPIR-V expects the runtime to work:
+ | Out-of-bounds typed buffer loads and `DST_SEL=1` | When a MUBUF `buffer_load_format_{x,xy,xyz,xyzw}` or `buffer_load_format_d16_{x,xy,xyz,xyzw}` is out of bounds (`OOB_SELECT` 0–3, `num_records == 0`, partial-element spill, or swizzled OOB), memory is not accessed and raw data channels (`DST_SEL` 4..7) read 0, while the V# `DST_SEL` swizzle still runs: `DST_SEL=0` returns 0 and `DST_SEL=1` returns `1.0f` (`0x3F800000`, `d16` `0x3C00`) iff V# `FORMAT[6:0]` is a valid float, normalized or scaled buffer format (`1..77` ending in `_UNORM`, `_SNORM`, `_USCALED`, `_SSCALED`, or `_FLOAT`), and integer `1` (`0x00000001`, `d16` `0x0001`) for `UINT`/`SINT`, `INVALID` (`0`), and reserved codes (`78..127`). `d16_x` and `d16_xyz` preserve the unaddressed upper 16 bits of the final destination VGPR, and MTBUF `tbuffer_load_format_*` ignores V# `DST_SEL` on both out-of-bounds and `FORMAT=0` loads (returning 0 in addressed channels). Until 2026-11-22 `Gen.buffer_load_format` clamped the post-swizzle result to 0 when `in_b` was false (`SHADER-429`), dropping `DST_SEL=1` on out-of-bounds loads and returning `1.0f` instead of `1` for `DST_SEL=1` with `FORMAT=0`. **Hardware-verified on RDNA2** (`gfx1036`, Windows 11, driver `32.0.21042.62`, wave32 and wave64, 746 kernels via `tools/hw_oracle`: all 41 `Gen.FORMATS` across `xyzw`/`d16_xyzw`/`d16_xyz`/`d16_x`, all 128 7-bit `FORMAT` codes `0..127` for both `f32` and `d16`, `OOB_SELECT` 0–3, partial spill, swizzled OOB, MTBUF controls, and inactive EXEC lanes), Vulkan GPU-checked across all 128 7-bit `FORMAT` codes (`xyzw`, `d16_xyzw`, `d16_xyz`, `d16_x`) and the `cs_fmt_*`/`cs_oob_*`/`cs_bounds`/`cs_buf_*` fixtures on NVIDIA GeForce RTX 5090 (driver `32.0.16.1088`) and AMD Radeon Graphics (`gfx1036`, driver `32.0.21042.62`), and CPU/`spirv-val`-checked by `tests/semantic/test_buffer_oob_dst_sel.py`. |
+ | `v_div_fixup_f32` | Measured natively on an AMD Radeon(TM) Graphics RDNA2 GPU (`gfx1036`, not the console's `gfx1013`; Windows driver 32.0.21042.62, `tools/hw_oracle`, wave32 and wave64 identical on every case: 256 seeded triples across 4 MODEs plus 73 targeted special-case/modifier rows, 0 mismatches). Computes `div_fixup_f32(S0=quotient, S1=denom, S2=numer)` with pure integer SPIR-V ops under the game's inferred MODE (`IEEE=0`, `denorm32=0`, `DX10_CLAMP=1`): VOP3 `abs` (clear bit 31) then `neg` (flip bit 31) apply bitwise to `S0`/`S1`/`S2` before classification (including NaN payloads); `S1`/`S2` subnormals flush to signed zero (`exp == 0`) while `S0` subnormals are preserved; priority order is (1) `NaN(S2) → S2`, (2) `NaN(S1) → S1` (signalling NaNs pass unchanged under `IEEE=0`, quieted only when `IEEE=1`), (3) `0/0` or `±inf/±inf → 0xFFC00000` (`-qNaN`), (4) `zero(S2) ∨ inf(S1) → ±0.0`, (5) `zero(S1) ∨ inf(S2) → ±inf`, (6) `exp(S2) − exp(S1) ≤ −151 → ±0.0` (pure biased-exponent check, beats `NaN(S0)` and `inf(S0)`; no overflow check), (7) `NaN(S0) → ±inf`, (8) `copysign(S0, sign(S1) ⊕ sign(S2))`. Output modifiers `mul:2`/`mul:4`/`div:2` apply before `clamp`, and `clamp` maps NaN to `+0.0` (`DX10_CLAMP=1`) before `FClamp` to `[0, 1]`. Not modelled: `IEEE=1` sNaN quieting, `denorm32=3` keeping `S1`/`S2` subnormals, and the hardware `omod` `-0 → +0` quirk (same as the other f32 ops). Checked bit-for-bit against 73 measured `gfx1036` words in `tests/semantic/test_alu_div_fixup_f32.py`. |
+ | Atomic natural alignment, 64-bit bounds, and `buffer_atomic_{fmin,fmax}` | Measured natively on RDNA2 (AMD Radeon(TM) Graphics, `gfx1036`, Windows driver `32.0.21042.62`, wave32 and wave64 via `tools/hw_oracle/`): **natural alignment** is enforced on every 32-bit and 64-bit buffer/global atomic (`buffer_atomic*`, `buffer_atomic*_x2`, `global_atomic*`, `global_atomic*_x2`), even under `OOB_SELECT = 2` (DISABLED). A 32-bit atomic requires `(addr & 3) == 0` (`offset = 1, 2` and `base + 2, offset = 0` are dropped; `base + 2, offset = 2` succeeds) and a 64-bit `_x2` atomic requires `(addr & 7) == 0` (`offset = 2, 4` and `base + 4, offset = 0` are dropped; `base + 4, offset = 4` succeeds). When dropped (OOB or unaligned), memory is untouched, an active `glc` lane receives `0` (32-bit) or `(0, 0)` (64-bit) in `vdst`/`vdata`, and an inactive lane (`EXEC = 0`) preserves `vdst`/`vdata`. Independently confirmed on a second `gfx1036` (driver `24.10.24`): without the alignment guard, an unaligned SPIR-V `OpAtomicAdd` corrupts the aligned dword (`100 -> 0xDEADBEF3`), whereas with the guard memory stays untouched and `0` is returned. `Gen.atomic_aligned` guards all six atomic emitters on `addr & 3 == 0` / `addr & 7 == 0`, merges `0` via `OpPhi` on skipped paths, and writes through `Gen.dst` so inactive lanes keep their prior register value while active unaligned/OOB lanes receive `0`. **64-bit partial bounds (`buffer_atomic*_x2`)**: the same `gfx1036` wave32/wave64 measurements confirm the all-or-nothing 8-byte bounds rule (`fixed_fmt = 62`) across all four `OOB_SELECT` modes (answering the unmeasured note in the `buffer_atomic_{and,or,xor,swap}_x2` row): mode 3 (RAW) requires `offs + 8 <= num_records` (`0/8` and `8/16` succeed; `0/7`, `0/5`, `0/4`, `8/15`, `8/12` drop cleanly); mode 0 (STRUCTURED_WITH_OFFSET) requires `idx < num_records` and `off + 8 <= stride` (`stride = 8, off = 0`, `stride = 16, off = 8`, `stride = 12, off = 0` succeed; `stride = 7, off = 0` and `stride = 12, off = 8` drop); mode 1 (STRUCTURED) checks `idx < num_records`; mode 2 (DISABLED) checks `num_records != 0`. **`buffer_atomic_{fmin,fmax}`**: lowered via `Gen.buffer_atomic_float` sharing `Gen._emit_atomic_fminmax_cas` (relaxed Device-scope `OpAtomicLoad` seed + `OpAtomicCompareExchange` + `GLSL.std.450` `NMin`/`NMax` CAS loop, no float-atomic extension required), enforcing V# bounds, 4-byte alignment, and `glc` return (`lds` and non-1-VGPR `vdata` raise `Unsupported`). On `gfx1036`, normal floats, `±inf`, `-0` vs `+0` (`fmin(-0, +0) = -0`, `fmax(-0, +0) = +0`), and `qNaN` (returns the non-NaN operand) match `NMin`/`NMax`; **known approximation**: the `gfx1036` L2 atomic unit quiets `sNaN` (`0x7f800001 -> 0x7fc00001`) regardless of `MODE`, while f32 subnormal handling follows the wave's `MODE.denorm32` and preserves sign (independently verified on a second `gfx1036`, wave32/wave64: under `denorm32 = 0`, subnormals flush to signed zero — `fmax(0x80000001, 0x80000002) -> 0x80000000 (-0)`, `fmax(0x00000001, 0x00000002) -> +0` — whereas under `denorm32 = 3`, subnormals are preserved and `NMin`/`NMax` is exact); `NMin`/`NMax` does not model `sNaN` quieting or `denorm32 = 0` subnormal flushing. CPU-checked by `tests/semantic/test_buffer_atomic_fminmax_and_align.py` (value grid, multi-lane CAS contention, OOB/partial-bounds matrix, inactive vs active-unaligned distinction across all six atomic families, and SPIR-V structural checks). |
++| Compare `SDST` (`null`, `exec`/`exec_lo`) and wave32 `vcc_hi` lane masks | `Gen.compare` (`f64` and `write_compare_result`), `Gen.cmp_class`, `Gen.cmp_class_f64`, and the 64-bit integer compare paths route `SDST` through `Gen.mask_dst` (`Gen.is_mask_dst` validates `v_cmp_class_f64`), so `v_cmp_*_e64` and `v_cmp_class_f64_e64` accept `null` (discarding the mask write without altering `VCC` or `EXEC`), `exec_lo` (wave32) / `exec` (wave64) (narrowing `EXEC` via `SDST[lane] = EXEC[lane] ? cond : 0` with inactive lanes remaining off even on constant `tru`/`t` predicates, leaving `VCC` untouched), and `vcc_hi` in wave32, while still raising `Unsupported` on VGPR/literal destinations and on `vcc_hi` VALU destinations in wave64. In wave32 (`not wave64`), `vcc_hi` (`0x6b`) is an independent 32-bit scalar/mask register (`%vcc_hi`), separate from `vcc_lo`/`VCC` (`%vcc`): `tools/lane_masks.py` (`kind`/`put`/`step`) tracks `"vcc_hi"` separately from `"vcc"` when `wave64=False`, and `Gen.mask_dst`, `Gen.holds_lane_mask`, `Gen.mask_src`, `Gen.mask_half` (`None` in wave32), `Gen.wave_mask`, and `Gen.wqm` store/load `%vcc_hi` as a per-lane mask when `"vcc_hi"` is tracked and extract bit `lane & 31` when `%vcc_hi` holds plain scalar data. Source: RDNA2 ISA VOPC/VOP3 `SDST` encoding (`0x7d` `null`, `0x7e` `exec_lo`/`exec`, `0x6b` wave32 `vcc_hi`), confirmed with `llvm-mc -arch=amdgcn -mcpu=gfx1013` (wave32 and `-mattr=+wavefrontsize64`). CPU-checked by `tests/test_lane_masks.py` (`test_wave32_vcc_hi_isolation`) and `tests/semantic/test_vcmp_dst_wave32_vcchi.py` (`spirv_mini_interp`, `spirv_wave_interp`, `spirv-val --target-env vulkan1.2` across wave32, wave64 native, and `--wave64-emulate`); translated SPIR-V compute shaders executed on AMD Radeon(TM) Graphics (`gfx1036`, wave32 + wave64 native + `--wave64-emulate`) and AMD Radeon RX 9070 XT (`vk_compute_test`). **No raw RDNA2 hardware-oracle run and no corpus count.** |
+ 
+ ### System values confirmed on the corpus (SHADER-4)
+ 
+diff --git a/tests/semantic/test_vcmp_dst_wave32_vcchi.py b/tests/semantic/test_vcmp_dst_wave32_vcchi.py
+new file mode 100644
+index 000000000..239b7a4b7
+--- /dev/null
++++ b/tests/semantic/test_vcmp_dst_wave32_vcchi.py
+@@ -0,0 +1,490 @@
++"""Semantic tests for v_cmp_* / v_cmp_class_f64 null/exec/wave32-vcc_hi SDSTs and wave32 vcc_hi masks.
++
++Covers:
++  - null destination on v_cmp_* (f32, f16, u16, i16, u32, i32, f64, f/tru_f64, u64 eq/lt, i64) and v_cmp_class_f64:
++    mask write is discarded without touching VCC or EXEC (wave32, wave64, and --wave64-emulate)
++  - exec_lo (wave32) and exec (wave64 / --wave64-emulate) destinations on the same compare / class families:
++    active lanes update EXEC and inactive lanes remain off (including constant tru/t compares), while VCC stays intact
++  - wave32 vcc_hi as an independent 32-bit mask/scalar register:
++      * v_cmp_*, v_cmp_class_f64, v_add_co_u32, v_mad_u64_u32, s_and_saveexec_b32, s_wqm_b32 writing vcc_hi
++      * v_cndmask_b32_e64, v_add_co_ci_u32_e64, s_bcnt1_i32_b32, s_ff1_i32_b32, s_flbit_i32_b32,
++        v_mbcnt_lo_u32_b32, s_cmp_eq/lt_u32, s_wqm_b32 reading vcc_hi (preserving vcc_lo)
++      * plain scalar data in vcc_hi (e.g. 0xA5000005, s_wqm_b32 vcc_hi, 1) read both as scalar and as a lane-bit
++        mask without corrupting or reading vcc_lo
++  - negative controls rejecting invalid destinations (VGPR everywhere; vcc_hi SDST in wave64)
++  - Vulkan 1.2 SPIR-V validation via spirv-as / spirv-val when present on PATH
++"""
++import gc
++import os
++import shutil
++import struct
++import subprocess
++import sys
++import tempfile
++import unittest
++import warnings
++
++HERE = os.path.dirname(os.path.abspath(__file__))
++ROOT = os.path.dirname(os.path.dirname(HERE))
++TOOLS_DIR = os.environ.get("LEONIDA_TOOLS_DIR") or os.path.join(ROOT, "tools")
++
++sys.dont_write_bytecode = True
++if HERE not in sys.path:
++    sys.path.insert(0, HERE)
++if TOOLS_DIR not in sys.path:
++    sys.path.insert(0, TOOLS_DIR)
++
++import rdna2spirv  # noqa: E402
++import spirv_mini_interp as si  # noqa: E402
++import spirv_wave_interp as wi  # noqa: E402
++
++STUB_DXBC = b"DXBC" + bytes(24) + struct.pack("<I", 0) + bytes(4)
++VSHARP = [0, 0, 0xFFFFFFFF, 0x31016FAC]
++
++
++def _fssm_blob(wave_size):
++    blob = bytearray(0x138)
++    blob[0:4] = b"FSSM"
++    if wave_size == 32:
++        struct.pack_into("<I", blob, 0xD4, 0x20)
++    return bytes(blob) + struct.pack("<4I", 0x8088, wave_size, 1, 1)
++
++
++def _validate_spirv(name, spv):
++    spirv_as = shutil.which("spirv-as")
++    spirv_val = shutil.which("spirv-val")
++    if not spirv_as or not spirv_val:
++        return
++    with tempfile.TemporaryDirectory() as d:
++        asm_p = os.path.join(d, "s.spvasm")
++        bin_p = os.path.join(d, "s.spv")
++        with open(asm_p, "w", encoding="utf-8", newline="\n") as f:
++            f.write(spv)
++        r1 = subprocess.run([spirv_as, "--target-env", "vulkan1.2", asm_p, "-o", bin_p],
++                            capture_output=True, text=True)
++        assert r1.returncode == 0, f"spirv-as failed for {name}: {r1.stderr}"
++        r2 = subprocess.run([spirv_val, "--target-env", "vulkan1.2", bin_p],
++                            capture_output=True, text=True)
++        assert r2.returncode == 0, f"spirv-val failed for {name}: {r2.stderr}"
++
++
++def _translate_cs(name, body_lines, wave_size=32, emulate=False):
++    prev_emu = rdna2spirv.WAVE64_EMULATE
++    try:
++        rdna2spirv.WAVE64_EMULATE = emulate
++        with tempfile.TemporaryDirectory() as tmp:
++            os.mkdir(os.path.join(tmp, "disasm"))
++            os.mkdir(os.path.join(tmp, "fssm"))
++            s_path = os.path.join(tmp, "disasm", "cs_" + name + ".s")
++            with open(s_path, "w", encoding="utf-8", newline="\n") as f:
++                f.write(f"; cs_{name}\n")
++                for ln in body_lines:
++                    f.write(f"\t{ln}\n")
++                f.write("\ts_endpgm\n")
++            with open(os.path.join(tmp, "cs_" + name + ".dxbc"), "wb") as f:
++                f.write(STUB_DXBC)
++            with open(os.path.join(tmp, "fssm", "cs_" + name + ".fssm"), "wb") as f:
++                f.write(_fssm_blob(wave_size))
++            with warnings.catch_warnings():
++                warnings.simplefilter("ignore", ResourceWarning)
++                spv = rdna2spirv.translate(s_path)
++                gc.collect()
++            assert rdna2spirv.translate.last_gen.wave64 == (wave_size == 64)
++            return spv
++    finally:
++        rdna2spirv.WAVE64_EMULATE = prev_emu
++
++
++def _run_cs(name, body_lines, wave_size=32, emulate=False, validate=True):
++    spv = _translate_cs(name, body_lines, wave_size=wave_size, emulate=emulate)
++    if validate:
++        _validate_spirv(name, spv)
++    pc = VSHARP + [0] * 28
++    mem = {}
++    sg_size = 32 if emulate else wave_size
++    si.run_workgroup(
++        spv, wave_size, sg_size,
++        inputs_for=lambda i: {"%wg_id": (0, 0, 0), "%local_id": (i, 0, 0), "%sg_lane": i % sg_size},
++        push_constants=pc, memory=mem,
++    )
++    return mem
++
++
++def _run_vs_w32(name, body_lines, out_regs=("v10", "v11", "v12", "v15")):
++    with tempfile.TemporaryDirectory() as tmp:
++        os.mkdir(os.path.join(tmp, "disasm"))
++        os.mkdir(os.path.join(tmp, "fssm"))
++        s_path = os.path.join(tmp, "disasm", "vs_" + name + ".s")
++        with open(s_path, "w", encoding="utf-8", newline="\n") as f:
++            f.write(f"; vs_{name}\n")
++            for ln in body_lines:
++                f.write(f"\t{ln}\n")
++            f.write("\tv_mov_b32_e32 v20, 0\n")
++            f.write("\texp pos0 v20, v20, v20, v20 done\n")
++            f.write(f"\texp param0 {', '.join(out_regs)}\n")
++            f.write("\ts_endpgm\n")
++        with open(os.path.join(tmp, "vs_" + name + ".dxbc"), "wb") as f:
++            f.write(STUB_DXBC)
++        with open(os.path.join(tmp, "fssm", "vs_" + name + ".fssm"), "wb") as f:
++            f.write(_fssm_blob(32))
++        with warnings.catch_warnings():
++            warnings.simplefilter("ignore", ResourceWarning)
++            spv = rdna2spirv.translate(s_path)
++            gc.collect()
++        assert rdna2spirv.translate.last_gen.wave64 is False
++    _validate_spirv("vs_" + name, spv)
++    res = wi.run_wave(spv, wave=32, builtins={"VertexIndex": lambda lane: lane, "InstanceIndex": lambda _lane: 0})
++    return [lane_out["%out_param0"] for lane_out in res["outputs"]]
++
++
++COMPARE_NULL_EXEC_CASES = [
++    # (tag, setup_lines, insn_template_with_dst, cond_fn)
++    ("f32", [
++        "v_cvt_f32_u32_e32 v1, v0",
++        "v_mov_b32_e32 v2, 10.0",
++    ], "v_cmp_lt_f32_e64 {dst}, v1, 10.0", lambda i: i < 10),
++    ("f16", [
++        "v_cvt_f32_u32_e32 v1, v0",
++        "v_cvt_f16_f32_e32 v1, v1",
++        "v_mov_b32_e32 v2, 0x4500",      # 5.0 in f16
++    ], "v_cmp_lt_f16_e64 {dst}, v1, v2", lambda i: i < 5),
++    ("u16", [
++        "v_mov_b32_e32 v1, v0",
++    ], "v_cmp_lt_u16_e64 {dst}, v1, 9", lambda i: i < 9),
++    ("i16", [
++        "v_sub_nc_u32_e32 v1, v0, 6",
++    ], "v_cmp_lt_i16_e64 {dst}, v1, 0", lambda i: (i - 6) < 0),
++    ("u32", [], "v_cmp_lt_u32_e64 {dst}, v0, 11", lambda i: i < 11),
++    ("i32", [
++        "v_sub_nc_u32_e32 v1, v0, 7",
++    ], "v_cmp_gt_i32_e64 {dst}, v1, 0", lambda i: (i - 7) > 0),
++    ("f64", [
++        "v_cvt_f64_u32_e32 v[2:3], v0",
++        "v_mov_b32_e32 v4, 0",
++        "v_mov_b32_e32 v5, 0x40180000",  # 6.0
++    ], "v_cmp_lt_f64_e64 {dst}, v[2:3], v[4:5]", lambda i: i < 6),
++    ("f_f64", [
++        "v_cvt_f64_u32_e32 v[2:3], v0",
++    ], "v_cmp_f_f64_e64 {dst}, v[2:3], v[2:3]", lambda i: False),
++    ("tru_f64", [
++        "v_cvt_f64_u32_e32 v[2:3], v0",
++    ], "v_cmp_tru_f64_e64 {dst}, v[2:3], v[2:3]", lambda i: True),
++    ("u64_eq", [
++        "v_mov_b32_e32 v2, v0",
++        "v_mov_b32_e32 v3, 0",
++        "v_mov_b32_e32 v4, 4",
++        "v_mov_b32_e32 v5, 0",
++    ], "v_cmp_eq_u64_e64 {dst}, v[2:3], v[4:5]", lambda i: i == 4),
++    ("u64_lt", [
++        "v_mov_b32_e32 v2, v0",
++        "v_mov_b32_e32 v3, 0",
++        "v_mov_b32_e32 v4, 8",
++        "v_mov_b32_e32 v5, 0",
++    ], "v_cmp_lt_u64_e64 {dst}, v[2:3], v[4:5]", lambda i: i < 8),
++    ("class_f64", [
++        "v_cvt_f64_u32_e32 v[2:3], v0",  # lane 0 is +0.0 (bit 6 = 0x40); lanes >= 1 are +normal (bit 8 = 0x100)
++    ], "v_cmp_class_f64_e64 {dst}, v[2:3], 0x100", lambda i: i >= 1),
++]
++
++
++class VcmpDstWave32VccHiTests(unittest.TestCase):
++    def _native_modes(self):
++        return [(32, False), (64, False)]
++
++    def test_null_destination_preserves_vcc_and_exec(self):
++        for wave_size, emulate in self._native_modes():
++            vcc_reg = "vcc_lo" if wave_size == 32 else "vcc"
++            mov_exec = "s_mov_b32 exec_lo, -1" if wave_size == 32 else "s_mov_b64 exec, -1"
++            and_exec = "s_and_b32 exec_lo, exec_lo, vcc_lo" if wave_size == 32 else "s_and_b64 exec, exec, vcc"
++            for idx, (tag, setup, tmpl, _cond_fn) in enumerate(COMPARE_NULL_EXEC_CASES):
++                with self.subTest(wave=wave_size, emulate=emulate, case=tag):
++                    # Initial active mask: even lanes (i & 1 == 0) via v_and_b32 + v_cmp_eq_u32.
++                    lines = [
++                        "v_and_b32_e32 v10, 1, v0",
++                        "v_mov_b32_e32 v11, 0x77777777",
++                        "v_mov_b32_e32 v12, 0x88888888",
++                        f"v_cmp_eq_u32_e64 {vcc_reg}, v10, 0",
++                        *setup,
++                        and_exec,
++                        # VCC sentinel: lanes with (v0 & 3) == 2 (distinguished from active mask!)
++                        "v_and_b32_e32 v13, 3, v0",
++                        f"{mov_exec}",
++                        f"v_cmp_eq_u32_e64 {vcc_reg}, v13, 2",
++                        # Re-apply even-lane EXEC before v_cmp null, so both active and inactive lanes run null compare.
++                        "v_cmp_eq_u32_e64 s4, v10, 0" if wave_size == 32 else "v_cmp_eq_u32_e64 s[4:5], v10, 0",
++                        "s_mov_b32 exec_lo, s4" if wave_size == 32 else "s_mov_b64 exec, s[4:5]",
++                        tmpl.format(dst="null"),
++                        # Record which lanes stayed active in v11, and restore full EXEC to read VCC in v12.
++                        "v_mov_b32_e32 v11, 0x11111111",
++                        mov_exec,
++                        f"v_cndmask_b32_e64 v12, 0x22222222, 0x33333333, {vcc_reg}",
++                        "v_lshlrev_b32_e32 v14, 3, v0",
++                        "v_add_nc_u32_e32 v15, 4, v14",
++                        "buffer_store_dword v11, v14, s[0:3], 0 offen",
++                        "buffer_store_dword v12, v15, s[0:3], 0 offen",
++                    ]
++                    mem = _run_cs(f"null_{tag}_w{wave_size}_{int(emulate)}", lines,
++                                  wave_size=wave_size, emulate=emulate, validate=(idx == 0))
++                    for i in range(wave_size):
++                        got_exec = mem[i * 8]
++                        got_vcc = mem[i * 8 + 4]
++                        self.assertEqual(got_exec, 0x11111111 if (i & 1) == 0 else 0x77777777, f"lane {i} exec")
++                        self.assertEqual(got_vcc, 0x33333333 if (i & 3) == 2 else 0x22222222, f"lane {i} vcc")
++
++    def test_exec_destination_narrows_exec_without_clobbering_vcc(self):
++        for wave_size, emulate in self._native_modes():
++            vcc_reg = "vcc_lo" if wave_size == 32 else "vcc"
++            exec_reg = "exec_lo" if wave_size == 32 else "exec"
++            mov_exec = "s_mov_b32 exec_lo, -1" if wave_size == 32 else "s_mov_b64 exec, -1"
++            and_exec = "s_and_b32 exec_lo, exec_lo, s4" if wave_size == 32 else "s_and_b64 exec, exec, s[4:5]"
++            sg_dst = "s4" if wave_size == 32 else "s[4:5]"
++            for idx, (tag, setup, tmpl, cond_fn) in enumerate(COMPARE_NULL_EXEC_CASES):
++                with self.subTest(wave=wave_size, emulate=emulate, case=tag):
++                    lines = [
++                        "v_mov_b32_e32 v11, 0x55555555",
++                        # Setup runs with all lanes on so inputs are defined everywhere.
++                        *setup,
++                        # Set distinct VCC pattern: (v0 & 3) == 1
++                        "v_and_b32_e32 v13, 3, v0",
++                        f"v_cmp_eq_u32_e64 {vcc_reg}, v13, 1",
++                        # Narrow initial EXEC to lanes with (v0 & 1) == 0.
++                        "v_and_b32_e32 v10, 1, v0",
++                        f"v_cmp_eq_u32_e64 {sg_dst}, v10, 0",
++                        and_exec,
++                        # Execute compare targeting EXEC directly.
++                        tmpl.format(dst=exec_reg),
++                        "v_mov_b32_e32 v11, 0xAAAAAAAA",
++                        mov_exec,
++                        f"v_cndmask_b32_e64 v12, 0x10101010, 0x20202020, {vcc_reg}",
++                        "v_lshlrev_b32_e32 v14, 3, v0",
++                        "v_add_nc_u32_e32 v15, 4, v14",
++                        "buffer_store_dword v11, v14, s[0:3], 0 offen",
++                        "buffer_store_dword v12, v15, s[0:3], 0 offen",
++                    ]
++                    mem = _run_cs(f"exec_{tag}_w{wave_size}_{int(emulate)}", lines,
++                                  wave_size=wave_size, emulate=emulate, validate=(idx in (0, 6, 8, 11)))
++                    for i in range(wave_size):
++                        want_active = ((i & 1) == 0) and cond_fn(i)
++                        self.assertEqual(mem[i * 8], 0xAAAAAAAA if want_active else 0x55555555, f"lane {i} exec")
++                        self.assertEqual(mem[i * 8 + 4], 0x20202020 if (i & 3) == 1 else 0x10101010, f"lane {i} vcc")
++
++    def test_wave32_vcc_hi_mask_producers_and_consumers_isolate_vcc_lo(self):
++        # Producer matrix in wave32 targeting vcc_hi while vcc_lo holds lane 7 only (0x00000080).
++        producers = [
++            ("cmp_f32", [
++                "v_cvt_f32_u32_e32 v1, v0",
++                "v_cmp_lt_f32_e64 vcc_hi, v1, 5.0",
++            ], 0x0000001F),
++            ("cmp_f64", [
++                "v_cvt_f64_u32_e32 v[2:3], v0",
++                "v_mov_b32_e32 v4, 0",
++                "v_mov_b32_e32 v5, 0x40080000",  # 3.0
++                "v_cmp_lt_f64_e64 vcc_hi, v[2:3], v[4:5]",
++            ], 0x00000007),
++            ("cmp_class_f64", [
++                "v_cvt_f64_u32_e32 v[2:3], v0",
++                "v_cmp_class_f64_e64 vcc_hi, v[2:3], 0x40",  # +0.0 -> lane 0 only
++            ], 0x00000001),
++            ("cmp_eq_u64", [
++                "v_mov_b32_e32 v2, v0",
++                "v_mov_b32_e32 v3, 0",
++                "v_mov_b32_e32 v4, 19",
++                "v_mov_b32_e32 v5, 0",
++                "v_cmp_eq_u64_e64 vcc_hi, v[2:3], v[4:5]",
++            ], 1 << 19),
++            ("cmp_lt_u64", [
++                "v_mov_b32_e32 v2, v0",
++                "v_mov_b32_e32 v3, 0",
++                "v_mov_b32_e32 v4, 6",
++                "v_mov_b32_e32 v5, 0",
++                "v_cmp_lt_u64_e64 vcc_hi, v[2:3], v[4:5]",
++            ], 0x0000003F),
++            ("add_co", [
++                "v_mov_b32_e32 v1, 0xFFFFFFFF",
++                "v_cmp_lt_u32_e64 s6, v0, 4",
++                "v_cndmask_b32_e64 v2, 0, 1, s6",
++                "v_add_co_u32 v3, vcc_hi, v1, v2",
++            ], 0x0000000F),
++            ("mad_u64", [
++                "v_cmp_lt_u32_e64 s6, v0, 3",
++                "v_cndmask_b32_e64 v2, 1, 0xFFFFFFFF, s6",
++                "v_mov_b32_e32 v4, 0",
++                "v_mov_b32_e32 v5, 0xFFFFFFFF",
++                "v_mad_u64_u32 v[6:7], vcc_hi, v2, 0x10000000, v[4:5]",
++            ], 0x00000007),
++            ("saveexec", [
++                "v_cmp_lt_u32_e64 s6, v0, 2",
++                "s_and_saveexec_b32 vcc_hi, s6",
++                "s_mov_b32 exec_lo, -1",
++            ], 0xFFFFFFFF),
++        ]
++
++        for tag, prod_lines, want_mask in producers:
++            with self.subTest(producer=tag):
++                lines = [
++                    "v_cmp_eq_u32_e64 vcc_lo, v0, 7",
++                    *prod_lines,
++                    # Consumers reading vcc_hi as a lane mask:
++                    "v_cndmask_b32_e64 v10, 0, 1, vcc_hi",          # per-lane bit of vcc_hi
++                    "v_add_co_ci_u32_e64 v11, s8, 10, 0, vcc_hi",    # 10 + carry_in(vcc_hi)
++                    "s_bcnt1_i32_b32 s9, vcc_hi",                    # popcount of whole wave
++                    "v_mov_b32_e32 v12, s9",
++                    "v_mbcnt_lo_u32_b32 v13, vcc_hi, 0",             # prefix count
++                    "s_cmp_eq_u32 vcc_hi, 0",                        # 1 iff mask == 0
++                    "s_cselect_b32 s10, 1, 0",
++                    "v_mov_b32_e32 v14, s10",
++                    "v_cndmask_b32_e32 v15, 0, 1, vcc_lo",           # verify vcc_lo still only lane 7
++                    "v_mul_i32_i24_e32 v16, 24, v0",
++                    "buffer_store_dword v10, v16, s[0:3], 0 offen",
++                    "v_add_nc_u32_e32 v16, 4, v16",
++                    "buffer_store_dword v11, v16, s[0:3], 0 offen",
++                    "v_add_nc_u32_e32 v16, 4, v16",
++                    "buffer_store_dword v12, v16, s[0:3], 0 offen",
++                    "v_add_nc_u32_e32 v16, 4, v16",
++                    "buffer_store_dword v13, v16, s[0:3], 0 offen",
++                    "v_add_nc_u32_e32 v16, 4, v16",
++                    "buffer_store_dword v14, v16, s[0:3], 0 offen",
++                    "v_add_nc_u32_e32 v16, 4, v16",
++                    "buffer_store_dword v15, v16, s[0:3], 0 offen",
++                ]
++                mem = _run_cs(f"w32_vcchi_{tag}", lines, wave_size=32, emulate=False, validate=True)
++                pop = bin(want_mask).count("1")
++                for i in range(32):
++                    bit = (want_mask >> i) & 1
++                    prefix = bin(want_mask & ((1 << i) - 1)).count("1")
++                    base = i * 24
++                    self.assertEqual(mem[base], bit, f"{tag} lane {i} cndmask")
++                    self.assertEqual(mem[base + 4], 10 + bit, f"{tag} lane {i} add_co_ci")
++                    self.assertEqual(mem[base + 8], pop, f"{tag} lane {i} s_bcnt1")
++                    self.assertEqual(mem[base + 12], prefix, f"{tag} lane {i} v_mbcnt")
++                    self.assertEqual(mem[base + 16], 1 if want_mask == 0 else 0, f"{tag} lane {i} s_cmp_eq")
++                    self.assertEqual(mem[base + 20], 1 if i == 7 else 0, f"{tag} lane {i} vcc_lo isolated")
++
++        # s_wqm_b32 vcc_hi, s6: validate both CS (QuadSwap) and VS semantic execution (run_wave).
++        wqm_lines = [
++            "v_cmp_eq_u32_e64 vcc_lo, v0, 7",
++            "v_cmp_eq_u32_e64 s6, v0, 5",
++            "s_wqm_b32 vcc_hi, s6",
++            "v_cndmask_b32_e64 v10, 0, 1, vcc_hi",
++            "v_add_co_ci_u32_e64 v11, s8, 10, 0, vcc_hi",
++            "s_bcnt1_i32_b32 s9, vcc_hi",
++            "v_mov_b32_e32 v12, s9",
++            "v_cndmask_b32_e32 v15, 0, 1, vcc_lo",
++        ]
++        _validate_spirv("w32_vcchi_wqm_cs", _translate_cs("w32_vcchi_wqm_cs", wqm_lines, wave_size=32))
++        vs_out = _run_vs_w32("w32_vcchi_wqm_vs", wqm_lines)
++        for i in range(32):
++            bit = 1 if 4 <= i < 8 else 0
++            self.assertEqual(vs_out[i], (bit, 10 + bit, 4, 1 if i == 7 else 0), f"wqm lane {i}")
++
++    def test_wave32_vcc_hi_plain_data_scalar_and_mask_reads_preserve_vcc_lo(self):
++        # 0xA5000005 sets bits {0, 2, 24, 26, 29, 31}; 6 bits total.
++        data_word = 0xA5000005
++        lines = [
++            "v_cmp_eq_u32_e64 vcc_lo, v0, 7",
++            f"s_mov_b32 vcc_hi, {data_word:#x}",
++            "s_mov_b32 s4, vcc_hi",                              # scalar read -> 0xA5000005
++            "v_mov_b32_e32 v10, s4",
++            "s_bcnt1_i32_b32 s5, vcc_hi",                        # popcount of scalar word -> 6
++            "v_mov_b32_e32 v11, s5",
++            "v_cndmask_b32_e64 v12, 0x100, 0x200, vcc_hi",       # per-lane bit of 0xA5000005!
++            "v_add_co_ci_u32_e64 v13, s6, 20, 0, vcc_hi",        # 20 + bit(lane, 0xA5000005)
++            # Plain-data s_wqm_b32 into vcc_hi -> 0xF (scalar AND bitmask lanes 0..3) while preserving vcc_lo.
++            "s_wqm_b32 vcc_hi, 0x1",
++            "s_mov_b32 s7, vcc_hi",
++            "v_mov_b32_e32 v14, s7",
++            "v_cndmask_b32_e64 v15, 0, 1, vcc_hi",
++            "v_cndmask_b32_e32 v16, 0, 1, vcc_lo",
++            "v_mul_i32_i24_e32 v17, 28, v0",
++            "buffer_store_dword v10, v17, s[0:3], 0 offen",
++            "v_add_nc_u32_e32 v17, 4, v17",
++            "buffer_store_dword v11, v17, s[0:3], 0 offen",
++            "v_add_nc_u32_e32 v17, 4, v17",
++            "buffer_store_dword v12, v17, s[0:3], 0 offen",
++            "v_add_nc_u32_e32 v17, 4, v17",
++            "buffer_store_dword v13, v17, s[0:3], 0 offen",
++            "v_add_nc_u32_e32 v17, 4, v17",
++            "buffer_store_dword v14, v17, s[0:3], 0 offen",
++            "v_add_nc_u32_e32 v17, 4, v17",
++            "buffer_store_dword v15, v17, s[0:3], 0 offen",
++            "v_add_nc_u32_e32 v17, 4, v17",
++            "buffer_store_dword v16, v17, s[0:3], 0 offen",
++        ]
++        mem = _run_cs("w32_vcchi_data", lines, wave_size=32, emulate=False, validate=True)
++        for i in range(32):
++            bit = (data_word >> i) & 1
++            base = i * 28
++            self.assertEqual(mem[base], data_word, f"lane {i} scalar read")
++            self.assertEqual(mem[base + 4], 6, f"lane {i} bcnt1 data")
++            self.assertEqual(mem[base + 8], 0x200 if bit else 0x100, f"lane {i} cndmask data")
++            self.assertEqual(mem[base + 12], 20 + bit, f"lane {i} co_ci data")
++            self.assertEqual(mem[base + 16], 0xF, f"lane {i} s_wqm scalar")
++            self.assertEqual(mem[base + 20], 1 if i < 4 else 0, f"lane {i} s_wqm mask bit")
++            self.assertEqual(mem[base + 24], 1 if i == 7 else 0, f"lane {i} vcc_lo isolated")
++
++    def test_wave32_vcc_hi_overwrite_data_and_cmp_with_vcc_lo(self):
++        # First hold a mask in vcc_hi, verify s_cmp_eq_u32 vcc_hi, vcc_lo; then overwrite vcc_hi with data
++        # and verify vcc_lo still behaves as a mask while vcc_hi behaves as data.
++        lines = [
++            "v_cmp_lt_u32_e64 vcc_lo, v0, 4",
++            "v_cmp_lt_u32_e64 vcc_hi, v0, 4",
++            "s_cmp_eq_u32 vcc_hi, vcc_lo",
++            "s_cselect_b32 s4, 1, 0",
++            "v_mov_b32_e32 v10, s4",
++            "s_mov_b32 vcc_hi, 0x10",          # lane 4 bit set -> only lane 4 when read by v_cndmask
++            "s_bcnt1_i32_b32 s5, vcc_lo",      # still 4
++            "v_mov_b32_e32 v11, s5",
++            "v_cndmask_b32_e64 v12, 0, 1, vcc_hi",
++            "v_cndmask_b32_e32 v13, 0, 1, vcc_lo",
++            "v_mul_i32_i24_e32 v14, 16, v0",
++            "buffer_store_dword v10, v14, s[0:3], 0 offen",
++            "v_add_nc_u32_e32 v14, 4, v14",
++            "buffer_store_dword v11, v14, s[0:3], 0 offen",
++            "v_add_nc_u32_e32 v14, 4, v14",
++            "buffer_store_dword v12, v14, s[0:3], 0 offen",
++            "v_add_nc_u32_e32 v14, 4, v14",
++            "buffer_store_dword v13, v14, s[0:3], 0 offen",
++        ]
++        mem = _run_cs("w32_vcchi_cmp_overwrite", lines, wave_size=32, emulate=False, validate=True)
++        for i in range(32):
++            base = i * 16
++            self.assertEqual(mem[base], 1, f"lane {i} vcc_hi == vcc_lo")
++            self.assertEqual(mem[base + 4], 4, f"lane {i} bcnt1(vcc_lo)")
++            self.assertEqual(mem[base + 8], 1 if i == 4 else 0, f"lane {i} data vcc_hi")
++            self.assertEqual(mem[base + 12], 1 if i < 4 else 0, f"lane {i} mask vcc_lo")
++
++    def test_wave64_emulate_null_and_exec_destinations_validate(self):
++        # Validate every compare/class family with null and exec destinations under --wave64-emulate,
++        # and confirm standalone null writes emit no %vcc / %active store while exec writes update %active.
++        for tag, setup, tmpl, _ in COMPARE_NULL_EXEC_CASES:
++            with self.subTest(case=tag, dst="null"):
++                spv = _translate_cs(f"emu_null_{tag}", [*setup, tmpl.format(dst="null")], wave_size=64, emulate=True)
++                _validate_spirv(f"emu_null_{tag}", spv)
++                self.assertNotIn("OpStore %vcc ", spv)
++                self.assertNotIn("OpStore %active ", spv)
++            with self.subTest(case=tag, dst="exec"):
++                spv = _translate_cs(f"emu_exec_{tag}", [*setup, tmpl.format(dst="exec")], wave_size=64, emulate=True)
++                _validate_spirv(f"emu_exec_{tag}", spv)
++                self.assertNotIn("OpStore %vcc ", spv)
++                self.assertIn("OpStore %active ", spv)
++
++    def test_negative_controls_invalid_compare_destinations(self):
++        invalid = [
++            (32, "v_cmp_lt_f32_e64 v2, v0, v1"),
++            (32, "v_cmp_lt_f64_e64 v2, v[0:1], v[2:3]"),
++            (32, "v_cmp_class_f64_e64 v2, v[0:1], 1"),
++            (32, "v_cmp_lt_f32_e64 1, v0, v1"),
++            (64, "v_cmp_lt_f32_e64 vcc_hi, v0, v1"),
++            (64, "v_cmp_lt_f64_e64 vcc_hi, v[0:1], v[2:3]"),
++            (64, "v_cmp_class_f64_e64 vcc_hi, v[0:1], 1"),
++            (64, "v_cmp_class_f64_e64 exec_hi, v[0:1], 1"),
++        ]
++        for wave_size, bad in invalid:
++            with self.subTest(wave=wave_size, insn=bad):
++                with self.assertRaises(rdna2spirv.Unsupported) as ctx:
++                    _translate_cs("bad_vcmp_dst", [bad], wave_size=wave_size)
++                self.assertIn("destination", str(ctx.exception))
++
++
++if __name__ == "__main__":
++    unittest.main()
+diff --git a/tests/test_lane_masks.py b/tests/test_lane_masks.py
+index 88040204f..d83c1544f 100644
+--- a/tests/test_lane_masks.py
++++ b/tests/test_lane_masks.py
+@@ -318,6 +318,64 @@ def test_v_and_or_xnor_bfi_track_vector_masks():
+         assert id(bad) not in writes, bad["op"]
+         assert 7 not in out[id(bad_use)] and ("v", 6) not in out[id(bad_use)], bad["op"]
+ 
++def test_wave32_vcc_hi_isolation():
++    use = ins("s_nop", imm(0))
++    vcmp_lo = ins("v_cmp_eq_u32_e64", sp("vcc_lo"), v(0), imm(1))
++    vcmp_hi = ins("v_cmp_lt_f32_e64", sp("vcc_hi"), v(0), v(1))
++
++    # In wave32, writing plain data to vcc_hi does not clear vcc (vcc_lo), and vice versa.
++    m_data_hi = L.analyse(
++        [[vcmp_lo, vcmp_hi, ins("s_mov_b32", sp("vcc_hi"), imm(0x5)), use]],
++        [[]],
++        wave64=False,
++    )[0][id(use)]
++    assert m_data_hi == {"vcc": L.MASK}
++
++    m_data_lo = L.analyse(
++        [[vcmp_lo, vcmp_hi, ins("s_mov_b32", sp("vcc_lo"), imm(0x5)), use]],
++        [[]],
++        wave64=False,
++    )[0][id(use)]
++    assert m_data_lo == {"vcc_hi": L.MASK}
++
++    # v_add_co_u32 / v_mad_u64_u32 / s_and_saveexec_b32 / s_wqm_b32 writing vcc_hi in wave32 produce a vcc_hi mask
++    # without clobbering vcc, and s_mov_b32 vcc_hi, s_mask vs s_mov_b32 s_dst, vcc_hi propagate it.
++    for hi_prod in (
++        ins("v_add_co_u32", v(2), sp("vcc_hi"), v(0), v(1)),
++        ins("v_mad_u64_u32", {"k": "vgpr", "r": 2, "n": 2}, sp("vcc_hi"), v(0), v(1), {"k": "vgpr", "r": 4, "n": 2}),
++        ins("s_and_saveexec_b32", sp("vcc_hi"), sp("vcc")),
++        ins("s_wqm_b32", sp("vcc_hi"), sp("vcc_lo")),
++    ):
++        got = L.analyse([[vcmp_lo, hi_prod, ins("s_mov_b32", s(4), sp("vcc_hi")), use]], [[]], wave64=False)[0][id(use)]
++        assert got == {"vcc": L.MASK, "vcc_hi": L.MASK, 4: L.MASK}, hi_prod["op"]
++
++    # CFG join: mask on one branch, EITHER (0/-1) on the other preserves vcc_hi as MASK in wave32;
++    # mask vs plain data drops vcc_hi while keeping vcc.
++    out_join = L.analyse(
++        [[vcmp_lo], [vcmp_hi], [ins("s_mov_b32", sp("vcc_hi"), imm(-1))], [use]],
++        [[1, 2], [3], [3], []],
++        wave64=False,
++    )[0][id(use)]
++    assert out_join == {"vcc": L.MASK, "vcc_hi": L.MASK}
++
++    out_drop = L.analyse(
++        [[vcmp_lo], [vcmp_hi], [ins("s_mov_b32", sp("vcc_hi"), imm(0x5))], [use]],
++        [[1, 2], [3], [3], []],
++        wave64=False,
++    )[0][id(use)]
++    assert out_drop == {"vcc": L.MASK}
++
++    # In wave64, plain-data writes to vcc_hi still clear vcc as a single 64-bit mask.
++    out_w64 = L.analyse(
++        [[ins("v_cmp_lt_u32_e64", sp("vcc"), v(0), imm(32)),
++          ins("s_mov_b32", sp("vcc_hi"), imm(0x5)),
++          use]],
++        [[]],
++        wave64=True,
++    )[0][id(use)]
++    assert out_w64 == {}
++
++
+ if __name__ == "__main__":
+     test_straight_line()
+     test_joins()
+@@ -328,4 +386,5 @@ if __name__ == "__main__":
+     test_b64_mask_imm_and_include_either()
+     test_writelane_sdwa_dpp_swaps_stores_and_div_scale()
+     test_v_and_or_xnor_bfi_track_vector_masks()
++    test_wave32_vcc_hi_isolation()
+     print("ok")
+diff --git a/tools/lane_masks.py b/tools/lane_masks.py
+index 616c4a30e..db1fc8047 100644
+--- a/tools/lane_masks.py
++++ b/tools/lane_masks.py
+@@ -60,17 +60,17 @@ def base_op(op):
+     return op
+ 
+ 
+-def kind(state, a):
++def kind(state, a, wave64=True):
+     if a["k"] == "special":
+         t = a.get("t", "")
+-        if t == "exec_lo":
+-            return MASK_LO
+-        if t == "exec_hi":
+-            return MASK_HI
+-        if t == "exec":
+-            return MASK
+-        if t == "vcc":
++        if t in ("exec_lo", "exec_hi", "exec"):
++            if not wave64:
++                return MASK
++            return MASK_LO if t == "exec_lo" else (MASK_HI if t == "exec_hi" else MASK)
++        if t == "vcc" or (not wave64 and t == "vcc_lo"):
+             return state.get("vcc")
++        if not wave64 and t == "vcc_hi":
++            return state.get("vcc_hi")
+         if t in ("vcc_lo", "vcc_hi"):
+             vk = state.get("vcc")
+             if vk in MASK_KINDS:
+@@ -92,7 +92,7 @@ def kind(state, a):
+     return None
+ 
+ 
+-def put(state, a, k):
++def put(state, a, k, wave64=True):
+     if a["k"] == "sgpr":
+         n = a.get("n", 1)
+         if k == MASK and n == 2:
+@@ -101,9 +101,14 @@ def put(state, a, k):
+             return
+         regs = [a["r"] + i for i in range(n)]
+     elif a["k"] == "slist":
+-        regs = [r if isinstance(r, int) else "vcc" for r in a["r"]]
+-    elif a["k"] == "special" and a.get("t") == "vcc":
++        regs = [
++            r if isinstance(r, int) else ("vcc_hi" if (r == "vcc_hi" and not wave64) else "vcc")
++            for r in a["r"]
++        ]
++    elif a["k"] == "special" and (a.get("t") == "vcc" or (not wave64 and a.get("t") == "vcc_lo")):
+         regs = ["vcc"]
++    elif a["k"] == "special" and not wave64 and a.get("t") == "vcc_hi":
++        regs = ["vcc_hi"]
+     elif a["k"] == "special" and a.get("t") in ("vcc_lo", "vcc_hi"):
+         # A mask / 0 / -1 half-write updates that half of %vcc in wave64 (put_mask), keeping VCC a lane mask;
+         # a plain-data half-write (k is None) ends VCC's life as one lane mask.
+@@ -152,22 +157,22 @@ def step(state, ins, wave64=True):
+     if op.startswith("ds_") and not op.startswith(DS_HAS_DST) and "_rtn" not in op:
+         return
+     if op == "v_readfirstlane_b32" and len(a) == 2:                             # sD = vS, the same in every lane
+-        put(state, a[0], kind(state, a[1]))
++        put(state, a[0], kind(state, a[1], wave64), wave64)
+         return
+     if op == "v_writelane_b32" and len(a) == 3 and lane_slot(a[0], a[2]):       # vD[lane] = sS
+         state.pop(("v", a[0]["r"]), None)
+-        k = kind(state, a[1])
++        k = kind(state, a[1], wave64)
+         if k is None:
+             state.pop(lane_slot(a[0], a[2]), None)
+         else:
+             state[lane_slot(a[0], a[2])] = k
+         return
+     if op == "v_readlane_b32" and len(a) == 3:                                  # sD = vS[lane]
+-        put(state, a[0], state.get(lane_slot(a[1], a[2])))
++        put(state, a[0], state.get(lane_slot(a[1], a[2])), wave64)
+         return
+     if op.startswith("v_cmp"):
+         # Handle v_cmp before VGPR clobber (defensive for 2-operand forms with implicit vcc).
+-        put(state, {"k": "special", "t": "vcc"} if len(a) == 2 else a[0], MASK)
++        put(state, {"k": "special", "t": "vcc"} if len(a) == 2 else a[0], MASK, wave64)
+         return
+     if op == "v_swap_b32":
+         written = set()
+@@ -198,7 +203,7 @@ def step(state, ins, wave64=True):
+                       and not ins["op"].endswith(("_sdwa", "_dpp", "_dpp8"))
+                       and not mods
+                       and not any(x.get("neg") or x.get("abs") or x.get("sext") for x in a[1:]))
+-        kinds = [kind(state, x) for x in a[1:]] if plain_valu else [None]
++        kinds = [kind(state, x, wave64) for x in a[1:]] if plain_valu else [None]
+         written = range(a[0]["r"], a[0]["r"] + a[0].get("n", 1))
+         for key in [k for k in state if isinstance(k, tuple) and k[1] in written]:
+             del state[key]
+@@ -210,45 +215,45 @@ def step(state, ins, wave64=True):
+             # because whole-wave readers (wave_mask, v_readfirstlane) read every lane's bit.
+             return op != "v_mov_b32"
+     if "_saveexec_b" in op or "_wrexec_b" in op:
+-        put(state, a[0], MASK_LO if op.endswith("_b32") else MASK)
++        put(state, a[0], MASK_LO if (wave64 and op.endswith("_b32")) else MASK, wave64)
+     elif op == "s_bfm_b64":
+         # In wave32 code it is 64-bit data, e.g. the first two words of an S# built in place (the pipeline library's
+         # wave32 compute programs: s_bfm_b64 s[88:89], 2, 54); rdna2spirv computes the value there.
+-        put(state, a[0], MASK if wave64 else None)
++        put(state, a[0], MASK if wave64 else None, wave64)
+     elif op.startswith(COPIES) and len(a) > 1:
+-        k = kind(state, a[1])
++        k = kind(state, a[1], wave64)
+         dst_t = a[0].get("t") if a[0]["k"] == "special" else None
+         if k in (None, EITHER) and op.endswith("b64") and dst_t in ("vcc", "vcc_lo") and a[1]["k"] == "imm":
+             k = MASK
+         elif op == "s_not_b32" and dst_t in ("vcc", "vcc_lo") and _maskable_b32(a[1]):
+             k = MASK
+-        elif op == "s_not_b32" and dst_t == "vcc_hi" and state.get("vcc") in MASK_KINDS and _maskable_b32(a[1]):
++        elif op == "s_not_b32" and dst_t == "vcc_hi" and wave64 and state.get("vcc") in MASK_KINDS and _maskable_b32(a[1]):
+             return
+-        put(state, a[0], k)
++        put(state, a[0], k, wave64)
+     elif op.startswith(BITWISE):
+-        kinds = [kind(state, x) for x in a[1:]]
++        kinds = [kind(state, x, wave64) for x in a[1:]]
+         ms = {k for k in kinds if k in MASK_KINDS}
+         dst_t = a[0].get("t") if a[0]["k"] == "special" else None
+         if None not in kinds:
+-            if op.endswith("b32") and dst_t == "vcc_hi" and state.get("vcc") in MASK_KINDS:
++            if op.endswith("b32") and dst_t == "vcc_hi" and wave64 and state.get("vcc") in MASK_KINDS:
+                 return
+             fallback = MASK if op.endswith("b64") and dst_t in ("vcc", "vcc_lo") else EITHER
+-            put(state, a[0], (ms.pop() if len(ms) == 1 else MASK) if ms else fallback)
++            put(state, a[0], (ms.pop() if len(ms) == 1 else MASK) if ms else fallback, wave64)
+         elif op.endswith("b64") and (ms or dst_t in ("vcc", "vcc_lo")) and \
+                 all(k is not None or x["k"] == "imm" for k, x in zip(kinds, a[1:])):
+-            put(state, a[0], (ms.pop() if len(ms) == 1 else MASK) if ms else MASK)
++            put(state, a[0], (ms.pop() if len(ms) == 1 else MASK) if ms else MASK, wave64)
+         elif op.endswith("b32") and dst_t in ("vcc", "vcc_lo") and all(_maskable_b32(x) for x in a[1:]):
+-            put(state, a[0], MASK)
+-        elif op.endswith("b32") and dst_t == "vcc_hi" and state.get("vcc") in MASK_KINDS and \
++            put(state, a[0], MASK, wave64)
++        elif op.endswith("b32") and dst_t == "vcc_hi" and wave64 and state.get("vcc") in MASK_KINDS and \
+                 all(_maskable_b32(x) for x in a[1:]):
+             return
+         else:
+-            put(state, a[0], None)
++            put(state, a[0], None, wave64)
+     else:
+-        put(state, a[0], None)
++        put(state, a[0], None, wave64)
+         if ((op.startswith("v_") and "_co_" in op)
+                 or op in ("v_mad_u64_u32", "v_mad_i64_i32", "v_div_scale_f32", "v_div_scale_f64")) and len(a) > 1:
+-            put(state, a[1], MASK)                      # carry/sign/scale lane mask of VOP3b ops
++            put(state, a[1], MASK, wave64)                      # carry/sign/scale lane mask of VOP3b ops
+ 
+ 
+ def parked(blocks, masks):
+diff --git a/tools/rdna2spirv.py b/tools/rdna2spirv.py
+index 4800aa31b..13c2e12d5 100644
+--- a/tools/rdna2spirv.py
++++ b/tools/rdna2spirv.py
+@@ -1514,7 +1514,7 @@ class Gen:
+                 r = x["r"]
+                 if r not in st and self.sgpr_imm.get(r) in (0, 0xFFFFFFFF):
+                     st[r] = lane_masks.EITHER
+-        lane_masks.step(st, self.cur_ins)
++        lane_masks.step(st, self.cur_ins, self.wave64)
+         return st.get("vcc") in lane_masks.MASK_KINDS
+ 
+     def dst(self, a, val, *, eager=False):
+@@ -1772,25 +1772,7 @@ class Gen:
+                    "eq": "OpIEqual", "ne": "OpINotEqual", "lg": "OpINotEqual"}
+         elif ty == "f64" and not scalar:
+             b = self.compare_f64_cond(op, cond, srcs, mods)
+-            r = self.tmp()
+-            bm = b
+-            if not exec_only:
+-                bm = self.tmp()
+-                self.emit(f"{bm} = OpLogicalAnd %bool {b} {self.active_b()}")
+-            self.emit(f"{r} = OpSelect %uint {bm} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+-            if dst is None:          # v_cmpx: EXEC &= cond
+-                a2 = self.tmp()
+-                self.emit(f"{a2} = OpLoad %bool %active")
+-                a3 = self.tmp()
+-                self.emit(f"{a3} = OpLogicalAnd %bool {a2} {b}")
+-                self.emit(f"OpStore %active {a3}")
+-                self.uses_active = True
+-            elif dst["k"] == "special" and dst["t"] in ("vcc", "vcc_lo"):
+-                self.emit(f"OpStore %vcc {r}")
+-            elif dst["k"] == "sgpr":
+-                self.mask_dst(dst, r)
+-            else:
+-                raise Unsupported("v_cmp destination")
++            self.write_compare_result(b, dst, False, exec_only)
+             return
+         else:
+             raise Unsupported(op)
+@@ -1843,12 +1825,8 @@ class Gen:
+             self.emit(f"{a3} = OpLogicalAnd %bool {a2} {b}")
+             self.emit(f"OpStore %active {a3}")
+             self.uses_active = True
+-        elif dst["k"] == "special" and dst["t"] in ("vcc", "vcc_lo"):
+-            self.emit(f"OpStore %vcc {r}")
+-        elif dst["k"] == "sgpr":
+-            self.mask_dst(dst, r)
+         else:
+-            raise Unsupported("v_cmp destination")
++            self.mask_dst(dst, r)
+ 
+     def compare_x(self, op, a, mods=()):
+         """v_cmpx_*: like v_cmp but the result ANDs into EXEC. e32 form has only the two sources; e64 also names
+@@ -4344,11 +4322,7 @@ class Gen:
+             self.uses_active = True
+             return
+         r = b(f"OpSelect %uint {acc} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+-        d = a[0]
+-        if len(a) == 2 or (d["k"] == "special" and d["t"] in ("vcc", "vcc_lo")):
+-            self.emit(f"OpStore %vcc {r}")
+-        else:
+-            self.mask_dst(d, r)
++        self.mask_dst({"k": "special", "t": "vcc"} if len(a) == 2 else a[0], r)
+ 
+     @staticmethod
+     def mod_int(mods, name, default):
+@@ -4367,10 +4341,8 @@ class Gen:
+         else:
+             if len(a) not in (2, 3):
+                 raise Unsupported(op + " operands")
+-            if len(a) == 3:
+-                d = a[0]
+-                if not (d["k"] == "sgpr" or (d["k"] == "special" and d["t"] in ("vcc", "vcc_lo"))):
+-                    raise Unsupported(op + " destination")
++            if len(a) == 3 and not self.is_mask_dst(a[0]):
++                raise Unsupported(op + " destination")
+         src0, mask_op = a[-2], a[-1]
+         if mask_op.get("n", 1) != 1 or mask_op.get("abs") or mask_op.get("neg"):
+             raise Unsupported(op + " mask")
+@@ -4443,11 +4415,7 @@ class Gen:
+             self.uses_active = True
+             return
+         r = b(f"OpSelect %uint {acc} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+-        d = a[0]
+-        if len(a) == 2 or (d["k"] == "special" and d["t"] in ("vcc", "vcc_lo")):
+-            self.emit(f"OpStore %vcc {r}")
+-        else:
+-            self.mask_dst(d, r)
++        self.mask_dst({"k": "special", "t": "vcc"} if len(a) == 2 else a[0], r)
+ 
+     # LDS atomics (non-returning name -> SPIR-V atomic); _rtn_ forms share the entry.
+     LDS_ATOMICS = {"ds_add_u32": "OpAtomicIAdd", "ds_sub_u32": "OpAtomicISub", "ds_min_u32": "OpAtomicUMin",
+@@ -5668,6 +5636,8 @@ class Gen:
+ 
+     def mask_half(self, a):
+         """For a 32-bit lane-mask operand in wave64, return 'lo' (lanes 0-31), 'hi' (lanes 32-63), or None."""
++        if not self.wave64:
++            return None
+         if a["k"] == "special":
+             t = a.get("t", "")
+             if t in ("exec_lo", "vcc_lo"):
+@@ -5719,8 +5689,13 @@ class Gen:
+         written as a mask on every path. An SGPR pair filled from a buffer (a light mask, say) is data."""
+         if a["k"] == "special":
+             t = a.get("t", "")
+-            return t.startswith("exec") or (t in ("vcc", "vcc_lo") and "vcc" in self.cur_masks) or \
+-                (t == "vcc_hi" and self.wave64 and "vcc" in self.cur_masks)
++            if t.startswith("exec"):
++                return True
++            if t in ("vcc", "vcc_lo"):
++                return "vcc" in self.cur_masks
++            if t == "vcc_hi":
++                return ("vcc" if self.wave64 else "vcc_hi") in self.cur_masks
++            return False
+         if a["k"] == "sgpr":
+             n = a.get("n", 1)
+             if n == 2:
+@@ -5759,7 +5734,8 @@ class Gen:
+                 toks = tuple(self.x_tok.get(("sgpr", a["r"] + i), ("start", a["r"] + i)) for i in range(a.get("n", 1)))
+                 key = ("v", self.x_gen, toks)
+             elif a["k"] == "special" and a["t"] in ("vcc", "vcc_lo", "vcc_hi"):
+-                key = ("v", self.x_gen, self.x_tok.get("%vcc", ("start", "vcc")))
++                reg = "%vcc_hi" if (a["t"] == "vcc_hi" and not self.wave64) else "%vcc"
++                key = ("v", self.x_gen, self.x_tok.get(reg, ("start", reg[1:])))
+             if key in self.x_mcache:
+                 return self.x_mcache[key]
+         mine = self.tmp_bool_nz(self.exec_value() if special else self.mask_src(a))
+@@ -5912,6 +5888,8 @@ class Gen:
+             self.store_reg("sgpr", d["r"], res[0])
+             if len(res) == 2:
+                 self.store_reg("sgpr", d["r"] + 1, res[1])
++        elif not self.wave64 and d["k"] == "special" and d.get("t") == "vcc_hi":
++            self.emit(f"OpStore %vcc_hi {res[0]}")
+         else:
+             # EXEC / VCC filled from data: this lane takes its own bit of the result.
+             lane = self.wave_lane()
+@@ -5943,6 +5921,17 @@ class Gen:
+         self.emit(f"{hi_in} = OpSelect %uint {low} {self.cu(0)} {v}")
+         return lo_in, hi_in
+ 
++    def _scalar_word_lane_bit(self, word, lane=None):
++        """Extract bit (lane & 31) of 32-bit scalar word as 0xFFFFFFFF / 0 for plain-data mask reads."""
++        if lane is None:
++            lane = self.wave_lane()
++        sh, shr, bit, r = (self.tmp() for _ in range(4))
++        self.emit(f"{sh} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
++        self.emit(f"{shr} = OpShiftRightLogical %uint {word} {sh}")
++        self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
++        self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
++        return r
++
+     def mask_src(self, a, wide=True):
+         """A lane mask operand (sgpr pair, vcc, exec, imm) as one uint for this lane. A constant is a mask with one
+         bit per lane, so lane L takes its bit L: of the 64-bit value (`wide`, the default: a 64-bit SALU operand or
+@@ -5970,14 +5959,13 @@ class Gen:
+                 self.emit(f"{up} = OpUGreaterThanEqual %bool {lane} {self.cu(32)}")
+                 self.emit(f"{sel} = OpSelect %uint {up} {hi} {word}")
+                 word = sel
+-            sh, shr, bit, r = (self.tmp() for _ in range(4))
+-            self.emit(f"{sh} = OpBitwiseAnd %uint {lane} {self.cu(31)}")
+-            self.emit(f"{shr} = OpShiftRightLogical %uint {word} {sh}")
+-            self.emit(f"{bit} = OpBitwiseAnd %uint {shr} {self.cu(1)}")
+-            self.emit(f"{r} = OpSelect %uint {self.tmp_bool_nz(bit)} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+-            return r
++            return self._scalar_word_lane_bit(word, lane)
+         if a["k"] == "special" and a["t"] == "null":
+             return self.cu(0)
++        if a["k"] == "special" and a["t"] == "vcc_hi" and not self.wave64:
++            v = self.tmp()
++            self.emit(f"{v} = OpLoad %uint %vcc_hi")
++            return v if self.holds_lane_mask(a) else self._scalar_word_lane_bit(v)
+         if a["k"] == "special" and a["t"] in ("vcc", "vcc_lo", "vcc_hi"):
+             v = self.tmp()
+             self.emit(f"{v} = OpLoad %uint %vcc")
+@@ -6070,8 +6058,21 @@ class Gen:
+             r = t
+         return r
+ 
++    def is_mask_dst(self, d):
++        """Whether `d` is a valid scalar lane-mask destination for VALU mask instructions (e.g. v_cmp_*_e64)."""
++        k, t = d["k"], d.get("t")
++        return (
++            k == "sgpr"
++            or (k == "special" and (
++                t in ("exec", "exec_lo", "null", "vcc", "vcc_lo")
++                or (t == "vcc_hi" and not self.wave64)
++            ))
++        )
++
+     def mask_dst(self, d, v):
+-        if d["k"] == "special" and d["t"] in ("exec", "exec_lo"):
++        if self.wave64 and d["k"] == "special" and d["t"] in ("exec_lo", "exec_hi"):
++            self.exec_half_write(1 if d["t"] == "exec_hi" else 0, v)
++        elif d["k"] == "special" and d["t"] in ("exec", "exec_lo"):
+             self.set_exec(v)
+         elif d["k"] == "special" and d["t"] == "null":
+             return
+@@ -6081,6 +6082,8 @@ class Gen:
+                 self.store_reg("sgpr", d["r"] + 1, v)
+         elif d["k"] == "special" and d["t"] in ("vcc", "vcc_lo"):
+             self.emit(f"OpStore %vcc {v}")
++        elif d["k"] == "special" and d["t"] == "vcc_hi" and not self.wave64:
++            self.emit(f"OpStore %vcc_hi {v}")
+         else:
+             raise Unsupported("mask destination")
+ 
+@@ -8212,10 +8215,7 @@ class Gen:
+                 self.uses_active = True
+                 return
+             self.emit(f"{r} = OpSelect %uint {ra} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+-            if d["k"] == "special" and d["t"] in ("vcc", "vcc_lo"):
+-                self.emit(f"OpStore %vcc {r}")
+-            else:
+-                self.mask_dst(d, r)
++            self.mask_dst(d, r)
+         elif op == "v_alignbit_b32":
+             # (({src0, src1} as 64 bits) >> (src2 & 31)) low 32 bits
+             # (32 - m) & 31 keeps the left shift below 32 when m == 0; that result is discarded by the OpSelect.
+@@ -9004,10 +9004,7 @@ class Gen:
+                 eqa = self.tmp()
+                 self.emit(f"{eqa} = OpLogicalAnd %bool {eq} {self.active_b()}")   # inactive lanes write 0
+                 self.emit(f"{r} = OpSelect %uint {eqa} {self.cu(0xFFFFFFFF)} {self.cu(0)}")
+-                if d["k"] == "special" and d["t"] in ("vcc", "vcc_lo"):
+-                    self.emit(f"OpStore %vcc {r}")
+-                else:
+-                    self.mask_dst(d, r)
++                self.mask_dst(d, r)
+         elif op == "s_not_b32":
+             to_mask_dst, dst_half = self._mask_b32_dst_half(a[0], a[1:2])
+             x_val = self.imm_val(a[1])
+-- 
+2.54.0
+

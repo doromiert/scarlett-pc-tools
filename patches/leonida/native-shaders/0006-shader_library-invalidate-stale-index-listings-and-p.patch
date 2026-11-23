@@ -1,0 +1,119 @@
+From 8ebe014c162a5613face4be56eb2d7dbeafeb537 Mon Sep 17 00:00:00 2001
+From: Davi Andrei <67552001+SaymonMaster14@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 16:13:08 -0300
+Subject: [PATCH 6/7] shader_library: invalidate stale index/listings and
+ publish generation after disasm succeeds
+
+---
+ tests/test_shader_library.py | 10 ++++++++
+ tools/shader_library.py      | 46 ++++++++++++++++++++++++------------
+ 2 files changed, 41 insertions(+), 15 deletions(-)
+
+diff --git a/tests/test_shader_library.py b/tests/test_shader_library.py
+index 54b1b5d94..7886a7ec0 100644
+--- a/tests/test_shader_library.py
++++ b/tests/test_shader_library.py
+@@ -399,6 +399,16 @@ class Main(unittest.TestCase):
+                 with self.assertRaisesRegex(sl.LibraryError, "lib_cs_00003: llvm-mc failed"):
+                     self.run_main(src, "--out", out_fail, "--stages", "cs", "--disasm", "--jobs", "1")
+                 self.assertEqual(os.listdir(os.path.join(out_fail, "disasm")), [])
++                self.assertFalse(os.path.exists(os.path.join(out_fail, "index.json")))
++                self.assertFalse(os.path.exists(os.path.join(out_fail, "library.json")))
++
++                # Reusing an existing output directory on a subsequent decoder failure invalidates old completion
++                # index/listings and does not publish partial artifacts.
++                with self.assertRaisesRegex(sl.LibraryError, "lib_cs_00003: llvm-mc failed"):
++                    self.run_main(src, "--out", out, "--stages", "cs", "--disasm", "--jobs", "1")
++                self.assertEqual(os.listdir(os.path.join(out, "disasm")), [])
++                self.assertFalse(os.path.exists(os.path.join(out, "index.json")))
++                self.assertFalse(os.path.exists(os.path.join(out, "library.json")))
+             finally:
+                 shader_disasm.disasm = old
+ 
+diff --git a/tools/shader_library.py b/tools/shader_library.py
+index 2f06a65ce..19c7e35dd 100644
+--- a/tools/shader_library.py
++++ b/tools/shader_library.py
+@@ -303,7 +303,11 @@ def main(argv=None) -> int:
+     names = {i: program_name(i, lib["stage"].get(i)) for i in range(lib["header"]["programs"])}
+     sources = carve_digests(a.carve) if a.carve else None
+     cs_state = {c["program"]: c["state"] for c in lib["compute"] if None not in (c["program"], c["state"])}
+-    index, written, work = [], 0, []
++    for stale in ("index.json", "library.json"):
++        p = os.path.join(a.out, stale)
++        if os.path.exists(p):
++            os.remove(p)
++    index, written, work, pending = [], 0, [], []
+     for i in range(lib["header"]["programs"]):
+         stages = lib["stage"].get(i, set())
+         st = "+".join(sorted(stages)) if stages else "unused"
+@@ -319,6 +323,7 @@ def main(argv=None) -> int:
+         entry = {"file": name + ".dxbc", "stage": st, "program": i}
+         digests = sorted(lib["digest"].get(i, ()))
+         meta["digest"] = [d.hex() for d in digests]
++        container = None
+         if sources is not None:
+             found = sorted({src for d in digests for src in sources.get(d, ())})
+             entry["source"] = meta["source"] = sorted({n for n, _ in found})
+@@ -327,17 +332,16 @@ def main(argv=None) -> int:
+                 # pipeline build keeps; the translator reads them from <name>.dxbc next to its folder.
+                 with open(found[0][1], "rb") as f:
+                     container = f.read()
+-                with open(os.path.join(a.out, name + ".dxbc"), "wb") as f:
+-                    f.write(container)
+         for k in ("threads", "wave32"):
+             if k in meta:
+                 entry[k] = meta[k]
+-        with open(os.path.join(a.out, "fspx", name + ".code"), "wb") as f:
+-            f.write(code)
+-        with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
+-            json.dump(meta, f, indent=1)
+-        if disasm and end:
+-            work.append((entry, name, code[start:end], start, end))
++        if disasm:
++            stale_s = os.path.join(a.out, "disasm", name + ".s")
++            if os.path.exists(stale_s):
++                os.remove(stale_s)
++            if end:
++                work.append((entry, name, code[start:end], start, end))
++        pending.append((name, code, meta, container))
+         index.append(entry)
+         written += 1
+ 
+@@ -353,15 +357,27 @@ def main(argv=None) -> int:
+             reason = (err.strip().splitlines() or ["no output"])[0]
+             raise LibraryError(f"{name}: {reason}")
+         entry["invalid_words"] = invalid
+-        with open(os.path.join(a.out, "disasm", name + ".s"), "w", encoding="utf-8", newline="\n") as f:
+-            f.write(f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n")
+-            f.write(asm)
+-            if err.strip():
+-                f.write("\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n")
++        text = f"; {name}  code 0x{start:x}..0x{end:x} (fspx), {a.mcpu}, {invalid} invalid words\n" + asm
++        if err.strip():
++            text += "\n; --- llvm-mc messages ---\n; " + err.strip().replace("\n", "\n; ") + "\n"
++        return name, text
+ 
++    listings = []
+     if work:
+         with ThreadPoolExecutor(a.jobs) as ex:   # each job waits on its own llvm-mc process
+-            list(ex.map(one, work))
++            listings = list(ex.map(one, work))
++
++    for name, code, meta, container in pending:
++        if container is not None:
++            with open(os.path.join(a.out, name + ".dxbc"), "wb") as f:
++                f.write(container)
++        with open(os.path.join(a.out, "fspx", name + ".code"), "wb") as f:
++            f.write(code)
++        with open(os.path.join(a.out, "fspx", name + ".json"), "w", encoding="utf-8", newline="\n") as f:
++            json.dump(meta, f, indent=1)
++    for name, text in listings:
++        with open(os.path.join(a.out, "disasm", name + ".s"), "w", encoding="utf-8", newline="\n") as f:
++            f.write(text)
+ 
+     def named(stages):
+         return {k: names[v["program"]] for k, v in stages.items()}
+-- 
+2.54.0
+

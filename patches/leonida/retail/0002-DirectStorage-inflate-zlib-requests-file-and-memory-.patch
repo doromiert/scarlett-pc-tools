@@ -1,0 +1,840 @@
+From f1acd36b4961524ce3a94511a205b43ecd370293 Mon Sep 17 00:00:00 2001
+From: Kelebek <berkantkelebek2@gmail.com>
+Date: Mon, 23 Nov 2026 19:06:16 +0300
+Subject: [PATCH 02/10] DirectStorage: inflate zlib requests (file and memory
+ sources)
+
+A request with ZlibDecompress alone now reads SourceSize bytes of the file or of memory into a staging buffer,
+inflates them with the runtime's RFC 1950 inflater (leonida::zlib_inflate in src/shader_library.h) and copies the
+result to Destination only when it is exactly DestinationSize bytes. A failed stream leaves the destination
+untouched, and a memory source inside its own destination inflates correctly.
+
+Checks follow DSTORAGE_REQUEST and dstorageerr.h: DestinationSize must be larger than SourceSize with zlib
+(E_DSTORAGE_INVALID_DESTINATION_SIZE), a zlib FileOffset must be 16-byte aligned (E_DSTORAGE_INVALID_FILE_OFFSET),
+IntermediateSize stays 0 without BCPack. Stream failures map to E_DSTORAGE_ZLIB_BAD_HEADER, _ZLIB_BAD_DATA,
+_ZLIB_PARITY_FAIL (Adler-32) and E_DSTORAGE_DECOMPRESSION_ERROR (a result of another size). GetStats counts
+the inflates, the pending ones and the decompression errors.
+
+zlib_inflate gains an optional failure reason (header, data, checksum, limit); its existing callers are unchanged.
+BCPack, swizzle and physical-page requests still fail with E_NOTIMPL.
+
+dstorage_test: synthetic streams only (Python zlib levels 9 and 1, stored blocks built by the test), from a file
+and from memory, with every failure code; shader_library_test checks the new failure reasons.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/README.md                       |   1 +
+ docs/directstorage.md                |  75 +++++++--
+ runtime/README.md                    |   5 +-
+ runtime/shims/dstorage.cpp           |  89 +++++++++-
+ runtime/shims/dstorage_xs_abi.h      |   9 +
+ runtime/src/shader_library.h         |  77 +++++----
+ runtime/test/dstorage_test.cpp       | 242 ++++++++++++++++++++++++++-
+ runtime/test/shader_library_test.cpp |  10 ++
+ 8 files changed, 453 insertions(+), 55 deletions(-)
+
+diff --git a/docs/README.md b/docs/README.md
+index 3d9a62771..89715bec3 100644
+--- a/docs/README.md
++++ b/docs/README.md
+@@ -77,6 +77,7 @@ method, scope and caveats. No game data is included.
+ | [audio_hal_exe_calls.md](audio_hal_exe_calls.md) | How the retail executable calls the 22 audio coprocessor, texture layout and DirectStorage imports that have no shim: call sites, constant arguments, and the four calls with a negative-result branch. |
+ | [xcl_compare.md](xcl_compare.md) | XCL's synthetic test title under `gta6rt --run` and under XCL (`tools/xcl_compare.py`): 5 of 50 checks pass here, both hangs are the documented manual-queue terminate deadlock, and each other difference mapped to an open item or a lead. |
+ | [gameinput.md](gameinput.md) | The GameInput shim on SDL3: `GameInputCreate` and the v0 `IGameInput`/`IGameInputDevice`/`IGameInputReading`/`IGameInputDispatcher` surface on any SDL gamepad, DualSense adaptive-trigger approximation and lightbar, force-feedback motors and trigger haptics through SDL's haptic API; 261 checks on virtual joysticks and a fake haptic backend; by hand on an Xbox Series X pad (Bluetooth) and a DualSense (USB). 261 checks on virtual joysticks and a fake haptic backend, not yet tried on a real pad. |
++| [directstorage.md](directstorage.md) | DirectStorage for the console title: the evidence for the DLL (`dstorage_xs.dll`, also `xcrdapi.dll`, `dstorage.dll`) and the console ABI with its confidence, and the shim: `GAME:` file open, queues, file and memory reads, status arrays, fences, events, cancel and errors, zlib requests inflated with their `E_DSTORAGE_ZLIB_*` errors; BCPack, swizzle and physical pages still open. |
+ | [saves.md](saves.md) | Save containers: `JSAV` (index + JSON story save, byte-exact rebuild), `ASAV` header, `SLAYER1` packed copy (not decoded); `tools/saves.py` and import into the offline `XGameSave` folder; key hashes are case-sensitive joaat (`tools/save_keys.py`). |
+ | [pipeline_check.md](pipeline_check.md) | Driver-level corpus check: the full corpus, 26,503 of 26,503 modules and pipelines, 0 failures (RTX 4060 Ti); an earlier 10/12-shard run, 22,092 modules and 2,217 compute pipelines, also had 0 failures. Driver-level corpus check: 10/12 shards, 22,092 modules, 2,217 compute pipelines, 0 failures. |
+ | [multi_gpu_validation.md](multi_gpu_validation.md) | Running disjoint shards on eight identical RDNA1/RADV GPUs: PCI-BDF pinning, base controls, per-card logs, the V540 farm's aggregate results and its known driver limitations. |
+diff --git a/docs/directstorage.md b/docs/directstorage.md
+index 724033fa5..dc2987a55 100644
+--- a/docs/directstorage.md
++++ b/docs/directstorage.md
+@@ -3,7 +3,8 @@
+ The console title reads its streamed data through Xbox DirectStorage: `DStorageGetFactory` hands out a factory, the
+ factory opens files and creates queues, and a queue reads file or memory ranges into memory and reports completion
+ through status arrays, `ID3D12Fence` signals and events. `runtime/shims/dstorage.cpp` serves that API on the PC:
+-files open through the runtime's `GAME:` mapping and write overlay, and a worker thread per queue does the reads.
++files open through the runtime's `GAME:` mapping and write overlay, and a worker thread per queue does the reads
++and inflates zlib requests.
+ This page records which DLL and ABI the console title is expected to use, how sure that is, and what the shim does.
+ 
+ ## Which DLL and which ABI: the evidence
+@@ -47,7 +48,7 @@ of these, so nothing is shadowed today.
+ | Vtable order of the console interfaces (the reference lists methods alphabetically) | The PC header's order for the methods both APIs have; console-only methods where the overview lists them: factory `CreateQueue, OpenFile, CreateStatusArray, SetCpuAffinity, SetDebugFlags, SetStagingBufferSize`, then `GetStats` (X1), `CreateQueue1` (X2); queue `EnqueueRequest, EnqueueStatus, EnqueueSignal, Submit, CancelRequestsWithTag, Close, GetErrorEvent, RetrieveErrorRecord, Query`, then `EnqueueSetEvent` (X1), `Query1` (X2); status array `IsComplete, GetHResult`; file `Close, GetHandle` | queue, status array: medium; file: medium; factory: low (the `SetCpuAffinity` slot is a guess) | `runtime/shims/dstorage_xs_abi.h`, one declaration per interface |
+ | Interface ids of the X interfaces | A creating call (`DStorageGetFactory`, `CreateQueue*`, `OpenFile`, `CreateStatusArray`) accepts an id it has not seen for the kind of object it hands out and logs it once (`[rt] dstorage: ... asked for {...}: serving the ... interface`), so the first boot records them. It refuses an id seen for another kind, a PC DirectStorage id, and the system COM interfaces (the `{xxxxxxxx-0000-0000-C000-000000000046}` range with `IMarshal`, `IClientSecurity`, ..., and `IAgileObject`, `INoMarshal`, `IInspectable` and a few more). `QueryInterface` follows [d3d12_vulkan.md](d3d12_vulkan.md)'s rule (an unknown id is `E_NOINTERFACE`, logged): it accepts only `IUnknown`, the declared `IDStorageStatusArray` id for a status array, and the ids a creating call accepted for that kind of object | n/a (a policy, not a fact) | `IidPolicy` in `runtime/shims/dstorage.cpp` |
+ | `DSTORAGE_MIN_QUEUE_CAPACITY`, `DSTORAGE_MAX_QUEUE_CAPACITY`, `DSTORAGE_REQUEST_MAX_NAME` | The PC header's values: `0x80`, `0x2000`, 64 | medium | `dstorage_xs_abi.h` |
+-| `E_DSTORAGE_*` values | The PC `dstorageerr.h` values (`FACILITY_GAME`, `0x8924xxxx`). That header also defines the console-only failures (zlib, BCPack, swizzle, XVD), so the space is shared | medium-high | `dstorage_xs_abi.h` |
++| `E_DSTORAGE_*` values | The PC `dstorageerr.h` values (`FACILITY_GAME`, `0x8924xxxx`). That header also defines the console-only failures (zlib, BCPack, swizzle, XVD), so the space is shared. `E_DSTORAGE_DECOMPRESSION_ERROR` (`0x89240030`) is on the public constants page; `E_DSTORAGE_ZLIB_BAD_HEADER`, `_ZLIB_BAD_DATA` and `_ZLIB_PARITY_FAIL` (`0x89240031`-`33`) have no public description, and their names and values come from the header-generated bindings of the `direct-storage` crate (Sources). Which failure the console reports with each zlib code is inferred from the names | medium-high (values); medium (zlib codes' meaning) | `dstorage_xs_abi.h` |
+ | Struct layouts | The compiler's x64 layout of the reference's declarations, pinned with `static_assert` (`DSTORAGE_REQUEST` 72 bytes, `DSTORAGE_QUEUE_DESC` 24, `DSTORAGE_QUEUE_DESC1` 32); `DSTORAGE_REQUEST_OPTIONS` is decoded from `AsUINT64` by explicit bit positions (zlib bit 0, BCPack 1-4, swizzle 5-20, destination pages 21, source type 22, source pages 23, reserved 24-63) | high for member order and types, medium for the bit allocation (MSVC allocates bit-fields from bit 0 up) | `dstorage_xs_abi.h` |
+ 
+ The first boot with the executable settles most of this: the dry-run report shows which module it imports
+@@ -59,7 +60,10 @@ The first boot with the executable settles most of this: the dry-run report show
+   `SetDebugFlags` and `SetCpuAffinity` are stored only (a console core mask means nothing on the host).
+   `SetStagingBufferSize` accepts 0, 16, 20, 24, 28 and 32 MiB, fails with `E_DSTORAGE_INVALID_STAGING_BUFFER_SIZE`
+   otherwise and with `E_DSTORAGE_STAGING_BUFFER_LOCKED` while a queue or file exists; there is no staging buffer.
+-  `GetStats` reports the counts the shim keeps (queues per priority, requests, bytes, files, errors). As
++  `GetStats` reports the counts the shim keeps (queues per priority, requests, bytes, files, errors, zlib
++  inflates: `TotalDecompressionRequestCount` grows when a zlib request's inflate starts, which is after its checks
++  passed and its source was read, `PendingDecompressionRequestCount` is the inflates running, and
++  `DecompressionErrors` the streams that failed). As
+   `DSTORAGE_PRIORITY_STATS` defines them, `TotalRequestCount` and the byte totals grow when a request is submitted
+   (not when it is enqueued), and `PendingRequestCount` counts the requests the worker is processing; status and fence
+   entries are counted when they are enqueued. A bad
+@@ -80,24 +84,54 @@ The first boot with the executable settles most of this: the dry-run report show
+   says; with auto-submit disabled only a `Submit` from another thread frees it. One worker thread per queue runs
+   the submitted entries in order, so every notification follows all the entries before it.
+ - **Requests**: copied at enqueue. A file request reads `SourceSize` bytes at `FileOffset` into `Destination`; a
+-  memory request copies `Source` to `Destination` (`memmove`, so an overlapping pair is safe). Checked in this
+-  order when the worker reaches the request:
++  memory request copies `Source` to `Destination` (`memmove`, so an overlapping pair is safe); a zlib request
++  inflates those `SourceSize` bytes into `Destination` (below). Checked in this order when the worker reaches the
++  request:
+   1. cancelled: a success, whatever else is wrong with it;
+   2. found at enqueue: a null request pointer (`E_INVALIDARG`) or a file object the shim did not make
+      (`E_DSTORAGE_INVALID_FILE_HANDLE`);
+   3. reserved option bits (`E_DSTORAGE_RESERVED_FIELDS`), then the source type against the queue's
+      (`E_DSTORAGE_INVALID_SOURCE_TYPE`);
+-  4. BCPack mode above 7, swizzle mode above 4 (`_INVALID_BCPACK_MODE`, `_INVALID_SWIZZLE_MODE`), then zlib, BCPack
+-     or swizzle, then physical pages (`E_NOTIMPL`, logged once: later PRs);
+-  5. an `IntermediateSize` without zlib and BCPack (`_INVALID_INTERMEDIATE_SIZE`), `DestinationSize` other than
+-     `SourceSize` (`_INVALID_DESTINATION_SIZE`), more than 1 GiB in total, then a buffer over 32 MiB
++  4. BCPack mode above 7, swizzle mode above 4 (`_INVALID_BCPACK_MODE`, `_INVALID_SWIZZLE_MODE`), then BCPack or
++     swizzle, with or without zlib, then physical pages (`E_NOTIMPL`, logged once: later PRs);
++  5. an `IntermediateSize` (`_INVALID_INTERMEDIATE_SIZE`: it is the size between the inflate and the BCPack decode,
++     so only a zlib + BCPack request has one), a `DestinationSize` other than `SourceSize` without zlib, or not
++     larger than `SourceSize` with it (`_INVALID_DESTINATION_SIZE`: the rule `dstorageerr.h` gives for that code,
++     and what `DSTORAGE_REQUEST` says of `DestinationSize`), more than 1 GiB in total, then a buffer over 32 MiB
+      (`_REQUEST_TOO_LARGE` for both: `DSTORAGE_REQUEST` allows a buffer over 32 MiB only with 64 KiB or 2 MiB pages,
+-     which are not implemented yet);
++     which are not implemented yet; the source is never larger than the destination here, so the destination's
++     limit covers it), then a zlib file request whose `FileOffset` is not 16-byte aligned (`_INVALID_FILE_OFFSET`,
++     as `DSTORAGE_REQUEST` requires);
+   6. a null destination, a null source (memory) or a null file (`E_INVALIDARG`), a closed file (`_FILE_NOT_OPEN`);
+   7. a zero size: a success that touches no memory (an assumption: the reference does not say);
+   8. a range past the end of the file (`E_DSTORAGE_END_OF_FILE`), then a destination or source the process cannot
+      access (`E_DSTORAGE_ACCESS_VIOLATION`; the worker survives it). This needs asynchronous exceptions under
+      clang-cl, so `runtime/CMakeLists.txt` builds `dstorage.cpp` with `/EHa` there; MSVC always catches it.
++
++  Step 7 does not apply to a zlib request (its `DestinationSize` is never 0 after step 5); its stream fails as
++  described next.
++- **zlib** (`ZlibDecompress` alone): the source, `SourceSize` bytes of the file or of memory, is read into a staging
++  buffer and inflated there by the runtime's RFC 1950 inflater (`leonida::zlib_inflate` in
++  `runtime/src/shader_library.h`, the one the shader library uses for XBCH blobs). The result is copied to
++  `Destination` only when it is exactly `DestinationSize` bytes, so a stream that fails leaves the destination as it
++  was, and a memory source inside its own destination (in-place loading) inflates correctly. Both buffers are at
++  most 32 MiB (step 5). Step 5 also means a stream of stored blocks only, which is larger than what it holds, is
++  refused with `_INVALID_DESTINATION_SIZE` before it is read, as the documented rule implies. The stream is a zlib
++  stream: the two header bytes, the deflate blocks (stored, fixed and
++  dynamic Huffman), the Adler-32 of the result. Bytes after the Adler-32 are not read, so a `SourceSize` rounded up
++  over padding works (an assumption: the reference does not say). The game's own data agrees with RFC 1950: the
++  texture pools' codec-8 chunks, laid out for this decompression ([textures.md](textures.md)), inflate with
++  Python's `zlib.decompress`, which checks the header and the Adler-32 (`tools/ttpf_mips.py`). A failure:
++
++  | Stream | HRESULT |
++  |---|---|
++  | header not deflate, a window over 32 KiB, a wrong check value, or a preset dictionary | `E_DSTORAGE_ZLIB_BAD_HEADER` (`0x89240031`) |
++  | a reserved block type, an invalid code, a distance before the start, or a truncated stream | `E_DSTORAGE_ZLIB_BAD_DATA` (`0x89240032`) |
++  | Adler-32 mismatch | `E_DSTORAGE_ZLIB_PARITY_FAIL` (`0x89240033`) |
++  | inflates to more or fewer bytes than `DestinationSize` | `E_DSTORAGE_DECOMPRESSION_ERROR` (`0x89240030`; no code names a size mismatch, so the generic one) |
++
++  The inflater decodes one bit at a time, on the queue's worker: correct, not fast. A faster decoder (table lookup)
++  can replace it behind `zlib_inflate` without touching the request path.
+ - **Cancel**: `CancelRequestsWithTag(mask, value)` marks every request enqueued before the call and not yet started
+   whose `(CancellationTag & mask) == value`. A cancelled request completes as a success without reading and is not
+   counted as a failure, as the overview and the reference say, even when it also had an error found at enqueue.
+@@ -120,10 +154,11 @@ The first boot with the executable settles most of this: the dry-run report show
+ 
+ ## Not done yet (later PRs)
+ 
+-- **zlib** (`ZlibDecompress`, RFC 1950), then **BCPack** (`BcpackMode`; `tools/bcpack.py` is the reference
+-  decoder), then **swizzle** (`SwizzleMode`). The decode order is DEFLATE, BCPack, swizzle; with both zlib and BCPack
+-  `IntermediateSize` is the size between them, and `FileOffset` must then be 16-byte aligned. Each becomes a stage
+-  in the worker between the read and the destination write, so the request checks above stay where they are.
++- **BCPack** (`BcpackMode`; `tools/bcpack.py` is the reference decoder), then **swizzle** (`SwizzleMode`). The
++  decode order is DEFLATE, BCPack, swizzle; with both zlib and BCPack `IntermediateSize` is the size between them
++  (the inflate's output, the BCPack decoder's input), and `FileOffset` must be 16-byte aligned. Each becomes a stage
++  after `inflate_request`'s inflate and before its destination write, so the request checks above stay where they
++  are.
+ - **Physical pages** (`SourceIsPhysicalPages`, `DestinationIsPhysicalPages`): arrays of 64 KiB page numbers from
+   `XMemAllocatePhysicalPages`; needs the `xmem` shim to translate a page number to the address it mapped.
+ - **GPU memory**: the console API has no GPU destinations of its own (memory is unified, so a destination is an
+@@ -141,7 +176,14 @@ cancellation, auto-submit, a full queue, status arrays, fences (a CPU fence obje
+ when it is signalled), events, error records, file and queue close with requests in flight, a destination the
+ process cannot write, four threads enqueueing at once, the interface-id policy (unknown and system ids refused by
+ `QueryInterface`, learned by creating calls), a `GetHandle` handle with its own file position, an event closed (and
+-its handle value reused) before it is set, and cancelled requests that also had an enqueue error.
++its handle value reused) before it is set, and cancelled requests that also had an enqueue error. zlib requests use
++synthetic streams only: two made with Python's `zlib` (level 9: one dynamic-Huffman block; level 1: one
++fixed-Huffman block) from text the test rebuilds, and stored-block streams the test builds, one of them a stored
++block followed by the dynamic one. They are read from a file and from memory (also in place); a bad header, a
++preset dictionary, a reserved block type, a truncated stream, an Adler-32 mismatch, a stream shorter and one longer
++than `DestinationSize`, a stored stream larger than its result, an unaligned offset, an `IntermediateSize`, zlib with
++BCPack or swizzle (`E_NOTIMPL`), an unreadable source and an unwritable destination each get their code, a failed
++stream leaves its destination untouched, and the decompression statistics count them.
+ 
+ ## Sources and licences
+ 
+@@ -150,3 +192,6 @@ its handle value reused) before it is set, and cancelled requests that also had
+ | [GDK DStorage reference](https://learn.microsoft.com/en-us/gaming/gdk/docs/reference/system/dstorage/dstorage_members) and its function, interface, structure and enumeration pages | Names, method signatures, structure members, enum values, requirements rows | [Microsoft Learn Terms of Use](https://learn.microsoft.com/en-us/legal/termsofuse); facts paraphrased, no text copied |
+ | [DirectStorage overview (GDK)](https://learn.microsoft.com/en-us/gaming/gdk/docs/features/console/storage/directstorage/directstorage-overview) | Queue, auto-submit, cancellation, notification order, file sharing, decode order | Same terms; paraphrased |
+ | `dstorage.h`, `dstorageerr.h` in the public `Microsoft.Direct3D.DirectStorage` 1.3.0 NuGet package | PC method order, interface ids (to refuse them), capacity and name-length constants, `E_DSTORAGE_*` values | Read for facts only; not vendored. `runtime/shims/dstorage_xs_abi.h` is Leonida's own declaration |
++| [DirectStorage constants](https://learn.microsoft.com/en-us/windows/win32/dstorage/dstorage-constants) (Win32 reference) | `E_DSTORAGE_DECOMPRESSION_ERROR` = `0x89240030`; `E_DSTORAGE_INVALID_DESTINATION_SIZE`: equal to the length without decompression, larger with it; `E_DSTORAGE_INVALID_FILE_OFFSET` is the offset invalid for a decompression mode | [Microsoft Learn Terms of Use](https://learn.microsoft.com/en-us/legal/termsofuse); paraphrased |
++| [`direct-storage` crate](https://docs.rs/direct-storage/0.5.1/src/direct_storage/bindings.rs.html) 0.5.1 (bindings generated by `windows-bindgen` from the DirectStorage headers; 0.2.0's `errors.rs` has the same values) | `E_DSTORAGE_ZLIB_BAD_HEADER` `0x89240031`, `E_DSTORAGE_ZLIB_BAD_DATA` `0x89240032`, `E_DSTORAGE_ZLIB_PARITY_FAIL` `0x89240033` (names and values only) | MIT/Apache-2.0; two constants' names and values, no code copied |
++| [RFC 1950](https://www.rfc-editor.org/rfc/rfc1950) and [RFC 1951](https://www.rfc-editor.org/rfc/rfc1951) | The zlib stream and DEFLATE formats `zlib_inflate` decodes | Public specifications |
+diff --git a/runtime/README.md b/runtime/README.md
+index 9670c8db3..370bec586 100644
+--- a/runtime/README.md
++++ b/runtime/README.md
+@@ -218,8 +218,9 @@ Current limits, by design:
+ 
+ - `dstorage_xs.dll` / `xcrdapi.dll` / `dstorage.dll` — `DStorageGetFactory`: the console DirectStorage API
+   (`shims/dstorage.cpp`, declarations in `shims/dstorage_xs_abi.h`). Files open through the `GAME:` mapping and the
+-  overlay; each queue reads file or memory ranges into memory in order on its own worker thread and reports through
+-  status arrays, `ID3D12Fence` signals and events. zlib, BCPack, swizzle and physical-page requests are not done yet.
++  overlay; each queue reads file or memory ranges into memory in order on its own worker thread, inflating zlib
++  requests (RFC 1950, `src/shader_library.h`'s inflater), and reports through status arrays, `ID3D12Fence` signals
++  and events. BCPack, swizzle and physical-page requests are not done yet.
+   See [docs/directstorage.md](../docs/directstorage.md) for the ABI evidence and what is unverified.
+ 
+ - `gameinput.dll` / `xgameruntime.dll` — `GameInputCreate`: the v0 GameInput API for gamepads on SDL3
+diff --git a/runtime/shims/dstorage.cpp b/runtime/shims/dstorage.cpp
+index 19bf51f0e..81abaea3d 100644
+--- a/runtime/shims/dstorage.cpp
++++ b/runtime/shims/dstorage.cpp
+@@ -8,8 +8,11 @@
+ //   - Each queue has one worker thread that runs its submitted entries in order: a request reads a file range or
+ //     copies a memory range into the destination, a status entry, fence signal or event runs when every entry before
+ //     it has. Completion is therefore in queue order, as the API guarantees.
+-//   - zlib, BCPack, swizzle and physical-page requests fail with E_NOTIMPL for now (later PRs: they become stages
+-//     between execute_request's read and its destination write).
++//   - A zlib request (ZlibDecompress alone) reads its source into a staging buffer, inflates it on the worker with
++//     the runtime's RFC 1950 inflater (leonida::zlib_inflate, src/shader_library.h) and copies the result to the
++//     destination only when it is exactly DestinationSize bytes; a stream that fails leaves the destination as it was.
++//   - BCPack, swizzle and physical-page requests fail with E_NOTIMPL for now (later PRs: they become stages between
++//     the read and the destination write, BCPack after the inflate).
+ // Nothing here goes online or touches the GPU.
+ #include <windows.h>
+ #include <d3d12.h>
+@@ -29,6 +32,7 @@
+ #include <unordered_set>
+ #include <vector>
+ 
++#include "../src/shader_library.h"  // leonida::zlib_inflate
+ #include "dstorage_xs_abi.h"
+ #include "shims.h"
+ 
+@@ -770,22 +774,31 @@ private:
+         if (options::source_type(o) != desc_.SourceType) return E_DSTORAGE_INVALID_SOURCE_TYPE;
+         if (options::bcpack(o) > DSTORAGE_BCPACK_MODE_BC7) return E_DSTORAGE_INVALID_BCPACK_MODE;
+         if (options::swizzle(o) > DSTORAGE_SWIZZLE_MODE_4K_12K_4K_12K) return E_DSTORAGE_INVALID_SWIZZLE_MODE;
+-        if (options::zlib(o) || options::bcpack(o) != 0 || options::swizzle(o) != 0) {
+-            log_once("decompress", "zlib, BCPack and swizzle requests are not implemented yet (E_NOTIMPL)");
++        if (options::bcpack(o) != 0 || options::swizzle(o) != 0) {
++            log_once("decompress", "BCPack and swizzle requests are not implemented yet (E_NOTIMPL)");
+             return E_NOTIMPL;
+         }
+         if (o & (options::kDestinationPages | options::kSourcePages)) {
+             log_once("pages", "physical-page requests are not implemented yet (E_NOTIMPL)");
+             return E_NOTIMPL;
+         }
+-        if (r.IntermediateSize != 0) return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;  // only zlib + BCPack use it
+-        if (r.DestinationSize != r.SourceSize) return E_DSTORAGE_INVALID_DESTINATION_SIZE;
++        const bool zlib = options::zlib(o);
++        // IntermediateSize is the BCPack data's size between the inflate and the BCPack decode (DSTORAGE_REQUEST), so
++        // it is 0 for every request that gets here (BCPack is refused above).
++        if (r.IntermediateSize != 0) return E_DSTORAGE_INVALID_INTERMEDIATE_SIZE;
++        // E_DSTORAGE_INVALID_DESTINATION_SIZE: without decompression DestinationSize must equal the source's length,
++        // with it it must be larger (dstorageerr.h's description; DSTORAGE_REQUEST says the same of DestinationSize).
++        if (zlib ? r.DestinationSize <= r.SourceSize : r.DestinationSize != r.SourceSize)
++            return E_DSTORAGE_INVALID_DESTINATION_SIZE;
+         const bool memory = desc_.SourceType == DSTORAGE_REQUEST_SOURCE_MEMORY;
+         const uint64_t total = static_cast<uint64_t>(r.DestinationSize) + (memory ? r.SourceSize : 0u);
+         if (total > kMaxRequestBytes) return E_DSTORAGE_REQUEST_TOO_LARGE;
+-        // DSTORAGE_REQUEST: a destination over 32 MiB is allowed only with 64 KiB or 2 MiB pages, which are not
+-        // implemented yet (refused above). The source equals the destination here, so this covers both buffers.
++        // DSTORAGE_REQUEST: a buffer over 32 MiB is allowed only with 64 KiB or 2 MiB pages, which are not implemented
++        // yet (refused above). The source is never larger than the destination here (the same size without zlib,
++        // smaller with it), so this covers both buffers, and bounds the staging buffers of a zlib request too.
+         if (r.DestinationSize > kMax4kPageDestinationSize) return E_DSTORAGE_REQUEST_TOO_LARGE;
++        // DSTORAGE_REQUEST: with ZlibDecompress the file offset must be 16-byte aligned.
++        if (zlib && !memory && r.FileOffset % 16 != 0) return E_DSTORAGE_INVALID_FILE_OFFSET;
+         if (!r.Destination) return E_INVALIDARG;
+         if (memory) {
+             if (!r.Source) return E_INVALIDARG;
+@@ -793,16 +806,76 @@ private:
+             if (!r.File) return E_INVALIDARG;
+             if (!e.file_counted) return E_DSTORAGE_FILE_NOT_OPEN;
+         }
++        if (zlib) return inflate_request(e, memory);
+         if (r.SourceSize == 0) return S_OK;  // nothing to move; the reference does not say this fails
+         if (memory) return guarded_move(r.Destination, r.Source, r.SourceSize) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
+         return read_file_range(e.file->handle(), r.FileOffset, r.Destination, r.SourceSize);
+     }
+ 
++    // A zlib request whose checks have passed: the source (SourceSize bytes of the file or of memory) goes into a
++    // staging buffer, inflates there, and only a result of exactly DestinationSize bytes is copied to the destination.
++    // So a failed stream leaves the destination as it was, and a memory source that overlaps its destination is safe.
++    // Both buffers are at most 32 MiB (execute_request). The stream is RFC 1950: the two header bytes, the deflate
++    // data, the Adler-32 of the result; bytes after the Adler-32 are not read. A failure is the matching
++    // dstorageerr.h code: a bad header (not deflate, a window over 32 KiB, a bad check value or a preset dictionary)
++    // E_DSTORAGE_ZLIB_BAD_HEADER, bad or truncated deflate data E_DSTORAGE_ZLIB_BAD_DATA, an Adler-32 mismatch
++    // E_DSTORAGE_ZLIB_PARITY_FAIL, and a stream that inflates to more or fewer bytes than DestinationSize
++    // E_DSTORAGE_DECOMPRESSION_ERROR (no code names a size mismatch; this is the header's generic one).
++    HRESULT inflate_request(const Entry& e, bool memory) {
++        const DSTORAGE_REQUEST& r = e.request;
++        std::vector<uint8_t> source, result;
++        try {
++            source.resize(r.SourceSize);
++            result.reserve(r.DestinationSize);
++        } catch (const std::bad_alloc&) {
++            return E_OUTOFMEMORY;
++        }
++        if (r.SourceSize != 0) {
++            if (memory) {
++                if (!guarded_move(source.data(), r.Source, r.SourceSize)) return E_DSTORAGE_ACCESS_VIOLATION;
++            } else if (const HRESULT hr = read_file_range(e.file->handle(), r.FileOffset, source.data(), r.SourceSize);
++                       FAILED(hr)) {
++                return hr;
++            }
++        }
++        log_once("zlib", "zlib requests are inflated on the CPU (RFC 1950, leonida::zlib_inflate)");
++        set_decompression_pending(+1);
++        leonida::ZlibError why = leonida::ZlibError::none;
++        const bool inflated = leonida::zlib_inflate(source, result, r.DestinationSize, &why);
++        set_decompression_pending(-1);
++        HRESULT hr = S_OK;
++        if (!inflated) {
++            switch (why) {
++                case leonida::ZlibError::header: hr = E_DSTORAGE_ZLIB_BAD_HEADER; break;
++                case leonida::ZlibError::checksum: hr = E_DSTORAGE_ZLIB_PARITY_FAIL; break;
++                case leonida::ZlibError::limit: hr = E_DSTORAGE_DECOMPRESSION_ERROR; break;  // longer than the destination
++                default: hr = E_DSTORAGE_ZLIB_BAD_DATA; break;
++            }
++        } else if (result.size() != r.DestinationSize) {
++            hr = E_DSTORAGE_DECOMPRESSION_ERROR;  // shorter than the destination
++        }
++        if (FAILED(hr)) {
++            std::lock_guard lock(stats().mutex);
++            ++stats().s.DecompressionErrors;
++            return hr;
++        }
++        return guarded_move(r.Destination, result.data(), result.size()) ? S_OK : E_DSTORAGE_ACCESS_VIOLATION;
++    }
++
+     void set_pending(int delta) {
+         std::lock_guard lock(stats().mutex);
+         priority_stats(stats().s, desc_.Priority).PendingRequestCount += static_cast<uint32_t>(delta);
+     }
+ 
++    // PendingDecompressionRequestCount is the zlib requests being inflated; TotalDecompressionRequestCount counts each
++    // one that reached its inflate (its source was read), DecompressionErrors those whose stream then failed.
++    static void set_decompression_pending(int delta) {
++        std::lock_guard lock(stats().mutex);
++        auto& s = stats().s;
++        s.PendingDecompressionRequestCount += static_cast<uint32_t>(delta);
++        if (delta > 0) ++s.TotalDecompressionRequestCount;
++    }
++
+     void describe(const Entry& e, DSTORAGE_ERROR_FIRST_FAILURE& f) const {
+         switch (e.type) {
+             case Entry::Type::Request: {
+diff --git a/runtime/shims/dstorage_xs_abi.h b/runtime/shims/dstorage_xs_abi.h
+index 854f8dbf9..aec6ac59d 100644
+--- a/runtime/shims/dstorage_xs_abi.h
++++ b/runtime/shims/dstorage_xs_abi.h
+@@ -110,6 +110,15 @@ constexpr HRESULT E_DSTORAGE_INVALID_STAGING_BUFFER_SIZE = static_cast<HRESULT>(
+ constexpr HRESULT E_DSTORAGE_INVALID_FENCE = static_cast<HRESULT>(0x89240022L);
+ constexpr HRESULT E_DSTORAGE_INVALID_STATUS_ARRAY = static_cast<HRESULT>(0x89240023L);
+ constexpr HRESULT E_DSTORAGE_INVALID_MEMORY_QUEUE_PRIORITY = static_cast<HRESULT>(0x89240024L);
++// The decompression failures. E_DSTORAGE_DECOMPRESSION_ERROR ("a generic error has happened during decompression")
++// is on the public DirectStorage constants page; the three zlib codes are in the same header (dstorageerr.h) with no
++// public description: the names and values here are those of the header-generated bindings of the `direct-storage`
++// crate (docs/directstorage.md "Sources"). PARITY_FAIL is read as the Adler-32 check, the only check value a zlib
++// stream has.
++constexpr HRESULT E_DSTORAGE_DECOMPRESSION_ERROR = static_cast<HRESULT>(0x89240030L);
++constexpr HRESULT E_DSTORAGE_ZLIB_BAD_HEADER = static_cast<HRESULT>(0x89240031L);
++constexpr HRESULT E_DSTORAGE_ZLIB_BAD_DATA = static_cast<HRESULT>(0x89240032L);
++constexpr HRESULT E_DSTORAGE_ZLIB_PARITY_FAIL = static_cast<HRESULT>(0x89240033L);
+ 
+ // ---- Structures ---------------------------------------------------------------------------------------------------
+ 
+diff --git a/runtime/src/shader_library.h b/runtime/src/shader_library.h
+index b98a7e293..996f4d34c 100644
+--- a/runtime/src/shader_library.h
++++ b/runtime/src/shader_library.h
+@@ -31,6 +31,10 @@ namespace leonida {
+ // ---------------------------------------------------------------------------------------------------------------
+ // zlib inflate
+ 
++// Why zlib_inflate failed, for a caller that reports the reason (runtime/shims/dstorage.cpp turns each into its
++// E_DSTORAGE_ZLIB_* code). `limit`: the output would pass the caller's limit; the stream was not read to its end.
++enum class ZlibError { none, header, data, checksum, limit };
++
+ namespace detail {
+ 
+ class BitReader {
+@@ -112,8 +116,8 @@ inline int decode(BitReader& in, const Huffman& h) {
+     return -1;
+ }
+ 
+-inline bool inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, const Huffman& lengths,
+-                          const Huffman& distances, std::size_t limit) {
++inline ZlibError inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, const Huffman& lengths,
++                               const Huffman& distances, std::size_t limit) {
+     static constexpr std::int16_t length_base[29] = {3,  4,  5,  6,  7,  8,  9,  10, 11,  13,  15,  17,  19,  23, 27,
+                                                      31, 35, 43, 51, 59, 67, 83, 99, 115, 131, 163, 195, 227, 258};
+     static constexpr std::int16_t length_extra[29] = {0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 2, 2, 2,
+@@ -125,20 +129,21 @@ inline bool inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, const H
+                                                         6, 7, 7, 8, 8, 9, 9, 10, 10, 11, 11, 12, 12, 13, 13};
+     for (;;) {
+         int symbol = decode(in, lengths);
+-        if (symbol < 0 || in.failed()) return false;
++        if (symbol < 0 || in.failed()) return ZlibError::data;
+         if (symbol < 256) {
+-            if (out.size() >= limit) return false;
++            if (out.size() >= limit) return ZlibError::limit;
+             out.push_back(std::uint8_t(symbol));
+             continue;
+         }
+-        if (symbol == 256) return true;
++        if (symbol == 256) return ZlibError::none;
+         symbol -= 257;
+-        if (symbol >= 29) return false;
++        if (symbol >= 29) return ZlibError::data;
+         const std::size_t length = std::size_t(length_base[symbol]) + in.bits(length_extra[symbol]);
+         const int d = decode(in, distances);
+-        if (d < 0 || d >= 30) return false;
++        if (d < 0 || d >= 30) return ZlibError::data;
+         const std::size_t distance = std::size_t(distance_base[d]) + in.bits(distance_extra[d]);
+-        if (in.failed() || distance > out.size() || out.size() + length > limit) return false;
++        if (in.failed() || distance > out.size()) return ZlibError::data;
++        if (out.size() + length > limit) return ZlibError::limit;
+         const std::size_t from = out.size() - distance;
+         for (std::size_t i = 0; i < length; ++i) out.push_back(out[from + i]);
+     }
+@@ -147,28 +152,39 @@ inline bool inflate_codes(BitReader& in, std::vector<std::uint8_t>& out, const H
+ } // namespace detail
+ 
+ // Inflates a zlib stream (RFC 1950: header, deflate data, Adler-32). Returns false for a malformed stream, a
+-// preset dictionary, a checksum mismatch, or output beyond `limit` bytes.
++// preset dictionary, a checksum mismatch, or output beyond `limit` bytes, and then stores the reason in `*why` when
++// it is given: `header` for the two header bytes (not deflate, a window over 32 KiB, a bad check value, a preset
++// dictionary), `data` for the deflate data or a missing trailer, `checksum` for an Adler-32 mismatch, `limit` for
++// output beyond `limit`. Bytes after the Adler-32 trailer are not read.
+ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint8_t>& out,
+-                         std::size_t limit = std::size_t(1) << 30) {
++                         std::size_t limit = std::size_t(1) << 30, ZlibError* why = nullptr) {
+     out.clear();
+-    if (in.size() < 6) return false;
++    const auto fail = [why](ZlibError reason) {
++        if (why) *why = reason;
++        return false;
++    };
++    if (why) *why = ZlibError::none;
++    if (in.size() < 2) return fail(ZlibError::header);
+     const unsigned cmf = in[0], flg = in[1];
+-    if ((cmf & 0x0f) != 8 || (cmf >> 4) > 7 || ((cmf << 8) | flg) % 31 != 0 || (flg & 0x20)) return false;
++    if ((cmf & 0x0f) != 8 || (cmf >> 4) > 7 || ((cmf << 8) | flg) % 31 != 0 || (flg & 0x20))
++        return fail(ZlibError::header);
++    if (in.size() < 6) return fail(ZlibError::data);
+     detail::BitReader reader(in.subspan(2));
+     for (bool last = false; !last;) {
+         last = reader.bits(1) != 0;
+         const std::uint32_t type = reader.bits(2);
+-        if (reader.failed()) return false;
++        if (reader.failed()) return fail(ZlibError::data);
+         if (type == 0) {  // stored
+             reader.align();
+             std::uint8_t b[4];
+             for (auto& x : b)
+-                if (!reader.byte(x)) return false;
++                if (!reader.byte(x)) return fail(ZlibError::data);
+             const unsigned length = b[0] | (b[1] << 8), complement = b[2] | (b[3] << 8);
+-            if (length != (~complement & 0xffff) || out.size() + length > limit) return false;
++            if (length != (~complement & 0xffff)) return fail(ZlibError::data);
++            if (out.size() + length > limit) return fail(ZlibError::limit);
+             for (unsigned i = 0; i < length; ++i) {
+                 std::uint8_t x;
+-                if (!reader.byte(x)) return false;
++                if (!reader.byte(x)) return fail(ZlibError::data);
+                 out.push_back(x);
+             }
+         } else if (type == 1) {  // fixed Huffman
+@@ -184,19 +200,21 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
+                 detail::build_huffman(t.second, lengths, 30);
+                 return t;
+             }();
+-            if (!detail::inflate_codes(reader, out, tables.first, tables.second, limit)) return false;
++            if (const ZlibError e = detail::inflate_codes(reader, out, tables.first, tables.second, limit);
++                e != ZlibError::none)
++                return fail(e);
+         } else if (type == 2) {  // dynamic Huffman
+             const int literal_count = int(reader.bits(5)) + 257, distance_count = int(reader.bits(5)) + 1;
+             const int code_count = int(reader.bits(4)) + 4;
+-            if (literal_count > 286 || distance_count > 30) return false;
++            if (literal_count > 286 || distance_count > 30) return fail(ZlibError::data);
+             static constexpr int order[19] = {16, 17, 18, 0, 8, 7, 9, 6, 10, 5, 11, 4, 12, 3, 13, 2, 14, 1, 15};
+             std::int16_t lengths[320] = {};
+             for (int i = 0; i < code_count; ++i) lengths[order[i]] = std::int16_t(reader.bits(3));
+             detail::Huffman code_lengths;
+-            if (!detail::build_huffman(code_lengths, lengths, 19)) return false;
++            if (!detail::build_huffman(code_lengths, lengths, 19)) return fail(ZlibError::data);
+             for (int i = 0; i < literal_count + distance_count;) {
+                 const int symbol = detail::decode(reader, code_lengths);
+-                if (symbol < 0) return false;
++                if (symbol < 0) return fail(ZlibError::data);
+                 if (symbol < 16) {
+                     lengths[i++] = std::int16_t(symbol);
+                     continue;
+@@ -204,7 +222,7 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
+                 std::int16_t value = 0;
+                 int repeat;
+                 if (symbol == 16) {
+-                    if (i == 0) return false;
++                    if (i == 0) return fail(ZlibError::data);
+                     value = lengths[i - 1];
+                     repeat = 3 + int(reader.bits(2));
+                 } else if (symbol == 17) {
+@@ -212,23 +230,24 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
+                 } else {
+                     repeat = 11 + int(reader.bits(7));
+                 }
+-                if (i + repeat > literal_count + distance_count) return false;
++                if (i + repeat > literal_count + distance_count) return fail(ZlibError::data);
+                 while (repeat--) lengths[i++] = value;
+             }
+-            if (lengths[256] == 0) return false;  // no end-of-block code
++            if (lengths[256] == 0) return fail(ZlibError::data);  // no end-of-block code
+             detail::Huffman literal, distance;
+             if (!detail::build_huffman(literal, lengths, literal_count) ||
+                 !detail::build_huffman(distance, lengths + literal_count, distance_count))
+-                return false;
+-            if (!detail::inflate_codes(reader, out, literal, distance, limit)) return false;
++                return fail(ZlibError::data);
++            if (const ZlibError e = detail::inflate_codes(reader, out, literal, distance, limit); e != ZlibError::none)
++                return fail(e);
+         } else {
+-            return false;
++            return fail(ZlibError::data);
+         }
+-        if (reader.failed()) return false;
++        if (reader.failed()) return fail(ZlibError::data);
+     }
+     // Adler-32, big-endian, after the deflate data's last whole byte.
+     const std::size_t at = 2 + reader.position();
+-    if (at + 4 > in.size()) return false;
++    if (at + 4 > in.size()) return fail(ZlibError::data);
+     std::uint32_t a = 1, b = 0;
+     for (const std::uint8_t x : out) {
+         a = (a + x) % 65521;
+@@ -236,7 +255,7 @@ inline bool zlib_inflate(std::span<const std::uint8_t> in, std::vector<std::uint
+     }
+     const std::uint32_t expected = (std::uint32_t(in[at]) << 24) | (std::uint32_t(in[at + 1]) << 16) |
+                                    (std::uint32_t(in[at + 2]) << 8) | in[at + 3];
+-    return ((b << 16) | a) == expected;
++    return ((b << 16) | a) == expected || fail(ZlibError::checksum);
+ }
+ 
+ // ---------------------------------------------------------------------------------------------------------------
+diff --git a/runtime/test/dstorage_test.cpp b/runtime/test/dstorage_test.cpp
+index a36178232..1e8ea7318 100644
+--- a/runtime/test/dstorage_test.cpp
++++ b/runtime/test/dstorage_test.cpp
+@@ -3,6 +3,7 @@
+ #include <windows.h>
+ #include <d3d12.h>
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <chrono>
+ #include <cstdio>
+@@ -400,11 +401,14 @@ void test_reads_and_errors(Env& env) {
+         cases.push_back({r, E_DSTORAGE_INVALID_DESTINATION_SIZE, "DestinationSize differs from SourceSize"});
+         r = file_request(b, 0, few.data(), 8);
+         r.Options.ZlibDecompress = 1;
+-        cases.push_back({r, E_NOTIMPL, "zlib is not implemented yet"});
++        cases.push_back({r, E_DSTORAGE_INVALID_DESTINATION_SIZE, "zlib with DestinationSize equal to SourceSize"});
+         r = file_request(b, 0, few.data(), 8);
+         r.Options.BcpackMode = DSTORAGE_BCPACK_MODE_BC1;
+         cases.push_back({r, E_NOTIMPL, "BCPack is not implemented yet"});
+         r = file_request(b, 0, few.data(), 8);
++        r.Options.SwizzleMode = DSTORAGE_SWIZZLE_MODE_4K_4K_8K;
++        cases.push_back({r, E_NOTIMPL, "swizzle is not implemented yet"});
++        r = file_request(b, 0, few.data(), 8);
+         r.Options.AsUINT64 = 8ull << options::kBcpackShift;
+         cases.push_back({r, E_DSTORAGE_INVALID_BCPACK_MODE, "BCPack mode 8"});
+         r = file_request(b, 0, few.data(), 8);
+@@ -978,6 +982,241 @@ void test_stats(Env& env) {
+     check(st.ErrorCount > 10, "errors are counted");
+ }
+ 
++
++// ---- zlib requests ------------------------------------------------------------------------------------------------
++//
++// Synthetic streams only. The two Huffman streams were made with Python's zlib (3.14, zlib-ng 1.3.1 API) from the
++// text zlib_text() builds, which in Python is
++//   text = lambda n: b"".join(b"line %04d: a zlib request for the queue, value %d\n" % (i, (i * i) % 97)
++//                             for i in range(n))
++// kZlibDynamic = zlib.compress(text(64), 9): one final dynamic-Huffman block (BTYPE 2), 345 bytes for 3,191.
++// kZlibFixed = zlib.compress(text(4), 1): one final fixed-Huffman block (BTYPE 1), 77 bytes for 196.
++// Streams with stored blocks (BTYPE 0) are built here by stored_stream(); for a single block that is byte for byte
++// what zlib.compress(data, 0) gives.
++constexpr uint8_t kZlibDynamic[] = {
++    0x78, 0xda, 0x95, 0xd4, 0x4d, 0x4e, 0x03, 0x31, 0x0c, 0x05, 0xe0, 0x3d, 0xa7, 0xc8, 0x01, 0x58, 0x4c, 0xfc,
++    0x97, 0x84, 0xdb, 0x14, 0x69, 0x10, 0x95, 0x46, 0x20, 0x4a, 0xcb, 0x82, 0xd3, 0x33, 0x0b, 0xf4, 0xbc, 0x7d,
++    0xee, 0x6e, 0xa4, 0x3e, 0x25, 0xce, 0x67, 0xfb, 0xb8, 0x7e, 0xec, 0x6d, 0x3b, 0x7f, 0x2f, 0xed, 0xd2, 0x7e,
++    0x8f, 0xeb, 0x6b, 0xbb, 0xed, 0x5f, 0x8f, 0xfd, 0xfb, 0xde, 0xde, 0x3e, 0x6f, 0xed, 0xfe, 0xbe, 0xb7, 0xf3,
++    0xeb, 0xb1, 0x3f, 0xb7, 0x9f, 0xcb, 0xf1, 0x38, 0xff, 0xf9, 0x74, 0xfc, 0x07, 0x3a, 0x17, 0xe8, 0x08, 0x08,
++    0x17, 0x30, 0x04, 0x94, 0x0b, 0x2c, 0x04, 0x8c, 0xbc, 0x52, 0x20, 0xe1, 0x5c, 0x42, 0x1c, 0x89, 0xe0, 0x12,
++    0x9a, 0x67, 0x0c, 0xb2, 0xee, 0xac, 0x63, 0x72, 0x89, 0xc8, 0xa7, 0x5a, 0x5c, 0x62, 0x42, 0xa3, 0x93, 0xde,
++    0x8a, 0x00, 0xe9, 0x2d, 0xb8, 0x54, 0x67, 0xc1, 0x07, 0x12, 0xa4, 0xf8, 0x10, 0x24, 0x48, 0xf2, 0x0c, 0x90,
++    0xe2, 0x9a, 0x2f, 0x45, 0x8a, 0x47, 0x9e, 0x41, 0x8a, 0x2f, 0x74, 0x55, 0x27, 0xc5, 0x35, 0x39, 0x48, 0xf1,
++    0x81, 0x81, 0x15, 0x52, 0xbc, 0xa3, 0x0e, 0x21, 0xc9, 0x1d, 0xb7, 0x12, 0x92, 0x7c, 0x61, 0x3a, 0x84, 0x24,
++    0x37, 0xb4, 0x95, 0x90, 0xe4, 0x0b, 0x82, 0x42, 0x9a, 0x5b, 0xd6, 0x41, 0x9a, 0xaf, 0xbc, 0x15, 0x69, 0xee,
++    0xe9, 0x41, 0x9a, 0x4f, 0x04, 0x48, 0xf2, 0x40, 0x5b, 0x29, 0x49, 0x2e, 0x98, 0x40, 0x25, 0xc9, 0x27, 0x6e,
++    0xa5, 0x24, 0xb9, 0xe3, 0xa9, 0x94, 0x24, 0x17, 0x34, 0xa2, 0x92, 0xe4, 0x13, 0x2b, 0x54, 0x49, 0xf2, 0x40,
++    0x93, 0x28, 0xbb, 0xd8, 0xf3, 0x75, 0x49, 0xf2, 0x9e, 0x67, 0xb0, 0xe4, 0x18, 0x0f, 0x65, 0xcd, 0x91, 0x30,
++    0xd2, 0xdc, 0x20, 0x68, 0xa4, 0xb9, 0xc2, 0xc3, 0x48, 0xf3, 0x9e, 0x67, 0x90, 0xe6, 0x59, 0x06, 0x3b, 0xe5,
++    0x98, 0x59, 0x23, 0xc9, 0x27, 0x00, 0x8d, 0x24, 0x1f, 0x68, 0x2b, 0x23, 0xc9, 0x47, 0x9e, 0x41, 0x92, 0x8f,
++    0xac, 0x63, 0x55, 0x13, 0xbe, 0x55, 0x6f, 0xe5, 0xbd, 0x5a, 0xb9, 0x4b, 0xf5, 0x75, 0x5d, 0xab, 0x82, 0x6e,
++    0xc5, 0x26, 0x71, 0xaf, 0xf6, 0xa1, 0x47, 0xb5, 0xd7, 0x7d, 0x54, 0xe7, 0xc9, 0x67, 0x75, 0x66, 0x7d, 0x55,
++    0xf7, 0x42, 0x6c, 0xd5, 0xdd, 0x13, 0xbd, 0xba, 0xdf, 0x42, 0xaa, 0x3b, 0x34, 0x94, 0xde, 0xd3, 0x7f, 0x97,
++    0x8b, 0x11, 0xce,
++};
++constexpr uint8_t kZlibFixed[] = {
++    0x78, 0x01, 0xcb, 0xc9, 0xcc, 0x4b, 0x55, 0x30, 0x30, 0x30, 0x30, 0xb0, 0x52, 0x48, 0x54, 0xa8, 0xca, 0xc9,
++    0x4c, 0x52, 0x28, 0x4a, 0x2d, 0x2c, 0x4d, 0x2d, 0x2e, 0x51, 0x48, 0xcb, 0x2f, 0x52, 0x28, 0xc9, 0x48, 0x55,
++    0x28, 0x2c, 0x4d, 0x2d, 0x4d, 0xd5, 0x51, 0x28, 0x4b, 0xcc, 0x29, 0x4d, 0x55, 0x30, 0xe0, 0x82, 0x69, 0x30,
++    0x24, 0x4e, 0x83, 0x21, 0x5c, 0x83, 0x11, 0x71, 0x1a, 0x4c, 0xe0, 0x1a, 0x8c, 0x89, 0xd3, 0x60, 0xc9, 0x05,
++    0x00, 0xb0, 0x6e, 0x40, 0x49,
++};
++
++std::vector<uint8_t> zlib_text(int lines) {
++    std::string t;
++    char line[96];
++    for (int i = 0; i < lines; ++i) {
++        std::snprintf(line, sizeof line, "line %04d: a zlib request for the queue, value %d\n", i, (i * i) % 97);
++        t += line;
++    }
++    return {t.begin(), t.end()};
++}
++
++uint32_t adler32(const std::vector<uint8_t>& data) {
++    uint32_t a = 1, b = 0;
++    for (const uint8_t x : data) {
++        a = (a + x) % 65521;
++        b = (b + a) % 65521;
++    }
++    return (b << 16) | a;
++}
++
++// A zlib stream (header 78 01) whose first block stores `stored` (a final block when there is no tail), followed by
++// the deflate blocks of the zlib stream `tail` (its header and Adler-32 dropped: a stored block ends on a byte
++// boundary, so they follow as they are) and the Adler-32 of the whole result, `stored` then `tail_plain`.
++std::vector<uint8_t> stored_stream(const std::vector<uint8_t>& stored, const uint8_t* tail = nullptr,
++                                   size_t tail_size = 0, const std::vector<uint8_t>& tail_plain = {}) {
++    const auto n = static_cast<uint16_t>(stored.size());
++    std::vector<uint8_t> z = {0x78, 0x01, static_cast<uint8_t>(tail ? 0 : 1), static_cast<uint8_t>(n),
++                              static_cast<uint8_t>(n >> 8), static_cast<uint8_t>(~n), static_cast<uint8_t>(~n >> 8)};
++    z.insert(z.end(), stored.begin(), stored.end());
++    if (tail) z.insert(z.end(), tail + 2, tail + tail_size - 4);
++    std::vector<uint8_t> plain = stored;
++    plain.insert(plain.end(), tail_plain.begin(), tail_plain.end());
++    const uint32_t check = adler32(plain);
++    for (int shift = 24; shift >= 0; shift -= 8) z.push_back(static_cast<uint8_t>(check >> shift));
++    return z;
++}
++
++void test_zlib(Env& env) {
++    const std::vector<uint8_t> dynamic(std::begin(kZlibDynamic), std::end(kZlibDynamic));
++    const std::vector<uint8_t> fixed(std::begin(kZlibFixed), std::end(kZlibFixed));
++    const std::vector<uint8_t> dynamic_plain = zlib_text(64), fixed_plain = zlib_text(4);
++    // The first block header is the low three bits after the two header bytes: BFINAL, then BTYPE (RFC 1951 3.2.3).
++    check(dynamic.size() == 345 && (dynamic[2] & 7) == (1 | 2 << 1), "kZlibDynamic is one final dynamic block");
++    check(fixed.size() == 77 && (fixed[2] & 7) == (1 | 1 << 1), "kZlibFixed is one final fixed-Huffman block");
++    check(dynamic_plain.size() == 3191 && fixed_plain.size() == 196, "the synthetic text has the generator's sizes");
++
++    const std::vector<uint8_t> stored_part = pattern(300, 21);
++    const std::vector<uint8_t> mixed = stored_stream(stored_part, kZlibDynamic, sizeof kZlibDynamic, dynamic_plain);
++    std::vector<uint8_t> mixed_plain = stored_part;
++    mixed_plain.insert(mixed_plain.end(), dynamic_plain.begin(), dynamic_plain.end());
++    check((mixed[2] & 7) == 0, "the mixed stream starts with a stored block that is not the last");
++    const std::vector<uint8_t> stored_only = stored_stream(pattern(40, 22));  // larger than what it inflates to
++    std::vector<uint8_t> bad_method = dynamic, bad_type = fixed, bad_check = dynamic, preset = dynamic;
++    bad_method[0] ^= 1;          // CM 9: not deflate
++    preset[1] = 0xbb;            // 78 BB: a valid check value with FDICT set (a preset dictionary)
++    bad_type[2] |= 0x06;         // BTYPE 3, reserved
++    bad_check.back() ^= 1;       // the Adler-32
++
++    // One file, every stream at a 16-byte aligned offset and followed by 32 zero bytes.
++    std::vector<uint8_t> file;
++    auto put = [&](const std::vector<uint8_t>& z) {
++        const uint64_t at = file.size();
++        file.insert(file.end(), z.begin(), z.end());
++        file.resize((file.size() + 32 + 15) & ~size_t{15}, 0);
++        return at;
++    };
++    const uint64_t at_dynamic = put(dynamic), at_fixed = put(fixed), at_mixed = put(mixed),
++                   at_stored = put(stored_only), at_method = put(bad_method), at_preset = put(preset),
++                   at_type = put(bad_type), at_check = put(bad_check);
++    write_file(env.game / L"data" / L"zlib.bin", file);
++
++    struct Case {
++        uint64_t offset;
++        uint32_t source, destination;
++        HRESULT want;
++        const std::vector<uint8_t>* result;  // the expected bytes; null when the destination stays untouched
++        const char* what;
++        uint64_t options = 0;
++        uint32_t intermediate = 0;
++    };
++    const auto z = static_cast<uint32_t>(dynamic.size());
++    std::vector<Case> cases = {
++        {at_dynamic, z, 3191, S_OK, &dynamic_plain, "a zlib file request: dynamic Huffman"},
++        {at_fixed, 77, 196, S_OK, &fixed_plain, "a zlib file request: fixed Huffman"},
++        {at_mixed, static_cast<uint32_t>(mixed.size()), 3491, S_OK, &mixed_plain,
++         "a zlib file request: a stored block, then dynamic Huffman"},
++        {at_dynamic, z + 16, 3191, S_OK, &dynamic_plain, "bytes after the Adler-32 are not read"},
++        {at_stored, static_cast<uint32_t>(stored_only.size()), 40, E_DSTORAGE_INVALID_DESTINATION_SIZE, nullptr,
++         "a zlib DestinationSize not larger than SourceSize"},
++        {at_method, z, 3191, E_DSTORAGE_ZLIB_BAD_HEADER, nullptr, "a header that is not deflate"},
++        {at_preset, z, 3191, E_DSTORAGE_ZLIB_BAD_HEADER, nullptr, "a header with a preset dictionary"},
++        {at_type, 77, 196, E_DSTORAGE_ZLIB_BAD_DATA, nullptr, "a reserved block type"},
++        {at_dynamic, z - 10, 3191, E_DSTORAGE_ZLIB_BAD_DATA, nullptr, "a truncated stream"},
++        {at_check, z, 3191, E_DSTORAGE_ZLIB_PARITY_FAIL, nullptr, "an Adler-32 mismatch"},
++        {at_dynamic, z, 3192, E_DSTORAGE_DECOMPRESSION_ERROR, nullptr, "a stream shorter than DestinationSize"},
++        {at_dynamic, z, 3190, E_DSTORAGE_DECOMPRESSION_ERROR, nullptr, "a stream longer than DestinationSize"},
++        {at_dynamic + 8, z, 3191, E_DSTORAGE_INVALID_FILE_OFFSET, nullptr, "a zlib offset not 16-byte aligned"},
++        {file.size() - 16, 32, 64, E_DSTORAGE_END_OF_FILE, nullptr, "a zlib source past the end of the file"},
++        {at_dynamic, z, 3191, E_DSTORAGE_INVALID_INTERMEDIATE_SIZE, nullptr, "zlib with an IntermediateSize", 0,
++         16},
++        {at_dynamic, z, 3191, E_NOTIMPL, nullptr, "zlib and BCPack is not implemented yet",
++         static_cast<uint64_t>(DSTORAGE_BCPACK_MODE_BC1) << options::kBcpackShift, 64},
++        {at_dynamic, z, 3191, E_NOTIMPL, nullptr, "zlib and swizzle is not implemented yet",
++         static_cast<uint64_t>(DSTORAGE_SWIZZLE_MODE_4K_4K_8K) << options::kSwizzleShift},
++    };
++
++    DSTORAGE_STATS before{};
++    env.factory->GetStats(&before);
++    IDStorageFileX* f = open(env, L"GAME:\\data\\zlib.bin");
++    IDStorageQueueX2* q = make_queue(env, 0x80, false);
++    IDStorageStatusArrayX* s = make_status(env, static_cast<UINT32>(cases.size()));
++    constexpr size_t kSlack = 64;  // past DestinationSize: must stay untouched
++    std::vector<std::vector<uint8_t>> out(cases.size());
++    for (size_t i = 0; i < cases.size(); ++i) {
++        const Case& c = cases[i];
++        out[i].assign(c.destination + kSlack, 0xEE);
++        DSTORAGE_REQUEST r = file_request(f, c.offset, out[i].data(), c.destination);
++        r.SourceSize = c.source;
++        r.IntermediateSize = c.intermediate;
++        r.Options.AsUINT64 = options::kZlib | c.options;
++        q->EnqueueRequest(&r);
++        q->EnqueueStatus(s, static_cast<UINT32>(i));
++    }
++    q->Submit();
++    check(wait_complete(s, static_cast<UINT32>(cases.size() - 1)), "the zlib file requests complete");
++    for (size_t i = 0; i < cases.size(); ++i) {
++        const Case& c = cases[i];
++        check_hr(s->GetHResult(static_cast<UINT32>(i)), c.want, c.what);
++        const std::vector<uint8_t> untouched(c.destination, 0xEE);
++        const bool head = c.result ? std::equal(c.result->begin(), c.result->end(), out[i].begin())
++                                   : std::equal(untouched.begin(), untouched.end(), out[i].begin());
++        const bool tail = std::all_of(out[i].end() - kSlack, out[i].end(), [](uint8_t x) { return x == 0xEE; });
++        check(head && tail, c.result ? "the inflated bytes are the synthetic text, and nothing past them"
++                                     : "a failed zlib request leaves the destination untouched");
++    }
++    s->Release();
++    q->Release();
++    f->Release();
++
++    // A memory source: the same stream, one inflated in place (the compressed bytes sit at the end of their own
++    // destination, as a title may load them), a corrupt one, a source and a destination the process cannot touch.
++    IDStorageQueueX2* mq = make_queue(env, 0x80, true, DSTORAGE_REQUEST_SOURCE_MEMORY, DSTORAGE_PRIORITY_REALTIME);
++    IDStorageStatusArrayX* ms = make_status(env, 5);
++    void* reserved = VirtualAlloc(nullptr, 1 << 16, MEM_RESERVE, PAGE_READWRITE);
++    std::vector<uint8_t> m0(3191, 0xEE), in_place(3191, 0xEE), m2(3191, 0xEE), m3(3191, 0xEE);
++    std::copy(dynamic.begin(), dynamic.end(), in_place.end() - dynamic.size());
++    DSTORAGE_REQUEST r{};
++    r.Options.AsUINT64 = options::kZlib | options::kSourceMemory;
++    r.SourceSize = z;
++    r.DestinationSize = 3191;
++    r.Source = dynamic.data();
++    r.Destination = m0.data();
++    mq->EnqueueRequest(&r);
++    mq->EnqueueStatus(ms, 0);
++    r.Source = in_place.data() + in_place.size() - dynamic.size();
++    r.Destination = in_place.data();
++    mq->EnqueueRequest(&r);
++    mq->EnqueueStatus(ms, 1);
++    r.Source = bad_check.data();
++    r.Destination = m2.data();
++    mq->EnqueueRequest(&r);
++    mq->EnqueueStatus(ms, 2);
++    r.Source = reserved;
++    r.Destination = m3.data();
++    mq->EnqueueRequest(&r);
++    mq->EnqueueStatus(ms, 3);
++    r.Source = dynamic.data();
++    r.Destination = reserved;
++    mq->EnqueueRequest(&r);
++    mq->EnqueueStatus(ms, 4);
++    mq->Submit();
++    check(wait_complete(ms, 4), "the zlib memory requests complete");
++    check_hr(ms->GetHResult(0), S_OK, "a zlib memory request");
++    check(m0 == dynamic_plain, "the zlib memory request inflates to the synthetic text");
++    check_hr(ms->GetHResult(1), S_OK, "a zlib memory request whose source lies inside its destination");
++    check(in_place == dynamic_plain, "inflating in place gives the synthetic text");
++    check_hr(ms->GetHResult(2), E_DSTORAGE_ZLIB_PARITY_FAIL, "a zlib memory request with an Adler-32 mismatch");
++    check(m2 == std::vector<uint8_t>(3191, 0xEE), "the failed zlib memory request leaves the destination untouched");
++    check_hr(ms->GetHResult(3), E_DSTORAGE_ACCESS_VIOLATION, "a zlib source the process cannot read");
++    check_hr(ms->GetHResult(4), E_DSTORAGE_ACCESS_VIOLATION, "a zlib destination the process cannot write");
++    VirtualFree(reserved, 0, MEM_RELEASE);
++    ms->Release();
++    mq->Release();
++
++    // Counted when the inflate starts: the 11 file requests (4 good, 7 bad streams) and 4 memory requests (all but the
++    // unreadable source) whose checks passed and whose source was read. Failed: the 7 bad file streams and the memory
++    // one with an Adler-32 mismatch; a destination the process cannot write is not a decompression error.
++    DSTORAGE_STATS after{};
++    env.factory->GetStats(&after);
++    check(after.TotalDecompressionRequestCount - before.TotalDecompressionRequestCount == 15,
++          "TotalDecompressionRequestCount counts the zlib requests that reached the inflate");
++    check(after.DecompressionErrors - before.DecompressionErrors == 8, "DecompressionErrors counts the bad streams");
++    check(after.PendingDecompressionRequestCount == 0, "no decompression is pending afterwards");
++}
++
+ }  // namespace
+ 
+ int main() {
+@@ -1013,6 +1252,7 @@ int main() {
+     test_iid_policy_events_and_cancel(env);
+     test_stats_timing(env);
+     test_stats(env);
++    test_zlib(env);  // after test_stats, whose request totals it would change
+ 
+     fs::remove_all(env.root, ec);
+     std::printf("dstorage: %d checks, %d failures\n", g_checks, g_failures);
+diff --git a/runtime/test/shader_library_test.cpp b/runtime/test/shader_library_test.cpp
+index e956fe984..b76e77df8 100644
+--- a/runtime/test/shader_library_test.cpp
++++ b/runtime/test/shader_library_test.cpp
+@@ -292,6 +292,16 @@ int main() {
+     CHECK(!zlib_inflate(broken, out));
+     CHECK(!zlib_inflate(dynamic, out, 599));  // larger than the limit
+     CHECK(!zlib_inflate(bytes("not zlib"), out));
++    // The reason a caller can ask for (dstorage.cpp reports each with its own HRESULT).
++    ZlibError why = ZlibError::limit;
++    CHECK(zlib_inflate(dynamic, out, 600, &why) && why == ZlibError::none);
++    CHECK(!zlib_inflate(dynamic, out, 599, &why) && why == ZlibError::limit);
++    CHECK(!zlib_inflate(bytes("not zlib"), out, 1 << 20, &why) && why == ZlibError::header);
++    broken = dynamic;
++    broken.back() ^= 1;
++    CHECK(!zlib_inflate(broken, out, 1 << 20, &why) && why == ZlibError::checksum);
++    broken.resize(100);
++    CHECK(!zlib_inflate(broken, out, 1 << 20, &why) && why == ZlibError::data);
+ 
+     Json json;
+     // "s" holds an escaped quote and a \u escape for U+00E9, which the reader must turn into UTF-8.
+-- 
+2.54.0
+

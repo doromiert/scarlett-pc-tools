@@ -1,0 +1,114 @@
+From fb5806d848dfc4890556df10fa53700272af4dad Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 20:19:41 +0100
+Subject: [PATCH 07/10] Add opt-in GPU frame readback statistics for actual
+ presentation diagnosis
+
+---
+ runtime/shims/d3d12_com.h             |  3 ++
+ runtime/shims/d3d12_vulkan_device.cpp | 51 ++++++++++++++++++++++++---
+ 2 files changed, 50 insertions(+), 4 deletions(-)
+
+diff --git a/runtime/shims/d3d12_com.h b/runtime/shims/d3d12_com.h
+index 7559b0dec..ca461624b 100644
+--- a/runtime/shims/d3d12_com.h
++++ b/runtime/shims/d3d12_com.h
+@@ -356,6 +356,9 @@ private:
+     IUnknown* device_;
+     HWND window_ = nullptr;
+     std::unique_ptr<leonida::VulkanPresenter> presenter_;
++    void report_capture();
++    bool capture_stats_ = false;
++    std::uint64_t capture_attempts_ = 0;
+ };
+ 
+ // Whether `device` (from create_vulkan_device*) was created with VK_EXT_swapchain_colorspace on its instance.
+diff --git a/runtime/shims/d3d12_vulkan_device.cpp b/runtime/shims/d3d12_vulkan_device.cpp
+index 1efb3bb39..c1e0aa8b9 100644
+--- a/runtime/shims/d3d12_vulkan_device.cpp
++++ b/runtime/shims/d3d12_vulkan_device.cpp
+@@ -8922,6 +8922,11 @@ BindlessRoom bindless_room(ID3D12Device* device) {
+ WindowPresenter::WindowPresenter(IUnknown* device, std::unique_ptr<leonida::VulkanPresenter> presenter)
+     : device_(device), presenter_(std::move(presenter)) {
+     device_->AddRef();
++    char capture[2]{};
++    if (GetEnvironmentVariableA("LEONIDA_CAPTURE_STATS", capture, sizeof(capture)) == 1 && capture[0] == '1') {
++        capture_stats_ = presenter_->enable_capture();
++        std::fprintf(stderr, "[rt] frame capture diagnostics %s\n", capture_stats_ ? "enabled" : "unavailable");
++    }
+ }
+ 
+ WindowPresenter::~WindowPresenter() {
+@@ -8945,8 +8950,10 @@ HRESULT WindowPresenter::present(ID3D12Resource* back_buffer, UINT sync_interval
+     const leonida::PresentRect rect = src_rect ? leonida::PresentRect{src_rect->left, src_rect->top, src_rect->right,
+                                                                        src_rect->bottom}
+                                                : leonida::PresentRect{};
+-    return present_result(presenter_->present(resource_id(back_buffer), sync_interval > 0, src_rect ? &rect : nullptr,
+-                                              tear));
++    const HRESULT result = present_result(presenter_->present(resource_id(back_buffer), sync_interval > 0,
++                                                              src_rect ? &rect : nullptr, tear));
++    if (SUCCEEDED(result)) report_capture();
++    return result;
+ }
+ 
+ bool WindowPresenter::tear_supported() const { return presenter_->tear_supported(); }
+@@ -8954,11 +8961,15 @@ bool WindowPresenter::last_present_tore() const { return presenter_->last_presen
+ std::uint64_t WindowPresenter::tear_presents() const { return presenter_->tear_presents(); }
+ 
+ HRESULT WindowPresenter::present_blank(UINT sync_interval) {
+-    return present_result(presenter_->present_blank(sync_interval > 0));
++    const HRESULT result = present_result(presenter_->present_blank(sync_interval > 0));
++    if (SUCCEEDED(result)) report_capture();
++    return result;
+ }
+ 
+ HRESULT WindowPresenter::present_planes(const leonida::PresentPlanes& planes, UINT sync_interval, bool tear) {
+-    return present_result(presenter_->present_planes(planes, sync_interval > 0, tear));
++    const HRESULT result = present_result(presenter_->present_planes(planes, sync_interval > 0, tear));
++    if (SUCCEEDED(result)) report_capture();
++    return result;
+ }
+ 
+ bool WindowPresenter::hdr_active() const { return presenter_->hdr_active(); }
+@@ -9004,6 +9015,38 @@ float WindowPresenter::display_sdr_white_nits() const {
+     return 0.0f;
+ }
+ 
++void WindowPresenter::report_capture() {
++    if (!capture_stats_) return;
++    const auto attempt = ++capture_attempts_;
++    if (attempt != 1 && attempt != 120 && attempt != 600) return;
++    std::vector<std::uint8_t> pixels;
++    VkExtent2D size{};
++    VkFormat format{};
++    if (!presenter_->read_back(pixels, &size, &format)) {
++        std::fprintf(stderr, "[rt] frame capture: attempt=%llu actual presents=%llu, no completed image\n",
++                     static_cast<unsigned long long>(attempt), static_cast<unsigned long long>(presenter_->presented()));
++        return;
++    }
++    if (format != VK_FORMAT_R8G8B8A8_UNORM && format != VK_FORMAT_R8G8B8A8_SRGB &&
++        format != VK_FORMAT_B8G8R8A8_UNORM && format != VK_FORMAT_B8G8R8A8_SRGB) {
++        std::fprintf(stderr, "[rt] frame capture: %ux%u format=%d (pixel statistics unavailable)\n",
++                     size.width, size.height, int(format));
++        return;
++    }
++    unsigned low = 255, high = 0;
++    std::uint64_t changed = 0;
++    for (std::size_t i = 0; i + 3 < pixels.size(); i += 4) {
++        for (unsigned c = 0; c < 3; ++c) {
++            low = (std::min)(low, unsigned(pixels[i + c]));
++            high = (std::max)(high, unsigned(pixels[i + c]));
++        }
++        if (pixels[i] != pixels[0] || pixels[i + 1] != pixels[1] || pixels[i + 2] != pixels[2]) ++changed;
++    }
++    std::fprintf(stderr, "[rt] frame capture: attempt=%llu %ux%u RGB range=%u..%u nonuniform pixels=%llu\n",
++                 static_cast<unsigned long long>(attempt), size.width, size.height, low, high,
++                 static_cast<unsigned long long>(changed));
++}
++
+ bool WindowPresenter::enable_capture() { return presenter_->enable_capture(); }
+ 
+ void WindowPresenter::set_abort(std::function<bool()> abort) { presenter_->set_abort(std::move(abort)); }
+-- 
+2.54.0
+

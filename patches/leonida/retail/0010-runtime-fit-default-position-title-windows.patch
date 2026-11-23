@@ -1,0 +1,59 @@
+From cc39adbbc59df49d2448bc4052b45d1f848c31f3 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 20:34:27 +0100
+Subject: [PATCH 10/10] runtime: fit default-position title windows
+
+---
+ runtime/shims/title_window.cpp | 24 +++++++++++++++++++-----
+ 1 file changed, 19 insertions(+), 5 deletions(-)
+
+diff --git a/runtime/shims/title_window.cpp b/runtime/shims/title_window.cpp
+index 8b28c1266..dd9dfe0b2 100644
+--- a/runtime/shims/title_window.cpp
++++ b/runtime/shims/title_window.cpp
+@@ -5,6 +5,7 @@
+ #include <windows.h>
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstdint>
+ #include <cstdio>
+ 
+@@ -12,16 +13,29 @@ namespace {
+ 
+ HWND WINAPI create_window_ex_a(DWORD ex_style, LPCSTR class_name, LPCSTR window_name, DWORD style, int x, int y,
+                                int width, int height, HWND parent, HMENU menu, HINSTANCE instance, LPVOID param) {
+-    const bool uses_default = x == CW_USEDEFAULT || y == CW_USEDEFAULT || width == CW_USEDEFAULT ||
+-                              height == CW_USEDEFAULT;
+-    if ((style & WS_CHILD) || parent == HWND_MESSAGE || uses_default || width <= 0 || height <= 0)
++    const bool top_level = !(style & WS_CHILD) && parent != HWND_MESSAGE;
++    static std::atomic<bool> logged_top_level{false};
++    if (top_level && !logged_top_level.exchange(true))
++        std::fprintf(stderr, "[rt] window: first top-level request x=%d y=%d width=%d height=%d style=0x%08lx\n", x,
++                     y, width, height, static_cast<unsigned long>(style));
++    // A default width asks Windows to choose the complete geometry. A default position with an explicit size can
++    // still be checked: small windows keep their native default placement; oversized ones are fit and centred.
++    if (!top_level || width == CW_USEDEFAULT || height == CW_USEDEFAULT || width <= 0 || height <= 0)
+         return CreateWindowExA(ex_style, class_name, window_name, style, x, y, width, height, parent, menu, instance,
+                                param);
+ 
+-    RECT requested{x, y, x + width, y + height};
++    HMONITOR target_monitor = nullptr;
++    if (x == CW_USEDEFAULT || y == CW_USEDEFAULT) {
++        POINT cursor{};
++        GetCursorPos(&cursor);
++        target_monitor = MonitorFromPoint(cursor, MONITOR_DEFAULTTOPRIMARY);
++    } else {
++        RECT requested{x, y, x + width, y + height};
++        target_monitor = MonitorFromRect(&requested, MONITOR_DEFAULTTONEAREST);
++    }
+     MONITORINFO monitor{};
+     monitor.cbSize = sizeof(monitor);
+-    if (!GetMonitorInfoW(MonitorFromRect(&requested, MONITOR_DEFAULTTONEAREST), &monitor))
++    if (!target_monitor || !GetMonitorInfoW(target_monitor, &monitor))
+         return CreateWindowExA(ex_style, class_name, window_name, style, x, y, width, height, parent, menu, instance,
+                                param);
+ 
+-- 
+2.54.0
+

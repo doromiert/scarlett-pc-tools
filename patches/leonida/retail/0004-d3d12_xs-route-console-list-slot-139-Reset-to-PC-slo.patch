@@ -1,0 +1,75 @@
+From 9a77e6df7f362940f5c08f39fdd04bd8cf18493c Mon Sep 17 00:00:00 2001
+From: Nolan Cotter <186326284+NolanCotter@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 10:14:43 -0700
+Subject: [PATCH 04/10] d3d12_xs: route console list slot 139 (Reset) to PC
+ slot 10
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Pipodi measured the retail title calling console list slot 139 with
+(allocator proxy, pso) before recording — Reset, at PC slot 10. Map it
+and unwrap the allocator (and a pipeline state the same way); the
+unwrap now keys on the PC slot so console-10 and console-139 both land
+on the real Reset.
+
+xs_proxy_mock: PASS under Wine
+
+Generated with [Devin](https://devin.ai)
+
+Co-Authored-By: Devin <158243242+devin-ai-integration[bot]@users.noreply.github.com>
+---
+ docs/d3d12_xs_console_abi.md      | 1 +
+ runtime/shims/d3d12_xs_device.cpp | 9 +++++++--
+ 2 files changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/docs/d3d12_xs_console_abi.md b/docs/d3d12_xs_console_abi.md
+index 604eb0e1f..e1ec05fc7 100644
+--- a/docs/d3d12_xs_console_abi.md
++++ b/docs/d3d12_xs_console_abi.md
+@@ -164,6 +164,7 @@ end; on a full buffer they call the vtable method the record stands for (Package
+ | 80 | `ExecuteIndirect` | Sibling layer (note: the package measured slot 80 as a console-only call, a `Dispatch`-with-extra-word shape; slot assignments past 61 differ between the two sources — unconfirmed) |
+ | 83 | `CopyTextureRegionX` (older layout) | Sibling layer; the package measured a `CopyTextureRegion`-shaped call at slot 85 — consistent with the newer layout (+2) |
+ | 108 | `ResolveSubresourceRegion` | Sibling layer |
++| 139 | `Reset(allocator, pso)` → PC slot 10 | **Measured here**: retail 1.0.2.1 (Pipodi) — the title creates a list, `Close`s at slot 9, then calls 139 with `(allocator proxy, 0)` before recording; the proxy unwraps the allocator and forwards to PC `Reset` |
+ | 146 | enhanced `Barrier` | **Confirmed here**: Package (console slot 146 takes one `D3D12_BARRIER_GROUP`; PC equivalent is GCL7 slot 80) |
+ | 148 | `AllocateUploadMemory` `(size, alignment)`; the returned CPU pointer is the GPU address in unified memory | Package + sibling layer |
+ 
+diff --git a/runtime/shims/d3d12_xs_device.cpp b/runtime/shims/d3d12_xs_device.cpp
+index 72da24e4e..69d84bb73 100644
+--- a/runtime/shims/d3d12_xs_device.cpp
++++ b/runtime/shims/d3d12_xs_device.cpp
+@@ -1827,6 +1827,7 @@ constexpr unsigned kConsoleClearDepthStencilView = 51;
+ constexpr unsigned kConsoleClearRenderTargetView = 52;
+ constexpr unsigned kConsoleClearUavUint = 53;
+ constexpr unsigned kConsoleClearUavFloat = 54;
++constexpr unsigned kConsoleReset = 139;
+ constexpr unsigned kConsoleBarrier = 146;
+ constexpr unsigned kConsoleAllocateUpload = 148;
+ 
+@@ -1837,6 +1838,7 @@ constexpr unsigned console_to_pc_list_slot(unsigned slot) {
+     if (slot == 60) return 58;                 // EndEvent (no console SetMarker/BeginEvent)
+     if (slot == 61) return 59;                 // ExecuteIndirect (Package)
+     if (slot == kConsoleBarrier) return 80;    // D3D12_BARRIER_GROUP (Package; PC GCL7)
++    if (slot == kConsoleReset) return 10;      // Reset(allocator, pso): measured on the retail title (Pipodi)
+     return kListNotForwarded;
+ }
+ 
+@@ -2019,9 +2021,12 @@ std::uint64_t WINAPI list_slot(ListProxy* self, std::uint64_t a1, std::uint64_t
+                                                      std::uint64_t, std::uint64_t, std::uint64_t,
+                                                      std::uint64_t, std::uint64_t);
+             auto** const real_vtable = *reinterpret_cast<void***>(self->real);
+-            if constexpr (Slot == 10) {
+-                // Reset(allocator, pso): the title hands its allocator proxy; the real list takes the real one.
++            if constexpr (pc == 10) {
++                // Reset(allocator, pso) — console 10, and 139 as the retail title calls it: the title hands its
++                // allocator proxy; the real list takes the real one (and a wrapped pipeline state, if that ever
++                // exists, the same way).
+                 a1 = unwrap_object(a1);
++                a2 = unwrap_object(a2);
+             } else if constexpr (Slot == kConsoleExecuteBundle) {
+                 a1 = unwrap_object(a1);  // the bundle is a list proxy too
+             } else if constexpr (Slot >= 41 && Slot <= 46) {
+-- 
+2.54.0
+

@@ -131,6 +131,27 @@ The Discord screenshot's black-screen/brief-audio claim contains no build revisi
 It has not been reproduced locally. The normal launcher clears both known guest
 assertion-skip environment variables; a diagnostic bypass is not a successful boot.
 
+## Latest retail runtime experiment
+
+The separate source recipe is [RETAIL_EXPERIMENT.md](RETAIL_EXPERIMENT.md).
+The measured audio allocation ABI and console command-list reset cleared the
+previous startup crashes and failed closes. Actual assertion-enabled Wine/RADV
+runs now stay alive throughout 180-second observations, repeatedly submit draws
+and report successful presentation. GPU readback confirms that sampled frames
+are entirely black; no menu or controllable scene has appeared. A successful
+present is not evidence of useful rendered content.
+
+All 42 initially captured native compute payloads translated and validated after
+the upstream thread-group SGPR change. The title subsequently requests hundreds
+of additional pipeline-library compute programs. The first library pass produced
+1,860 validated modules; they need the library's exact kind-0 dispatch-state keys
+to match at runtime. Further translation and actual launch work continues.
+
+The XCL upstream comparison has advanced to `956a476` for another local build.
+Its README reports a steady frame loop but still a black image for the newer
+retail title. Our actual launch still stops at VKD3D shared-fence vtable identity
+assertion; the frame-loop claim was not reproduced in our Wine setup.
+
 ## Not verified
 
 Rendered output, audio output, a playable scene, simulation speed at

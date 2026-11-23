@@ -206,6 +206,18 @@ def leonida_run(target, loader, output, timeout, wine=None):
         env.update(WINEPREFIX=str(attempt / "wineprefix"), WINEARCH="win64", WINEDEBUG="-all",
                    WINEDLLOVERRIDES="mscoree,mshtml=;winedbg.exe=d")
         env["PATH"] = str(Path(wine).parent) + os.pathsep + env.get("PATH", "")
+        # Daemon-launched terminals may lack the desktop session's display variables.
+        if not env.get("DISPLAY") and not env.get("WAYLAND_DISPLAY"):
+            try:
+                desktop = subprocess.run(["systemctl", "--user", "show-environment"],
+                                         capture_output=True, text=True, check=True, timeout=1)
+                for line in desktop.stdout.splitlines():
+                    key, separator, value = line.partition("=")
+                    if separator and value and not env.get(key) and key in {
+                            "DISPLAY", "WAYLAND_DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR"}:
+                        env[key] = value
+            except (OSError, subprocess.SubprocessError):
+                pass
     log = attempt / "run.log"
     print(f"Launching actual executable; private log: {log}", file=sys.stderr, flush=True)
     start = time.monotonic()

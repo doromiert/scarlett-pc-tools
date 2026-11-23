@@ -1,0 +1,245 @@
+From 35a35670227aeaae2ca9f352de2707a25a2f0dce Mon Sep 17 00:00:00 2001
+From: FIocker <4461558+FIocker@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 16:10:47 +0100
+Subject: [PATCH 3/7] shader_library: fix the #4343 review findings; recount
+ with llvm-mc 21 and 23
+
+Review findings on #4343 (@tupacfan04):
+* A compute record may hold NONE in any field (ref allows it), but parse()
+  indexed the blob table with a NONE layout (IndexError) and main() decoded a
+  NONE state. A record without a program now names no stage, one without a
+  layout links no digest, one without a state gets no dispatch fields, and
+  library.json gives a missing program as null.
+* find_library inflated any false zlib header without a cap, up to ~132 MB per
+  stream. Each stream now inflates to at most BLOCK + 1 bytes (a library block
+  is at most 64 KiB, so a longer stream isn't one), and a header that asks for
+  more than 1032:1 of the bytes after it is rejected.
+Three new tests fail on main (the IndexError, the ratio, a too-long stream with a
+library header) and pass here.
+
+docs/shader_library.md:
+* 91 compute programs set TG_SIZE_EN, not 90 (90 was the refusal count; one
+  program is refused earlier).
+* A default run writes 21,521 programs: --stages all adds the slot-6 one
+  (@bielfreedom).
+* Section 5 said llvm-mc 23, but those counts were made with 21.1.8, which can't
+  decode the vcc tuples (LLVM 23 added VCCTuple). The section now compares 21.1.8
+  (15,551), 23.1.5 (16,699) and 23.1.5 with #6446, #6808 and #6809 (18,544) at
+  main 561b65a8, and lists what stops the rest. Section 4 says to use llvm-mc 23.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ docs/shader_library.md       | 77 ++++++++++++++++++++----------------
+ tests/test_shader_library.py | 42 ++++++++++++++++++++
+ tools/shader_library.py      | 13 ++++--
+ 3 files changed, 96 insertions(+), 36 deletions(-)
+
+diff --git a/docs/shader_library.md b/docs/shader_library.md
+index 6e29edc89..f8224ffdd 100644
+--- a/docs/shader_library.md
++++ b/docs/shader_library.md
+@@ -76,8 +76,8 @@ have the sizes and shapes of the four [FSPX](fspx.md) kinds:
+ | program | | kind 6 |
+ | layout blob | 56 to 10,552 bytes | kind 7 |
+ 
+-1,529 of the 2,684 compute programs set the wave32 flag. 90 set RSRC2 `TG_SIZE_EN` (bit 10), which none of the
+-2,689 carved compute shaders do.
++1,529 of the 2,684 compute programs set the wave32 flag. 91 set RSRC2 `TG_SIZE_EN` (bit 10), which none of the
++2,689 carved compute shaders do. No program is named by two records that differ in that bit.
+ 
+ **Programs.** 52 to 239,464 bytes (median 3,968; 238,829,764 in total), padded to 256 bytes with `s_code_end`.
+ 21,463 of them start with the 36-byte prologue FSPX programs have, three 12-byte VOP3 opcode-0x180 words with
+@@ -115,11 +115,14 @@ python -I tools/rdna2spirv.py <work>/library/disasm --out <work>/library/spirv
+   `library.json` with the header and both pipeline tables, stage to program name. Programs are named
+   `lib_<stage>_<index>`.
+ * `--disasm` writes `disasm/<name>.s` for the code after the prologue, as `fspx_unpack.py --disasm` does.
++  Use llvm-mc 23 (`scripts/build_llvm_mc.ps1 -Version 23.1.5`, or the `llvm-23` package): older versions can't
++  decode the `vcc` tuples these programs use (§5).
+ * `--carve` names each program's source shaders. It copies the first source container to `<name>.dxbc`, because
+   the translator reads the stage's signatures and `PSV0` from there. Pipeline compilation keeps the D3D12 stage
+   interface.
+ * `--save` writes the reassembled library. A saved file is also accepted as input.
+-* `--stages` limits the output to some stages.
++* `--stages` limits the output to some stages. The default, `cs,ps,vs,ms`, leaves out the slot-6 program, so a
++  default run writes 21,521 of the 21,522 programs; `--stages all` writes it too.
+ 
+ The output is game data and must stay in your work folder. `tests/test_shader_library.py` builds libraries and
+ archives by hand and covers the header, both tables, the size checks, the search in an archive and the digest
+@@ -127,36 +130,44 @@ walk. It also checks the `--carve` copy and the translator's reads of the comput
+ 
+ ## 5. Translation
+ 
+-With `--carve` and `rdna2spirv.py` at `main` `aa2988cc` (llvm-mc 23, `gfx1013`), **17,955 of the 21,522 programs
+-translate and pass `spirv-val`**:
+-
+-| stage | programs | pass `spirv-val` |
+-|---|---:|---:|
+-| VS | 1,343 | 1,333 (99.3%) |
+-| MS | 7,498 | 7,059 (94.1%) |
+-| PS | 9,996 | 7,719 (77.2%) |
+-| CS | 2,684 | 1,844 (68.7%) |
+-| slot 6 | 1 | 0 (stage not identified) |
+-
+-What stops the rest, by the translator's message:
+-
+-* **2,533 programs: "reachable instruction with normalized encoding".** llvm-mc rejects scalar register tuples that
+-  run into `vcc` (SGPRs 106 and 107): `s_load_dwordx8`/`x4`/`x16` writing `s[100:107]`, `s[104:107]` or
+-  `s[92:107]`, and image instructions whose resource is `s[100:107]`. In the compute programs alone that is 37,952
+-  SMEM, 22,248 MIMG and 2,298 MUBUF words. The same words with the register field one tuple lower decode; with
+-  `gfx1030` they don't either. The FSSM shaders don't use these tuples; the pipeline builds use them often. A decoder
+-  fallback for these encodings would cover most of the remaining programs. The translator already reads
+-  `[s100,...,vcc_lo,vcc_hi]` lists (design.md *Scalar/buffer memory*).
+-* **443: an instruction llvm-mc prints with another encoding than the blob's** (`v_fma_mix*`, `v_interp_p2_f16`):
+-  the existing `check_printed_encodings` refusal.
+-* **90 CS: "CS thread-group-size SGPR"**: RSRC2 `TG_SIZE_EN`, which no FSSM compute shader sets.
+-* **68 translate but fail `spirv-val`**, mostly "requires a previous definition".
+-* Fewer than 30 each: `ds_append`, `s_bitreplicate_b64_b32` and `s_flbit_i32_b64` on a lane mask, `v_cmp` and mask
+-  destinations, 25 branches into data, 10 undecodable words that can't be re-anchored, and a few `vcc`/`ttmp`
+-  operands.
+-* Programs with no source container: a PS or MS one has no signatures and is `Unsupported` (the reads now raise
+-  that instead of `FileNotFoundError`, which stopped the whole run). A VS that fetches no inputs translates without
+-  one.
++**The llvm-mc version matters here.** The first count of this section (17,955 at `aa2988cc`) said llvm-mc 23, but it
++was made with llvm-mc 21.1.8, which rejects the scalar register tuples that run into `vcc` (SGPRs 106 and 107):
++`s_load_dwordx8`/`x4`/`x16` writing `s[100:107]`, `s[104:107]` or `s[92:107]`, and image and buffer instructions
++whose resource or sampler includes them. LLVM 22.1.8 rejects them too. LLVM 23 added register classes for these
++tuples (`VCCTuple` in `SIRegisterInfo.td`) and prints them as lists, `[s100,s101,s102,s103,s104,s105,vcc_lo,vcc_hi]`,
++which the translator reads (design.md, *Scalar/buffer memory*). The FSSM shaders don't use these tuples; the
++pipeline builds use them often: with llvm-mc 21 they blocked 2,533 programs. LLVM 23 also prints some `v_fma_mix*`
++literals as `lit(V)` where LLVM 21 printed the inline constant of their low half and dropped the literal.
++
++With `--stages all --disasm --carve` and `rdna2spirv.py` at `main` `561b65a8` (`gfx1013`), the programs that
++translate and pass `spirv-val`:
++
++| stage | programs | llvm-mc 21.1.8 | llvm-mc 23.1.5 | 23.1.5 with #6446, #6808, #6809 |
++|---|---:|---:|---:|---:|
++| VS | 1,343 | 1,296 | 1,335 | 1,340 |
++| MS | 7,498 | 6,744 | 7,427 | 7,473 |
++| PS | 9,996 | 6,119 | 6,442 | 7,871 |
++| CS | 2,684 | 1,392 | 1,495 | 1,860 |
++| total | 21,521 | 15,551 | 16,699 | 18,544 |
++
++The slot-6 program isn't counted (its stage is not identified). The three pull requests: #6446 writes the compute
++thread-group SGPR (RSRC2 `TG_SIZE_EN`, set by 91 compute programs and by no FSSM shader), #6808 reads `lit(V)`, #6809
++translates `s_bfm_b64` in wave32 code as data (958 wave32 compute programs build an S# with it, and the FSPX wave32
++check counted it as wave64 code).
++
++What stops the other 2,977 with all three, by the translator's message:
++
++* **1,731: "fall-through into undecodable words".** Words no llvm-mc version decodes for `gfx1013`, on a reachable
++  path. Most are VOPC compares with a DPP16 source (`src0` 0xFA, e.g. `quad_perm`), which LLVM decodes only for
++  gfx11 and later, followed by their DPP word; the rest are VOP3 opcode 0x180 words with a literal, the instruction
++  the 36-byte prologue is made of, inside the code.
++* **767: "v_cmp destination"**, almost all `v_cmp_*_e64 vcc_hi, ...` in wave32 code (6,324 compares in 910 programs):
++  the compiler keeps a 32-bit lane mask in `vcc_hi`, which the translator models only as half of wave64 `vcc`.
++* **204: `v_interp_p2_f16` printed without its `op_sel`** (`check_printed_encodings`).
++* **149: "mask destination"**, and fewer than 60 each: `s_load*` with `vcc` as the base pointer (54), `ds_append`,
++  `s_bitreplicate_b64_b32` and `s_flbit_i32_b64` on a lane mask, `s_getpc_b64` destinations.
++* Programs with no source container: a PS or MS one has no signatures and is `Unsupported`. A VS that fetches no
++  inputs translates without one.
+ 
+ None of the programs has been run on a GPU.
+ 
+diff --git a/tests/test_shader_library.py b/tests/test_shader_library.py
+index 8bbde96f9..385280aa0 100644
+--- a/tests/test_shader_library.py
++++ b/tests/test_shader_library.py
+@@ -185,6 +185,48 @@ class Parse(unittest.TestCase):
+         with self.assertRaises(sl.LibraryError):
+             sl.find_library(b"9FPR" + bytes(4096))
+ 
++    def test_find_skips_streams_larger_than_a_block(self):
++        # A stream that inflates past 64 KiB is not a library block: skipped, and inflated only to BLOCK + 1 bytes.
++        lib = sample()
++        self.assertEqual(sl.find_library(zlib.compress(bytes(4 * sl.BLOCK), 9) + archive(lib)), lib)
++        head = bytearray(sl.HEADER)                  # a library header at the start of a too-long stream
++        head[:4] = sl.MAGIC
++        self.assertEqual(sl.find_library(zlib.compress(bytes(head) + bytes(2 * sl.BLOCK), 9) + archive(lib)), lib)
++
++    def test_find_rejects_a_size_the_archive_cannot_hold(self):
++        head = bytearray(sl.HEADER)
++        head[:4] = sl.MAGIC
++        struct.pack_into("<I", head, 0x64, 0xFFFFFF00)   # a 4 GiB code section, from a stream of about 100 bytes
++        with self.assertRaises(sl.LibraryError) as cm:
++            sl.find_library(b"9FPR" + zlib.compress(bytes(head), 9))
++        self.assertIn("can inflate to", str(cm.exception))
++
++    def test_compute_record_fields_may_be_none(self):
++        # ref() allows NONE in every field: a record without a layout links no digest, one without a state gets
++        # no dispatch fields, one without a program names no stage. None of them may raise.
++        blobs = [kind0(), b"\x01" * 20, layout_blob(3, D_CS, 1)]
++        programs = [prog(1), prog(2), prog(3)]
++        compute = [(0, 1, 0, NONE), (NONE, 1, 1, 2), (0, 1, NONE, 2)]
++        b = build([], compute, blobs, programs)
++        lib = sl.parse(b)
++        self.assertEqual(lib["stage"], {0: {"cs"}, 1: {"cs"}})
++        self.assertEqual(lib["digest"], {1: {D_CS}})
++        self.assertIsNone(lib["compute"][2]["program"])
++        with tempfile.TemporaryDirectory() as tmp:
++            src = os.path.join(tmp, "lib.bin")
++            with open(src, "wb") as f:
++                f.write(b)
++            out = os.path.join(tmp, "out")
++            with contextlib.redirect_stdout(io.StringIO()):
++                self.assertEqual(sl.main([src, "--out", out]), 0)
++            with open(os.path.join(out, "fspx", "lib_cs_00000.json"), encoding="utf-8") as f:
++                self.assertEqual(json.load(f)["rsrc2"], 0xB8A)
++            with open(os.path.join(out, "fspx", "lib_cs_00001.json"), encoding="utf-8") as f:
++                self.assertNotIn("rsrc2", json.load(f))
++            with open(os.path.join(out, "library.json"), encoding="utf-8") as f:
++                self.assertEqual([c["program"] for c in json.load(f)["compute"]],
++                                 ["lib_cs_00000", "lib_cs_00001", None])
++
+ 
+ class Main(unittest.TestCase):
+     def run_main(self, *args):
+diff --git a/tools/shader_library.py b/tools/shader_library.py
+index ca03547a3..519ba00a2 100644
+--- a/tools/shader_library.py
++++ b/tools/shader_library.py
+@@ -48,6 +48,7 @@ NONE = 0xFFFFFFFF
+ SLOTS = {0: "ps", 1: "vs", 2: "ms", 6: "slot6"}
+ ZHDR = re.compile(rb"\x78[\x01\x5e\x9c\xda]")
+ BLOCK = 1 << 16
++MAX_RATIO = 1032   # deflate's largest inflate ratio
+ 
+ 
+ class LibraryError(ValueError):
+@@ -91,17 +92,23 @@ def find_library(m) -> bytes:
+         d = zlib.decompressobj()
+         inp = m[s:s + 2 * BLOCK]   # a 64 KiB block never deflates to more than this
+         try:
+-            data = d.decompress(inp) + d.flush()
++            # A library block inflates to at most 64 KiB. Stop one byte later: a false header whose stream inflates
++            # further is not a block (not at eof), and it no longer grows `data` by up to 1032 x the input.
++            data = d.decompress(inp, BLOCK + 1)
+         except zlib.error:
+             pos = s + 1
+             continue
+-        if not d.eof:
++        if not d.eof or len(data) > BLOCK:
+             pos = s + 1
+             continue
+         used = len(inp) - len(d.unused_data)
+         if out is None:
+             if data[:4] == MAGIC and len(data) >= HEADER:
+                 need, out, start = layout(header(data))["end"], bytearray(data), s
++                if need > MAX_RATIO * (len(m) - s):
++                    # Deflate inflates at most 1032:1, so the rest of the archive can't hold that much.
++                    raise LibraryError(f"library at 0x{s:x}: the header gives {need} bytes, more than the "
++                                       f"{len(m) - s} bytes after it can inflate to")
+         else:
+             out += data
+         pos = s + used
+@@ -293,7 +300,7 @@ def main(argv=None) -> int:
+         os.makedirs(os.path.join(a.out, "disasm"), exist_ok=True)
+     names = {i: program_name(i, lib["stage"].get(i)) for i in range(lib["header"]["programs"])}
+     sources = carve_digests(a.carve) if a.carve else None
+-    cs_state = {c["program"]: c["state"] for c in lib["compute"]}
++    cs_state = {c["program"]: c["state"] for c in lib["compute"] if None not in (c["program"], c["state"])}
+     index, written, work = [], 0, []
+     for i in range(lib["header"]["programs"]):
+         stages = lib["stage"].get(i, set())
+-- 
+2.54.0
+
