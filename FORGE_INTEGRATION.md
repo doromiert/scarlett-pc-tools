@@ -28,7 +28,7 @@ capture, session pipeline-cache persistence/checkpoints, newer title-memory
 buffer handling, shared shader modules, and frame-poll compatibility. The current
 series builds and has been exercised with the actual executable. The local
 slot-67 capture and a 1.05 GiB session-cache checkpoint have been verified;
-cache reuse on restart still needs checking.
+a restart successfully merged 1,156,440,368 bytes from that cache.
 
 Build the `gta6rt` target. Linux cross-toolchain details and the opt-in RADV
 file-backed host-memory adapter are in
@@ -96,8 +96,9 @@ session-cache writes after slow successful compiles. The opaque cache remains
 beside the external runtime binary. It is also private game-derived output.
 The actual game exceeded the default 256 MiB save limit. A local run with
 `LEONIDA_PIPELINE_CACHE_BYTES=2147483648` successfully wrote 1,126,351,504 bytes.
-This raises only the external cache-file limit. Reuse still needs verification
-through an actual restart.
+This raises only the external cache-file limit. The next actual launch successfully
+merged a later 1,156,440,368-byte checkpoint and passed 1,920 native completions.
+This verifies reload, not a measured cache-hit rate or gameplay.
 
 ## Observed limits
 
