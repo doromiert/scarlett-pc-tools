@@ -1,0 +1,241 @@
+From 0cb3173bbc47e3aa05cb288cb462005a0f16fff9 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 23:21:12 +0100
+Subject: [PATCH] D3D12.X: keep command list identity native behind title
+ dispatch
+
+---
+ crates/xcl/src/hle/d3d12x/device_x.rs         |  1 -
+ crates/xcl/src/hle/d3d12x/native_proxy.rs     |  1 +
+ crates/xcl/src/hle/d3d12x/real.rs             |  7 ++-
+ .../xcl/src/hle/d3d12x/resource_boundary.rs   | 22 +++++++-
+ crates/xcl/src/hle/d3d12x/title_list.rs       | 50 ++++++++++++-------
+ 5 files changed, 60 insertions(+), 21 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/device_x.rs b/crates/xcl/src/hle/d3d12x/device_x.rs
+index 483d8f1..b52e8b5 100644
+--- a/crates/xcl/src/hle/d3d12x/device_x.rs
++++ b/crates/xcl/src/hle/d3d12x/device_x.rs
+@@ -112,7 +112,6 @@ unsafe fn create_list(this: *mut c_void, node: u32, ty: u32, alloc: usize, pso:
+     // console's shape (`title_list`)
+     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() && !super::console_list::enabled() {
+         super::bind::reset(*ppv, alloc, pso);
+-        *ppv = super::title_list::wrap(*ppv);
+     }
+     hr
+ }
+diff --git a/crates/xcl/src/hle/d3d12x/native_proxy.rs b/crates/xcl/src/hle/d3d12x/native_proxy.rs
+index 8f69279..5606a49 100644
+--- a/crates/xcl/src/hle/d3d12x/native_proxy.rs
++++ b/crates/xcl/src/hle/d3d12x/native_proxy.rs
+@@ -30,6 +30,7 @@ static ALLOCATOR_CALLBACKS: Mutex<Option<HashMap<usize, (usize, usize)>>> = Mute
+ 
+ /// Unwrap a console proxy at native API boundaries; PC-only objects pass through.
+ pub(super) fn native(fence: *mut c_void) -> *mut c_void {
++    if let Some(list) = super::title_list::backing(fence) { return list; }
+     PROXIES.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
+         .and_then(|m| m.get(&(fence as usize))).copied().unwrap_or(fence as usize) as *mut c_void
+ }
+diff --git a/crates/xcl/src/hle/d3d12x/real.rs b/crates/xcl/src/hle/d3d12x/real.rs
+index 8259b10..c5b1960 100644
+--- a/crates/xcl/src/hle/d3d12x/real.rs
++++ b/crates/xcl/src/hle/d3d12x/real.rs
+@@ -2453,6 +2453,8 @@ macro_rules! creator {
+                     *ppv = super::native_proxy::wrap(*ppv, super::native_proxy::Kind::Resource);
+                 } else if $kind == Kind::CommandAllocator {
+                     *ppv = super::native_proxy::wrap(*ppv, super::native_proxy::Kind::Allocator);
++                } else if $kind == Kind::CommandList {
++                    *ppv = super::title_list::wrap(*ppv);
+                 } else if $kind == Kind::Heap {
+                     let observed = super::native_proxy::observe_heap(*ppv);
+                     if observed < 0 {
+@@ -4567,10 +4569,11 @@ unsafe extern "system" fn q_execute_command_lists(this: *mut c_void, n: u32, lis
+     }
+     // textures in title memory the CPU wrote since: uploaded again first
+     super::title_textures::refresh(this);
+-    // console-shaped lists run as the PC lists they were translated into
++    // Packet-interpreter lists run through their dispatch backing. Keep title_list's
++    // outer key here for waits/write bookkeeping; the native boundary unwraps it.
+     let mapped: Vec<*mut c_void> = std::slice::from_raw_parts(lists, n as usize)
+         .iter()
+-        .map(|&l| super::console_list::pc_list(l).or_else(|| super::title_list::backing(l)).unwrap_or(l))
++        .map(|&l| super::console_list::pc_list(l).unwrap_or(l))
+         .collect();
+     super::list_x::note_queue_for_lists(this as usize, &mapped);
+     super::list_x::execute_with_waits(&mapped, |chunk| {
+diff --git a/crates/xcl/src/hle/d3d12x/resource_boundary.rs b/crates/xcl/src/hle/d3d12x/resource_boundary.rs
+index 8915eca..bf1c1a8 100644
+--- a/crates/xcl/src/hle/d3d12x/resource_boundary.rs
++++ b/crates/xcl/src/hle/d3d12x/resource_boundary.rs
+@@ -5,7 +5,7 @@ use windows::Win32::Graphics::Direct3D12::*;
+ use super::{native_proxy::native, real::{self, Kind}};
+ use crate::util::HRESULT;
+ 
+-pub(super) fn relevant(s: usize) -> bool { matches!(s, 8 | 9 | 14..=21 | 26 | 28 | 34 | 35 | 42 | 46 | 49..=51 | 54 | 55 | 59..=61 | 64 | 80) }
++pub(super) fn relevant(s: usize) -> bool { matches!(s, 8..=10 | 14..=21 | 26..=28 | 34 | 35 | 42 | 46 | 49..=51 | 54 | 55 | 59..=61 | 64 | 80) }
+ 
+ pub(super) fn method(kind: Kind, s: usize) -> Option<usize> {
+     Some(match (kind, s) {
+@@ -19,6 +19,7 @@ pub(super) fn method(kind: Kind, s: usize) -> Option<usize> {
+         (Kind::Device, 46) => residency_priority as usize,
+         (Kind::CommandQueue, 8) => update_tiles as usize,
+         (Kind::CommandQueue, 9) => copy_tile_mappings as usize,
++        (Kind::CommandQueue, 10) => execute_lists as usize,
+         (Kind::CommandQueue, 14) => signal as usize,
+         (Kind::CommandQueue, 15) => wait as usize,
+         (Kind::CommandList | Kind::DmaList, 15) => copy_buffer as usize,
+@@ -27,6 +28,7 @@ pub(super) fn method(kind: Kind, s: usize) -> Option<usize> {
+         (Kind::CommandList | Kind::DmaList, 18) => copy_tiles as usize,
+         (Kind::CommandList | Kind::DmaList, 19) => resolve as usize,
+         (Kind::CommandList | Kind::DmaList, 26) => barriers as usize,
++        (Kind::CommandList | Kind::DmaList, 27) => execute_bundle as usize,
+         (Kind::CommandList | Kind::DmaList, 28) => set_descriptor_heaps as usize,
+         (Kind::CommandList | Kind::DmaList, 49) => clear_uint as usize,
+         (Kind::CommandList | Kind::DmaList, 50) => clear_float as usize,
+@@ -63,6 +65,24 @@ forward!(tiling, 42, (r: *mut c_void, tiles: *mut u32, packed: *mut c_void, shap
+ forward!(update_tiles, 8, (r: *mut c_void, n: u32, coords: *const c_void, sizes: *const c_void, heap: *mut c_void, ranges: u32, flags: *const c_void, offsets: *const u32, counts: *const u32, mapping_flags: u32) -> (), (native(r), n, coords, sizes, heap, ranges, flags, offsets, counts, mapping_flags));
+ forward!(copy_tile_mappings, 9, (dst: *mut c_void, dc: *const c_void, src: *mut c_void, sc: *const c_void, size: *const c_void, flags: u32) -> (), (native(dst), dc, native(src), sc, size, flags));
+ forward!(wait, 15, (fence: *mut c_void, value: u64) -> HRESULT, (native(fence), value));
++forward!(execute_bundle, 27, (list: *mut c_void) -> (), (native(list)));
++
++unsafe extern "system" fn execute_lists(this: *mut c_void, n: u32, lists: *const *mut c_void) {
++    let f: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) = std::mem::transmute(real::raw_orig_fn(this, 10));
++    let mapped = objects(lists, n);
++    if std::env::var_os("XCL_NATIVE_OBJECT_TRACE").is_some() {
++        static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
++        if !lists.is_null() {
++            for (&console, &p) in std::slice::from_raw_parts(lists, n as usize).iter().zip(&mapped) {
++                if !p.is_null() && N.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 16 {
++                    let v = *(p as *const usize);
++                    crate::xlog_info!("D3D12.X: native ExecuteCommandLists: console list {console:p}, native {p:p}, vtable {v:#x} ({})", crate::modules::describe_address(v));
++                }
++            }
++        }
++    }
++    f(this, n, if lists.is_null() { lists } else { mapped.as_ptr() })
++}
+ 
+ unsafe extern "system" fn signal(this: *mut c_void, fence: *mut c_void, value: u64) -> HRESULT {
+     let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(real::raw_orig_fn(this, 14));
+diff --git a/crates/xcl/src/hle/d3d12x/title_list.rs b/crates/xcl/src/hle/d3d12x/title_list.rs
+index de3dc75..4c23f74 100644
+--- a/crates/xcl/src/hle/d3d12x/title_list.rs
++++ b/crates/xcl/src/hle/d3d12x/title_list.rs
+@@ -7,15 +7,18 @@
+ //! a hardware topology, else #20 IASetPrimitiveTopology). A PC list object has other data at
+ //! those offsets. So console code gets a list object of the console's shape whose buffer never
+ //! has room: every inline write becomes the method call, and each method runs on the
+-//! (adopted) PC list behind it – with all of XCL's console slot handling.
++//! genuinely native PC list behind it. XCL's existing extended console dispatch table is
++//! installed on the outer object, whose original entries forward to the current native table.
+ //!
+-//! The object: the console fields, the PC list at `F_BACKING`; its vtable is a thunk per slot
+-//! (`mov rcx, [rcx + F_BACKING]` and on to the PC list's own vtable entry). QueryInterface
+-//! hands out the console object again, Release frees it with the PC list, and
++//! The object: the console fields and the PC list at `F_BACKING`; original methods are
++//! thunks (`mov rcx, [rcx + F_BACKING]` and on to the PC list's current vtable entry).
++//! QueryInterface hands out the console object again, Release drops its native reference, and
+ //! ExecuteCommandLists runs the PC lists (`backing`).
+ 
+ use std::ffi::c_void;
+-use std::sync::OnceLock;
++use std::collections::HashMap;
++use std::sync::{Mutex, OnceLock};
++use std::sync::atomic::{AtomicU32, Ordering};
+ 
+ use windows_sys::core::GUID;
+ 
+@@ -33,7 +36,9 @@ const F_END: usize = 0x30;
+ /// `XCL_LIST_TRACE`: the last `RING` slots called (u16 each) and a counter
+ const F_RING: usize = 0x2000;
+ const F_RING_AT: usize = 0x2100;
++const F_REFS: usize = 0x2108;
+ const RING: usize = 64;
++static LISTS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+ 
+ struct Vtable(usize);
+ 
+@@ -48,6 +53,7 @@ fn vtable() -> usize {
+             *e = if trace { forward_traced(slot) } else { forward(slot) };
+         }
+         v[0] = qi as usize;
++        v[1] = add_ref as usize;
+         v[2] = release as usize;
+         v[9] = close as usize;
+         Vtable(Box::leak(v.into_boxed_slice()).as_ptr() as usize)
+@@ -119,7 +125,8 @@ unsafe extern "system" fn close(this: *mut c_void) -> HRESULT {
+     hr
+ }
+ 
+-/// The console object for the PC list `pc` (adopted; one reference moves to it).
++/// The console object owns one reference to an untouched native list. Only the outer
++/// object receives the existing extended console dispatch and its bookkeeping hooks.
+ pub unsafe fn wrap(pc: *mut c_void) -> *mut c_void {
+     if pc.is_null() {
+         return pc;
+@@ -135,15 +142,16 @@ pub unsafe fn wrap(pc: *mut c_void) -> *mut c_void {
+         *(o.add(f) as *mut usize) = room;
+     }
+     *(o.add(F_BACKING) as *mut usize) = pc as usize;
++    (o.add(F_REFS) as *mut AtomicU32).write(AtomicU32::new(1));
++    LISTS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(o as usize, pc as usize);
++    super::real::adopt(o as *mut c_void, super::real::Kind::CommandList);
+     o as *mut c_void
+ }
+ 
+ /// The PC list behind a console list object (None: not one).
+ pub fn backing(list: *mut c_void) -> Option<*mut c_void> {
+-    if list.is_null() || !crate::gpu::shader::readable(list as usize, 8) {
+-        return None;
+-    }
+-    unsafe { (*(list as *const usize) == vtable()).then(|| *((list as usize + F_BACKING) as *const *mut c_void)) }
++    LISTS.lock().unwrap_or_else(|e| e.into_inner()).as_ref()
++        .and_then(|m| m.get(&(list as usize))).copied().map(|p| p as *mut c_void)
+ }
+ 
+ unsafe fn pc_slot(pc: *mut c_void, slot: usize) -> usize {
+@@ -166,26 +174,34 @@ unsafe extern "system" fn qi(this: *mut c_void, riid: *const GUID, ppv: *mut *mu
+     if !riid.is_null() && !ppv.is_null() {
+         let g = &*riid;
+         if CONSOLE_LIST_IIDS.contains(&(g.data1, g.data2, g.data3, g.data4)) {
+-            let add_ref: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(pc, 1));
+-            add_ref(pc);
++            add_ref(this);
+             *ppv = this;
+             return 0;
+         }
+     }
+     let hr = f(pc, riid, ppv);
+     if hr >= 0 && !ppv.is_null() && *ppv == pc {
++        let release: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(pc, 2));
++        release(pc);
++        add_ref(this);
+         *ppv = this;
+     }
+     hr
+ }
+ 
+-/// Release: the console object goes with the PC list's last reference.
++unsafe extern "system" fn add_ref(this: *mut c_void) -> u32 {
++    (&*((this as usize + F_REFS) as *const AtomicU32)).fetch_add(1, Ordering::Relaxed) + 1
++}
++
++/// The native runtime may retain the backing list after the last console reference.
++/// Console-only state belongs to this outer object and is released with its own lifetime.
+ unsafe extern "system" fn release(this: *mut c_void) -> u32 {
+-    let pc = *((this as usize + F_BACKING) as *const *mut c_void);
+-    let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(pc, 2));
+-    let n = f(pc);
++    let n = (&*((this as usize + F_REFS) as *const AtomicU32)).fetch_sub(1, Ordering::AcqRel) - 1;
+     if n == 0 {
+-        super::bind::forget(pc);
++        let pc = *((this as usize + F_BACKING) as *const *mut c_void);
++        LISTS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().unwrap().remove(&(this as usize));
++        let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(pc_slot(pc, 2));
++        f(pc);
+         std::alloc::dealloc(this as *mut u8, std::alloc::Layout::from_size_align(OBJECT_BYTES, 64).unwrap());
+     }
+     n
+-- 
+2.54.0
+

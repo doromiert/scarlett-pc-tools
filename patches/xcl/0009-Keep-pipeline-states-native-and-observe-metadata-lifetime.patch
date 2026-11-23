@@ -1,0 +1,125 @@
+From 43391a48acfb6a71fdb6b8081269148ab3f25ae6 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 22:39:11 +0100
+Subject: [PATCH] Keep pipeline states native and observe metadata lifetime
+
+---
+ crates/xcl/src/hle/d3d12x/native_proxy.rs | 39 +++++++++++++++++------
+ crates/xcl/src/hle/d3d12x/real.rs         | 16 ++++++++--
+ 2 files changed, 42 insertions(+), 13 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/native_proxy.rs b/crates/xcl/src/hle/d3d12x/native_proxy.rs
+index 3869315..c9f16e5 100644
+--- a/crates/xcl/src/hle/d3d12x/native_proxy.rs
++++ b/crates/xcl/src/hle/d3d12x/native_proxy.rs
+@@ -1,5 +1,5 @@
+ //! Native objects whose vtable identity the backend checks must stay untouched.
+-use std::collections::HashMap;
++use std::collections::{HashMap, HashSet};
+ use std::ffi::c_void;
+ use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+ use std::sync::{Mutex, OnceLock};
+@@ -195,7 +195,7 @@ unsafe extern "system" fn get_desc1(p: *mut c_void, out: *mut D3D12_RESOURCE_DES
+ }
+ 
+ #[repr(C)]
+-struct Lifetime { vtbl: *const [usize; 3], refs: AtomicU32, proxy: AtomicUsize }
++struct Lifetime { vtbl: *const [usize; 3], refs: AtomicU32, target: AtomicUsize, cleanup: unsafe fn(*mut c_void) }
+ 
+ unsafe extern "system" fn lifetime_qi(p: *mut c_void, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+     if out.is_null() || iid.is_null() { return 0x8000_4003u32 as i32; }
+@@ -209,8 +209,8 @@ unsafe extern "system" fn lifetime_release(p: *mut c_void) -> u32 {
+     let n = obj.refs.fetch_sub(1, Ordering::AcqRel) - 1;
+     if n == 0 {
+         let obj = Box::from_raw(p as *mut Lifetime);
+-        let target = obj.proxy.load(Ordering::Acquire);
+-        if target != 0 { destroy_native_proxy(target as *mut c_void); }
++        let target = obj.target.load(Ordering::Acquire);
++        if target != 0 { (obj.cleanup)(target as *mut c_void); }
+     }
+     n
+ }
+@@ -226,17 +226,36 @@ unsafe fn destroy_native_proxy(p: *mut c_void) {
+ }
+ 
+ unsafe fn observe_native_lifetime(p: *mut c_void) {
++    if install_lifetime_observer(proxy(p).native, p, destroy_native_proxy) >= 0 {
++        (*(p as *mut Proxy)).observed = true;
++    } else { crate::xlog_warn!("D3D12.X: native object lifetime observer unavailable; cleanup follows external Release"); }
++}
++
++unsafe fn install_lifetime_observer(obj: *mut c_void, target: *mut c_void, cleanup: unsafe fn(*mut c_void)) -> HRESULT {
+     static V: OnceLock<[usize; 3]> = OnceLock::new();
+-    let observer = Box::into_raw(Box::new(Lifetime { vtbl: V.get_or_init(|| [lifetime_qi as usize, lifetime_add as usize, lifetime_release as usize]), refs: AtomicU32::new(1), proxy: AtomicUsize::new(0) }));
++    let observer = Box::into_raw(Box::new(Lifetime { vtbl: V.get_or_init(|| [lifetime_qi as usize, lifetime_add as usize, lifetime_release as usize]), refs: AtomicU32::new(1), target: AtomicUsize::new(0), cleanup }));
+     // A private IUnknown dies with the native object, including references held by the backend.
+     const KEY: GUID = GUID::from_u128(0xd0189bc8_9744_48dd_8e67_d2fd6b5de63a);
+-    let obj = proxy(p).native;
+     let f: unsafe extern "system" fn(*mut c_void, *const GUID, *mut c_void) -> HRESULT = std::mem::transmute(*(*(obj as *const *const usize)).add(5));
+-    if f(obj, &KEY, observer as *mut c_void) >= 0 {
+-        (*observer).proxy.store(p as usize, Ordering::Release);
+-        (*(p as *mut Proxy)).observed = true;
+-    } else { crate::xlog_warn!("D3D12.X: native object lifetime observer unavailable; cleanup follows external Release"); }
++    let hr = f(obj, &KEY, observer as *mut c_void);
++    if hr >= 0 { (*observer).target.store(target as usize, Ordering::Release); }
+     lifetime_release(observer as *mut c_void);
++    hr
++}
++
++static NATIVE_PSOS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
++
++/// PSOs need no console vtable: observe destruction to release their metadata/async job.
++pub(super) unsafe fn observe_pipeline_state(pso: *mut c_void) -> HRESULT {
++    if !NATIVE_PSOS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashSet::new).insert(pso as usize) { return 0; }
++    let hr = install_lifetime_observer(pso, pso, destroy_pipeline_state);
++    if hr < 0 { NATIVE_PSOS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().unwrap().remove(&(pso as usize)); }
++    hr
++}
++
++unsafe fn destroy_pipeline_state(pso: *mut c_void) {
++    NATIVE_PSOS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().unwrap().remove(&(pso as usize));
++    super::real::forget_pipeline_state(pso);
+ }
+ 
+ unsafe extern "system" fn get_creation_flags(p: *mut c_void) -> u32 {
+diff --git a/crates/xcl/src/hle/d3d12x/real.rs b/crates/xcl/src/hle/d3d12x/real.rs
+index 1b7d3f6..52866a6 100644
+--- a/crates/xcl/src/hle/d3d12x/real.rs
++++ b/crates/xcl/src/hle/d3d12x/real.rs
+@@ -1477,12 +1477,16 @@ unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
+     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+     let n = f(this);
+     if n == 0 {
+-        forget_pso(this as usize);
+-        super::pso_async::release(super::pso_async::released(this as usize));
++        forget_pipeline_state(this);
+     }
+     n
+ }
+ 
++pub(super) fn forget_pipeline_state(pso: *mut c_void) {
++    forget_pso(pso as usize);
++    super::pso_async::release(super::pso_async::released(pso as usize));
++}
++
+ /// A pipeline state is gone: drop what XCL keeps by its address (a later pipeline may get the
+ /// same address and must not inherit its root signature or compute pass).
+ /// compute pipelines that run a translated console shader
+@@ -3018,7 +3022,13 @@ unsafe fn finish_pso(this: *mut c_void, f: PsoFn, desc: *const c_void, riid: *co
+         hr = f(this, desc, &iid, ppv);
+     }
+     if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
+-        adopt(*ppv, Kind::PipelineState);
++        let observed = super::native_proxy::observe_pipeline_state(*ppv);
++        if observed < 0 {
++            let release: RefFn = std::mem::transmute(*vt(*ppv).add(2));
++            release(*ppv);
++            *ppv = std::ptr::null_mut();
++            return observed;
++        }
+     }
+     hr
+ }
+-- 
+2.54.0
+

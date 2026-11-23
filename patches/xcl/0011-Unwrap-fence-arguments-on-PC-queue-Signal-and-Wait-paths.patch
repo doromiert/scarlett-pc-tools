@@ -1,0 +1,123 @@
+From 6dc74648c6e6cc17a63006f872de7bc642dd081f Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 22:50:15 +0100
+Subject: [PATCH] Unwrap fence arguments on PC queue Signal and Wait paths
+
+---
+ crates/xcl/src/hle/d3d12x/native_proxy.rs      |  6 ++++++
+ crates/xcl/src/hle/d3d12x/resource_boundary.rs | 13 ++++++++++++-
+ crates/xcl/src/hle/d3d12x/sparse.rs            |  9 +++++----
+ crates/xcl/src/hle/d3d12x/vram.rs              |  4 ++--
+ 4 files changed, 25 insertions(+), 7 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/native_proxy.rs b/crates/xcl/src/hle/d3d12x/native_proxy.rs
+index 1b6b60f..a77e858 100644
+--- a/crates/xcl/src/hle/d3d12x/native_proxy.rs
++++ b/crates/xcl/src/hle/d3d12x/native_proxy.rs
+@@ -301,3 +301,9 @@ pub(super) unsafe fn descriptor_heap_for_pc(heap: &ID3D12DescriptorHeap) -> ID3D
+     let p = native(heap.as_raw());
+     ID3D12DescriptorHeap::from_raw_borrowed(&p).unwrap().clone()
+ }
++
++/// Internal PC queues may predate adoption and must receive a genuine native fence.
++pub(super) unsafe fn fence_for_pc(fence: &ID3D12Fence) -> ID3D12Fence {
++    let p = native(fence.as_raw());
++    ID3D12Fence::from_raw_borrowed(&p).unwrap().clone()
++}
+diff --git a/crates/xcl/src/hle/d3d12x/resource_boundary.rs b/crates/xcl/src/hle/d3d12x/resource_boundary.rs
+index d959736..8915eca 100644
+--- a/crates/xcl/src/hle/d3d12x/resource_boundary.rs
++++ b/crates/xcl/src/hle/d3d12x/resource_boundary.rs
+@@ -5,7 +5,7 @@ use windows::Win32::Graphics::Direct3D12::*;
+ use super::{native_proxy::native, real::{self, Kind}};
+ use crate::util::HRESULT;
+ 
+-pub(super) fn relevant(s: usize) -> bool { matches!(s, 8 | 9 | 15..=21 | 26 | 28 | 34 | 35 | 42 | 46 | 49..=51 | 54 | 55 | 59..=61 | 64 | 80) }
++pub(super) fn relevant(s: usize) -> bool { matches!(s, 8 | 9 | 14..=21 | 26 | 28 | 34 | 35 | 42 | 46 | 49..=51 | 54 | 55 | 59..=61 | 64 | 80) }
+ 
+ pub(super) fn method(kind: Kind, s: usize) -> Option<usize> {
+     Some(match (kind, s) {
+@@ -19,6 +19,8 @@ pub(super) fn method(kind: Kind, s: usize) -> Option<usize> {
+         (Kind::Device, 46) => residency_priority as usize,
+         (Kind::CommandQueue, 8) => update_tiles as usize,
+         (Kind::CommandQueue, 9) => copy_tile_mappings as usize,
++        (Kind::CommandQueue, 14) => signal as usize,
++        (Kind::CommandQueue, 15) => wait as usize,
+         (Kind::CommandList | Kind::DmaList, 15) => copy_buffer as usize,
+         (Kind::CommandList | Kind::DmaList, 16) => copy_texture as usize,
+         (Kind::CommandList | Kind::DmaList, 17) => copy_resource as usize,
+@@ -60,6 +62,15 @@ forward!(dsv, 21, (r: *mut c_void, d: *const c_void, at: u64) -> (), (native(r),
+ forward!(tiling, 42, (r: *mut c_void, tiles: *mut u32, packed: *mut c_void, shape: *mut c_void, count: *mut u32, first: u32, out: *mut c_void) -> (), (native(r), tiles, packed, shape, count, first, out));
+ forward!(update_tiles, 8, (r: *mut c_void, n: u32, coords: *const c_void, sizes: *const c_void, heap: *mut c_void, ranges: u32, flags: *const c_void, offsets: *const u32, counts: *const u32, mapping_flags: u32) -> (), (native(r), n, coords, sizes, heap, ranges, flags, offsets, counts, mapping_flags));
+ forward!(copy_tile_mappings, 9, (dst: *mut c_void, dc: *const c_void, src: *mut c_void, sc: *const c_void, size: *const c_void, flags: u32) -> (), (native(dst), dc, native(src), sc, size, flags));
++forward!(wait, 15, (fence: *mut c_void, value: u64) -> HRESULT, (native(fence), value));
++
++unsafe extern "system" fn signal(this: *mut c_void, fence: *mut c_void, value: u64) -> HRESULT {
++    let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(real::raw_orig_fn(this, 14));
++    let pc = native(fence);
++    let hr = f(this, pc, value);
++    if hr >= 0 && pc != fence { super::fence_x::note_queue_signal(fence as usize, value); }
++    hr
++}
+ forward!(copy_buffer, 15, (dst: *mut c_void, doff: u64, src: *mut c_void, soff: u64, size: u64) -> (), (native(dst), doff, native(src), soff, size));
+ forward!(copy_resource, 17, (dst: *mut c_void, src: *mut c_void) -> (), (native(dst), native(src)));
+ forward!(copy_tiles, 18, (r: *mut c_void, coord: *const c_void, size: *const c_void, buffer: *mut c_void, offset: u64, flags: u32) -> (), (native(r), coord, size, native(buffer), offset, flags));
+diff --git a/crates/xcl/src/hle/d3d12x/sparse.rs b/crates/xcl/src/hle/d3d12x/sparse.rs
+index 8960eae..287f8d2 100644
+--- a/crates/xcl/src/hle/d3d12x/sparse.rs
++++ b/crates/xcl/src/hle/d3d12x/sparse.rs
+@@ -704,7 +704,7 @@ impl State {
+     #[inline]
+     unsafe fn signal(&mut self) {
+         self.value += 1;
+-        let _ = self.queue.Signal(&self.fence, self.value);
++        let _ = self.queue.Signal(&super::native_proxy::fence_for_pc(&self.fence), self.value);
+     }
+ 
+     #[inline]
+@@ -1134,8 +1134,9 @@ pub unsafe fn readback_after_execute(queue: &ID3D12CommandQueue, ranges: &[(usiz
+     }
+     s.rb_value += 1;
+     let v = s.rb_value;
+-    if queue.Signal(&s.rb_fence, v).is_ok() {
+-        let _ = s.queue.Wait(&s.rb_fence, v);
++    let native_fence = super::native_proxy::fence_for_pc(&s.rb_fence);
++    if queue.Signal(&native_fence, v).is_ok() {
++        let _ = s.queue.Wait(&native_fence, v);
+     }
+     s.readback_ranges(&merged);
+ }
+@@ -1368,7 +1369,7 @@ pub unsafe fn before_execute(queue: &ID3D12CommandQueue, dirty: &[usize], page:
+     s.scratch_runs = dirty_runs;
+     let q = queue.as_raw() as usize;
+     if s.value > 0 && s.waited.get(&q).copied().unwrap_or(0) < s.value {
+-        let _ = queue.Wait(&s.fence, s.value);
++        let _ = queue.Wait(&super::native_proxy::fence_for_pc(&s.fence), s.value);
+         s.waited.insert(q, s.value);
+     }
+ }
+diff --git a/crates/xcl/src/hle/d3d12x/vram.rs b/crates/xcl/src/hle/d3d12x/vram.rs
+index 2fdd672..de10d40 100644
+--- a/crates/xcl/src/hle/d3d12x/vram.rs
++++ b/crates/xcl/src/hle/d3d12x/vram.rs
+@@ -297,7 +297,7 @@ impl Pages {
+             );
+         }
+         self.value += 1;
+-        let _ = self.queue.Signal(&self.fence, self.value);
++        let _ = self.queue.Signal(&super::native_proxy::fence_for_pc(&self.fence), self.value);
+     }
+ }
+ 
+@@ -406,7 +406,7 @@ pub(super) unsafe fn before_execute(queue: &ID3D12CommandQueue) {
+     let Some(Some(pages)) = g.as_mut() else { return };
+     let key = queue.as_raw() as usize;
+     if pages.waited.get(&key).copied().unwrap_or(0) < pages.value {
+-        let _ = queue.Wait(&pages.fence, pages.value);
++        let _ = queue.Wait(&super::native_proxy::fence_for_pc(&pages.fence), pages.value);
+         pages.waited.insert(key, pages.value);
+     }
+ }
+-- 
+2.54.0
+

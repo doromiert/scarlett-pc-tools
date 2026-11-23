@@ -1,0 +1,580 @@
+From 33291de79269b66dcfaf2707f47974df4e7b0718 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 22:16:12 +0100
+Subject: [PATCH] Keep native resources behind console proxies and unwrap API
+ inputs
+
+---
+ crates/xcl/src/hle/d3d12x/mod.rs              |   1 +
+ crates/xcl/src/hle/d3d12x/native_proxy.rs     | 118 ++++++++++++-
+ crates/xcl/src/hle/d3d12x/real.rs             |  91 ++++++----
+ .../xcl/src/hle/d3d12x/resource_boundary.rs   | 157 ++++++++++++++++++
+ 4 files changed, 326 insertions(+), 41 deletions(-)
+ create mode 100644 crates/xcl/src/hle/d3d12x/resource_boundary.rs
+
+diff --git a/crates/xcl/src/hle/d3d12x/mod.rs b/crates/xcl/src/hle/d3d12x/mod.rs
+index 07b91da..7c19afa 100644
+--- a/crates/xcl/src/hle/d3d12x/mod.rs
++++ b/crates/xcl/src/hle/d3d12x/mod.rs
+@@ -17,6 +17,7 @@ pub mod dxgi_device;
+ mod cpu_writes;
+ mod fence_x;
+ mod native_proxy;
++mod resource_boundary;
+ pub mod frame;
+ pub mod guard;
+ pub mod layout;
+diff --git a/crates/xcl/src/hle/d3d12x/native_proxy.rs b/crates/xcl/src/hle/d3d12x/native_proxy.rs
+index 97d5555..a7bde94 100644
+--- a/crates/xcl/src/hle/d3d12x/native_proxy.rs
++++ b/crates/xcl/src/hle/d3d12x/native_proxy.rs
+@@ -1,14 +1,14 @@
+ //! Native objects whose vtable identity the backend checks must stay untouched.
+ use std::collections::HashMap;
+ use std::ffi::c_void;
+-use std::sync::atomic::{AtomicU32, Ordering};
++use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+ use std::sync::{Mutex, OnceLock};
+ use windows::core::{Interface, IUnknown, GUID};
+ use windows::Win32::Graphics::Direct3D12::*;
+ use crate::util::{HRESULT, E_NOINTERFACE};
+ 
+ #[derive(Clone, Copy, PartialEq)]
+-pub(super) enum Kind { Fence, Allocator }
++pub(super) enum Kind { Fence, Allocator, Resource }
+ 
+ #[repr(C)]
+ struct Proxy {
+@@ -16,8 +16,13 @@ struct Proxy {
+     refs: AtomicU32,
+     native: *mut c_void,
+     kind: Kind,
++    observed: bool,
+ }
+ 
++static FENCE_VTABLE: OnceLock<[usize; 13]> = OnceLock::new();
++static ALLOCATOR_VTABLE: OnceLock<[usize; 9]> = OnceLock::new();
++static RESOURCE_VTABLE: OnceLock<[usize; 17]> = OnceLock::new();
++
+ static PROXIES: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+ 
+ /// Unwrap a console proxy at native API boundaries; PC-only objects pass through.
+@@ -26,30 +31,57 @@ pub(super) fn native(fence: *mut c_void) -> *mut c_void {
+         .and_then(|m| m.get(&(fence as usize))).copied().unwrap_or(fence as usize) as *mut c_void
+ }
+ 
++pub(super) unsafe fn kind(p: *mut c_void) -> Option<Kind> {
++    (native(p) != p).then(|| proxy(p).kind)
++}
++
+ /// Take ownership of the reference returned by a native creator.
+ pub(super) unsafe fn wrap(native: *mut c_void, kind: Kind) -> *mut c_void {
+-    static V: OnceLock<[usize; 13]> = OnceLock::new();
+-    let fence_vtbl = V.get_or_init(|| [
++    if kind == Kind::Resource {
++        let registry = PROXIES.lock().unwrap_or_else(|e| e.into_inner());
++        if let Some((&p, _)) = registry.as_ref().and_then(|m| m.iter().find(|&(p, &n)| n == native as usize && proxy(*p as *mut c_void).kind == Kind::Resource)) {
++            return p as *mut c_void;
++        }
++    }
++    let fence_vtbl = FENCE_VTABLE.get_or_init(|| [
+         query_interface as usize, add_ref as usize, release as usize,
+         get_private_data as usize, set_private_data as usize, set_private_data_interface as usize,
+         set_name as usize, get_device as usize, get_completed_value as usize,
+         set_event_on_completion as usize, signal as usize, get_creation_flags as usize,
+         super::fence_x::completed_value_address as usize,
+     ]);
+-    static A: OnceLock<[usize; 9]> = OnceLock::new();
+-    let allocator_vtbl = A.get_or_init(|| [
++    let allocator_vtbl = ALLOCATOR_VTABLE.get_or_init(|| [
+         query_interface as usize, add_ref as usize, release as usize,
+         get_private_data as usize, set_private_data as usize, set_private_data_interface as usize,
+         set_name as usize, get_device as usize, reset_allocator as usize,
+     ]);
+-    let vtbl = if kind == Kind::Fence { fence_vtbl.as_ptr() } else { allocator_vtbl.as_ptr() };
+-    let p = Box::into_raw(Box::new(Proxy { vtbl, refs: AtomicU32::new(1), native, kind })) as *mut c_void;
++    let resource_vtbl = RESOURCE_VTABLE.get_or_init(|| [
++        query_interface as usize, add_ref as usize, release as usize,
++        get_private_data as usize, set_private_data as usize, set_private_data_interface as usize,
++        set_name as usize, get_device as usize, super::real::res_map as usize, super::real::res_unmap as usize,
++        get_desc as usize, super::guard::make_split(super::real::res_gpu_va_x as usize, get_gpu_va as usize),
++        super::real::res_write_to_subresource as usize, read_from_subresource as usize,
++        get_heap_properties as usize, get_protected_session as usize, get_desc1 as usize,
++    ]);
++    let vtbl = match kind { Kind::Fence => fence_vtbl.as_ptr(), Kind::Allocator => allocator_vtbl.as_ptr(), Kind::Resource => resource_vtbl.as_ptr() };
++    let p = Box::into_raw(Box::new(Proxy { vtbl, refs: AtomicU32::new(1), native, kind, observed: false })) as *mut c_void;
+     PROXIES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(p as usize, native as usize);
++    if kind == Kind::Resource { observe_resource(p); }
+     p
+ }
+ 
+ unsafe fn proxy<'a>(p: *mut c_void) -> &'a Proxy { &*(p as *const Proxy) }
+ 
++/// The caller already has a valid COM object: avoid registry locking on every native draw.
++pub(super) unsafe fn native_if_proxy(p: *mut c_void) -> Option<*mut c_void> {
++    let v = *(p as *const usize);
++    let ours = FENCE_VTABLE.get().is_some_and(|t| t.as_ptr() as usize == v)
++        || ALLOCATOR_VTABLE.get().is_some_and(|t| t.as_ptr() as usize == v)
++        || RESOURCE_VTABLE.get().is_some_and(|t| t.as_ptr() as usize == v);
++    ours.then(|| proxy(p).native)
++}
++
++
+ unsafe extern "system" fn query_interface(p: *mut c_void, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
+     if out.is_null() || iid.is_null() { return 0x8000_4003u32 as i32; }
+     *out = std::ptr::null_mut();
+@@ -57,6 +89,7 @@ unsafe extern "system" fn query_interface(p: *mut c_void, iid: *const GUID, out:
+     let specific = match proxy(p).kind {
+         Kind::Fence => [ID3D12Fence::IID, ID3D12Fence1::IID].contains(&*iid),
+         Kind::Allocator => *iid == ID3D12CommandAllocator::IID,
++        Kind::Resource => [ID3D12Resource::IID, ID3D12Resource1::IID, ID3D12Resource2::IID].contains(&*iid),
+     };
+     if !base && !specific {
+         return E_NOINTERFACE;
+@@ -73,10 +106,22 @@ unsafe extern "system" fn query_interface(p: *mut c_void, iid: *const GUID, out:
+ }
+ 
+ unsafe extern "system" fn add_ref(p: *mut c_void) -> u32 {
++    if proxy(p).kind == Kind::Resource {
++        let obj = proxy(p).native;
++        let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(obj as *const *const usize)).add(1));
++        return f(obj);
++    }
+     proxy(p).refs.fetch_add(1, Ordering::Relaxed) + 1
+ }
+ 
+ unsafe extern "system" fn release(p: *mut c_void) -> u32 {
++    if proxy(p).kind == Kind::Resource {
++        let (obj, observed) = (proxy(p).native, proxy(p).observed);
++        let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(obj as *const *const usize)).add(2));
++        let n = f(obj);
++        if n == 0 && !observed { destroy_resource_proxy(p); }
++        return n;
++    }
+     let refs = proxy(p).refs.fetch_sub(1, Ordering::AcqRel) - 1;
+     if refs == 0 {
+         PROXIES.lock().unwrap_or_else(|e| e.into_inner()).as_mut().unwrap().remove(&(p as usize));
+@@ -106,6 +151,63 @@ forward!(get_device, 7, (iid: *const GUID, out: *mut *mut c_void) -> HRESULT);
+ forward!(get_completed_value, 8, () -> u64);
+ forward!(set_event_on_completion, 9, (value: u64, event: *mut c_void) -> HRESULT);
+ forward!(native_signal, 10, (value: u64) -> HRESULT);
++forward!(get_desc, 10, (out: *mut D3D12_RESOURCE_DESC) -> ());
++forward!(get_gpu_va, 11, () -> u64);
++forward!(read_from_subresource, 13, (data: *mut c_void, row_pitch: u32, depth_pitch: u32, subresource: u32, region: *const D3D12_BOX) -> HRESULT);
++forward!(get_heap_properties, 14, (properties: *mut D3D12_HEAP_PROPERTIES, flags: *mut D3D12_HEAP_FLAGS) -> HRESULT);
++
++unsafe extern "system" fn get_protected_session(p: *mut c_void, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
++    ID3D12Resource::from_raw_borrowed(&proxy(p).native).unwrap().cast::<ID3D12Resource1>()
++        .map_or_else(|e| e.code().0, |r| {
++            let f: unsafe extern "system" fn(*mut c_void, *const GUID, *mut *mut c_void) -> HRESULT = std::mem::transmute(*(*(r.as_raw() as *const *const usize)).add(15));
++            f(r.as_raw(), iid, out)
++        })
++}
++
++unsafe extern "system" fn get_desc1(p: *mut c_void, out: *mut D3D12_RESOURCE_DESC1) {
++    if let Ok(r) = ID3D12Resource::from_raw_borrowed(&proxy(p).native).unwrap().cast::<ID3D12Resource2>() { *out = r.GetDesc1(); }
++}
++
++#[repr(C)]
++struct Lifetime { vtbl: *const [usize; 3], refs: AtomicU32, proxy: AtomicUsize }
++
++unsafe extern "system" fn lifetime_qi(p: *mut c_void, iid: *const GUID, out: *mut *mut c_void) -> HRESULT {
++    if out.is_null() || iid.is_null() { return 0x8000_4003u32 as i32; }
++    *out = std::ptr::null_mut();
++    if *iid != IUnknown::IID { return E_NOINTERFACE; }
++    lifetime_add(p); *out = p; 0
++}
++unsafe extern "system" fn lifetime_add(p: *mut c_void) -> u32 { (*(p as *const Lifetime)).refs.fetch_add(1, Ordering::Relaxed) + 1 }
++unsafe extern "system" fn lifetime_release(p: *mut c_void) -> u32 {
++    let obj = &*(p as *const Lifetime);
++    let n = obj.refs.fetch_sub(1, Ordering::AcqRel) - 1;
++    if n == 0 {
++        let obj = Box::from_raw(p as *mut Lifetime);
++        let target = obj.proxy.load(Ordering::Acquire);
++        if target != 0 { destroy_resource_proxy(target as *mut c_void); }
++    }
++    n
++}
++
++unsafe fn destroy_resource_proxy(p: *mut c_void) {
++    PROXIES.lock().unwrap_or_else(|e| e.into_inner()).as_mut().unwrap().remove(&(p as usize));
++    super::real::forget_resource(p);
++    drop(Box::from_raw(p as *mut Proxy));
++}
++
++unsafe fn observe_resource(p: *mut c_void) {
++    static V: OnceLock<[usize; 3]> = OnceLock::new();
++    let observer = Box::into_raw(Box::new(Lifetime { vtbl: V.get_or_init(|| [lifetime_qi as usize, lifetime_add as usize, lifetime_release as usize]), refs: AtomicU32::new(1), proxy: AtomicUsize::new(0) }));
++    // A private IUnknown dies with the native resource, including references held by the backend.
++    const KEY: GUID = GUID::from_u128(0xd0189bc8_9744_48dd_8e67_d2fd6b5de63a);
++    let obj = proxy(p).native;
++    let f: unsafe extern "system" fn(*mut c_void, *const GUID, *mut c_void) -> HRESULT = std::mem::transmute(*(*(obj as *const *const usize)).add(5));
++    if f(obj, &KEY, observer as *mut c_void) >= 0 {
++        (*observer).proxy.store(p as usize, Ordering::Release);
++        (*(p as *mut Proxy)).observed = true;
++    } else { crate::xlog_warn!("D3D12.X: native resource lifetime observer unavailable; cleanup follows external Release"); }
++    lifetime_release(observer as *mut c_void);
++}
+ 
+ unsafe extern "system" fn get_creation_flags(p: *mut c_void) -> u32 {
+     ID3D12Fence::from_raw_borrowed(&proxy(p).native).unwrap().cast::<ID3D12Fence1>()
+diff --git a/crates/xcl/src/hle/d3d12x/real.rs b/crates/xcl/src/hle/d3d12x/real.rs
+index 0e3c0ef..639a82e 100644
+--- a/crates/xcl/src/hle/d3d12x/real.rs
++++ b/crates/xcl/src/hle/d3d12x/real.rs
+@@ -524,6 +524,16 @@ unsafe fn vt(obj: *mut c_void) -> *const usize {
+ 
+ /// Original function of `slot` for an adopted object.
+ pub unsafe fn orig_fn(this: *mut c_void, slot: usize) -> usize {
++    if super::resource_boundary::relevant(slot) {
++        if let Some(kind) = kind_of(vt(this) as usize) {
++            if let Some(f) = super::resource_boundary::method(kind, slot) { return f; }
++        }
++    }
++    raw_orig_fn(this, slot)
++}
++
++pub(super) unsafe fn raw_orig_fn(this: *mut c_void, slot: usize) -> usize {
++    if let Some(native) = super::native_proxy::native_if_proxy(this) { return *vt(native).add(slot); }
+     let ext = vt(this);
+     let orig = *ext.sub(1) as *const usize;
+     *orig.add(slot)
+@@ -641,6 +651,9 @@ unsafe fn class_for(obj: *mut c_void, orig: usize, kind: Kind) -> usize {
+         info.hook.store(hook, Ordering::Release);
+         v.push(addr);
+     }
++    for i in 0..public {
++        if let Some(f) = super::resource_boundary::method(kind, i) { v[1 + i] = f; }
++    }
+     for (method, f) in overrides(kind) {
+         if let Some(s) = layout::slot(iface, method) {
+             if s < public {
+@@ -1332,7 +1345,7 @@ pub(super) fn set_test_buffer_delta(res: usize, delta: Option<u64>) {
+ /// Map: on the console every resource is CPU-visible memory. One in unified memory that the
+ /// PC cannot map (a texture XCL keeps in step with it) gives its unified-memory address – what
+ /// the console gives; the CPU's writes there reach the texture (`title_textures`).
+-unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_void, data: *mut *mut c_void) -> HRESULT {
++pub(super) unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_void, data: *mut *mut c_void) -> HRESULT {
+     // a resource in unified memory: its console address (no PC mapping – the PC's would be
+     // the start of the PC resource, before the address for a buffer placed below it)
+     if let Some((p, bytes)) = console_buffer(this as usize) {
+@@ -1357,7 +1370,7 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
+         return S_OK;
+     }
+     let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void, *mut *mut c_void) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "Map")));
+-    let hr = f(this, sub, range, data);
++    let hr = f(super::native_proxy::native(this), sub, range, data);
+     if hr >= 0 {
+         return hr;
+     }
+@@ -1382,10 +1395,10 @@ unsafe extern "system" fn res_map(this: *mut c_void, sub: u32, range: *const c_v
+ 
+ /// WriteToSubresource(subresource, box, data, row pitch, depth pitch): the CPU writing texels.
+ /// Every console resource is CPU-visible memory, a PC texture only in a CPU-visible heap.
+-unsafe extern "system" fn res_write_to_subresource(this: *mut c_void, sub: u32, dst_box: *const D3D12_BOX, data: *const c_void, row_pitch: u32, depth_pitch: u32) -> HRESULT {
++pub(super) unsafe extern "system" fn res_write_to_subresource(this: *mut c_void, sub: u32, dst_box: *const D3D12_BOX, data: *const c_void, row_pitch: u32, depth_pitch: u32) -> HRESULT {
+     type F = unsafe extern "system" fn(*mut c_void, u32, *const D3D12_BOX, *const c_void, u32, u32) -> HRESULT;
+     let f: F = std::mem::transmute(orig_fn(this, slot_of(this, "WriteToSubresource")));
+-    let hr = f(this, sub, dst_box, data, row_pitch, depth_pitch);
++    let hr = f(super::native_proxy::native(this), sub, dst_box, data, row_pitch, depth_pitch);
+     static CALLS: AtomicU64 = AtomicU64::new(0);
+     static FAILED: AtomicU64 = AtomicU64::new(0);
+     let n = CALLS.fetch_add(1, Ordering::Relaxed);
+@@ -1417,45 +1430,48 @@ pub(super) fn note_title_address(res: usize, va: usize) {
+ /// resources whose Map gave their unified-memory address (no PC mapping to undo)
+ static UNMAPPABLE: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
+ 
+-unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c_void) {
++pub(super) unsafe extern "system" fn res_unmap(this: *mut c_void, sub: u32, range: *const c_void) {
+     if UNMAPPABLE.lock().unwrap().as_ref().is_some_and(|s| s.contains(&(this as usize))) {
+         return;
+     }
+     let f: unsafe extern "system" fn(*mut c_void, u32, *const c_void) = std::mem::transmute(orig_fn(this, slot_of(this, "Unmap")));
+-    f(this, sub, range)
++    f(super::native_proxy::native(this), sub, range)
+ }
+ 
+ unsafe extern "system" fn res_release(this: *mut c_void) -> u32 {
+     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+     let n = f(this);
+-    if n == 0 {
+-        if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
+-            s.remove(&(this as usize));
+-        }
+-        if let Some(s) = SPARSE_READBACK.lock().unwrap().as_mut() {
+-            s.remove(&(this as usize));
+-        }
+-        if let Some(m) = BUFFER_DELTA.lock().unwrap().as_mut() {
+-            m.remove(&(this as usize));
+-        }
+-        if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
+-            m.remove(&(this as usize));
+-        }
+-        super::sparse::forget_buffer(this as usize);
+-        super::vram::forget(this as usize);
+-        super::title_textures::forget(this as usize);
+-        let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
+-        if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
+-            if u.is_sparse(p) {
+-                super::sparse::free(p);
+-            } else {
+-                u.free(p);
+-            }
++    if n == 0 { forget_resource(this); }
++    n
++}
++
++pub(super) unsafe fn forget_resource(this: *mut c_void) {
++    if let Some(s) = UNMAPPABLE.lock().unwrap().as_mut() {
++        s.remove(&(this as usize));
++    }
++    if let Some(s) = SPARSE_READBACK.lock().unwrap().as_mut() {
++        s.remove(&(this as usize));
++    }
++    if let Some(m) = BUFFER_DELTA.lock().unwrap().as_mut() {
++        m.remove(&(this as usize));
++    }
++    if let Some(m) = TITLE_ADDRESS.lock().unwrap().as_mut() {
++        m.remove(&(this as usize));
++    }
++    super::sparse::forget_buffer(this as usize);
++    super::vram::forget(this as usize);
++    super::title_textures::forget(this as usize);
++    let gone = UMA_BUFFERS.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize)));
++    if let (Some((p, _, true)), Some(u)) = (gone, crate::gpu::uma::get()) {
++        if u.is_sparse(p) {
++            super::sparse::free(p);
++        } else {
++            u.free(p);
+         }
+     }
+-    n
+ }
+ 
++
+ /// A stand-in pipeline released for good takes its background-built real pipeline with it.
+ unsafe extern "system" fn pso_release(this: *mut c_void) -> u32 {
+     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+@@ -1535,7 +1551,7 @@ fn forget_pso(pso: usize) {
+ }
+ 
+ /// resource #11 GetGPUVirtualAddress for console code
+-unsafe extern "system" fn res_gpu_va_x(this: *mut c_void) -> u64 {
++pub(super) unsafe extern "system" fn res_gpu_va_x(this: *mut c_void) -> u64 {
+     if let Some((p, _)) = console_buffer(this as usize) {
+         return p as u64;
+     }
+@@ -1543,7 +1559,7 @@ unsafe extern "system" fn res_gpu_va_x(this: *mut c_void) -> u64 {
+     // a texture has no GPU address on the PC (0) – on the console every resource has one, and
+     // titles use a texture's as the CPU's pointer to it (a retail game clears a 256x256 R32F one
+     // through it: with 0 it wrote 256 KB at address 0): the title's address it was placed at
+-    match f(this) {
++    match f(super::native_proxy::native(this)) {
+         0 => {
+             let placed = TITLE_ADDRESS.lock().unwrap().as_ref().and_then(|m| m.get(&(this as usize)).copied());
+             placed.or_else(|| texture_memory(this)).unwrap_or(0) as u64
+@@ -2254,6 +2270,9 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
+ 
+ /// Slot of `method` in the class of an adopted object.
+ unsafe fn slot_of(this: *mut c_void, method: &str) -> usize {
++    if super::native_proxy::kind(this) == Some(super::native_proxy::Kind::Resource) {
++        return layout::slot(layout::find("ID3D12Resource2").unwrap(), method).expect("resource method");
++    }
+     let ext = vt(this) as usize;
+     let g = CLASSES.lock().unwrap();
+     let c = g.iter().find(|c| c.ext == ext).expect("adopted class");
+@@ -2422,6 +2441,8 @@ macro_rules! creator {
+             if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() && !super::title_textures::is_own_work() {
+                 if $kind == Kind::Fence {
+                     *ppv = super::native_proxy::wrap(*ppv, super::native_proxy::Kind::Fence);
++                } else if $kind == Kind::Resource {
++                    *ppv = super::native_proxy::wrap(*ppv, super::native_proxy::Kind::Resource);
+                 } else if $kind == Kind::CommandAllocator {
+                     *ppv = super::native_proxy::wrap(*ppv, super::native_proxy::Kind::Allocator);
+                 } else {
+@@ -2810,6 +2831,9 @@ unsafe extern "system" fn dev_open_shared_handle(this: *mut c_void, handle: usiz
+             drop(windows::core::IUnknown::from_raw(*out));
+             *out = super::native_proxy::wrap(fence.into_raw(), super::native_proxy::Kind::Fence);
+             remember_fence(*out, 0, 0);
++        } else if let Ok(resource) = object.cast::<ID3D12Resource>() {
++            drop(windows::core::IUnknown::from_raw(*out));
++            *out = super::native_proxy::wrap(resource.into_raw(), super::native_proxy::Kind::Resource);
+         }
+     }
+     hr
+@@ -2824,7 +2848,8 @@ unsafe extern "system" fn dev_set_event_on_multiple_fences(this: *mut c_void, fe
+ 
+ unsafe extern "system" fn dev_enqueue_make_resident(this: *mut c_void, flags: u32, count: u32, objects: *const *mut c_void, fence: *mut c_void, value: u64) -> HRESULT {
+     let f: unsafe extern "system" fn(*mut c_void, u32, u32, *const *mut c_void, *mut c_void, u64) -> HRESULT = std::mem::transmute(orig_fn(this, slot_of(this, "EnqueueMakeResident")));
+-    f(this, flags, count, objects, super::native_proxy::native(fence), value)
++    let native = super::resource_boundary::objects(objects, count);
++    f(this, flags, count, if objects.is_null() { objects } else { native.as_ptr() }, super::native_proxy::native(fence), value)
+ }
+ 
+ /// End the title on purpose without leaving the process stuck in the driver: every fence it
+diff --git a/crates/xcl/src/hle/d3d12x/resource_boundary.rs b/crates/xcl/src/hle/d3d12x/resource_boundary.rs
+new file mode 100644
+index 0000000..7f998ed
+--- /dev/null
++++ b/crates/xcl/src/hle/d3d12x/resource_boundary.rs
+@@ -0,0 +1,157 @@
++//! Translate console resource pointers only where a native API consumes them.
++use std::ffi::c_void;
++use std::mem::ManuallyDrop;
++use windows::Win32::Graphics::Direct3D12::*;
++use super::{native_proxy::native, real::{self, Kind}};
++use crate::util::HRESULT;
++
++pub(super) fn relevant(s: usize) -> bool { matches!(s, 8 | 9 | 15..=21 | 26 | 34 | 35 | 42 | 46 | 49..=51 | 54 | 55 | 59..=61 | 64 | 80) }
++
++pub(super) fn method(kind: Kind, s: usize) -> Option<usize> {
++    Some(match (kind, s) {
++        (Kind::Device, 18) => srv as usize,
++        (Kind::Device, 19) => uav as usize,
++        (Kind::Device, 20) => rtv as usize,
++        (Kind::Device, 21) => dsv as usize,
++        (Kind::Device, 34) => make_resident as usize,
++        (Kind::Device, 35) => evict as usize,
++        (Kind::Device, 42) => tiling as usize,
++        (Kind::Device, 46) => residency_priority as usize,
++        (Kind::CommandQueue, 8) => update_tiles as usize,
++        (Kind::CommandQueue, 9) => copy_tile_mappings as usize,
++        (Kind::CommandList | Kind::DmaList, 15) => copy_buffer as usize,
++        (Kind::CommandList | Kind::DmaList, 16) => copy_texture as usize,
++        (Kind::CommandList | Kind::DmaList, 17) => copy_resource as usize,
++        (Kind::CommandList | Kind::DmaList, 18) => copy_tiles as usize,
++        (Kind::CommandList | Kind::DmaList, 19) => resolve as usize,
++        (Kind::CommandList | Kind::DmaList, 26) => barriers as usize,
++        (Kind::CommandList | Kind::DmaList, 49) => clear_uint as usize,
++        (Kind::CommandList | Kind::DmaList, 50) => clear_float as usize,
++        (Kind::CommandList | Kind::DmaList, 51) => discard as usize,
++        (Kind::CommandList | Kind::DmaList, 54) => resolve_query as usize,
++        (Kind::CommandList | Kind::DmaList, 55) => predication as usize,
++        (Kind::CommandList | Kind::DmaList, 59) => indirect as usize,
++        (Kind::CommandList | Kind::DmaList, 60) => atomic_uint as usize,
++        (Kind::CommandList | Kind::DmaList, 61) => atomic_uint64 as usize,
++        (Kind::CommandList | Kind::DmaList, 64) => resolve_region as usize,
++        (Kind::CommandList | Kind::DmaList, 80) => enhanced_barriers as usize,
++        _ => return None,
++    })
++}
++
++pub(super) unsafe fn objects(p: *const *mut c_void, n: u32) -> Vec<*mut c_void> {
++    if p.is_null() { return Vec::new(); }
++    std::slice::from_raw_parts(p, n as usize).iter().map(|&p| native(p)).collect()
++}
++
++macro_rules! forward {
++    ($name:ident, $slot:expr, ($($arg:ident: $ty:ty),*) -> $result:ty, ($($value:expr),*)) => {
++        unsafe extern "system" fn $name(this: *mut c_void, $($arg: $ty),*) -> $result {
++            let f: unsafe extern "system" fn(*mut c_void, $($ty),*) -> $result = std::mem::transmute(real::raw_orig_fn(this, $slot));
++            f(this, $($value),*)
++        }
++    };
++}
++forward!(srv, 18, (r: *mut c_void, d: *const c_void, at: u64) -> (), (native(r), d, at));
++forward!(uav, 19, (r: *mut c_void, c: *mut c_void, d: *const c_void, at: u64) -> (), (native(r), native(c), d, at));
++forward!(rtv, 20, (r: *mut c_void, d: *const c_void, at: u64) -> (), (native(r), d, at));
++forward!(dsv, 21, (r: *mut c_void, d: *const c_void, at: u64) -> (), (native(r), d, at));
++forward!(tiling, 42, (r: *mut c_void, tiles: *mut u32, packed: *mut c_void, shape: *mut c_void, count: *mut u32, first: u32, out: *mut c_void) -> (), (native(r), tiles, packed, shape, count, first, out));
++forward!(update_tiles, 8, (r: *mut c_void, n: u32, coords: *const c_void, sizes: *const c_void, heap: *mut c_void, ranges: u32, flags: *const c_void, offsets: *const u32, counts: *const u32, mapping_flags: u32) -> (), (native(r), n, coords, sizes, heap, ranges, flags, offsets, counts, mapping_flags));
++forward!(copy_tile_mappings, 9, (dst: *mut c_void, dc: *const c_void, src: *mut c_void, sc: *const c_void, size: *const c_void, flags: u32) -> (), (native(dst), dc, native(src), sc, size, flags));
++forward!(copy_buffer, 15, (dst: *mut c_void, doff: u64, src: *mut c_void, soff: u64, size: u64) -> (), (native(dst), doff, native(src), soff, size));
++forward!(copy_resource, 17, (dst: *mut c_void, src: *mut c_void) -> (), (native(dst), native(src)));
++forward!(copy_tiles, 18, (r: *mut c_void, coord: *const c_void, size: *const c_void, buffer: *mut c_void, offset: u64, flags: u32) -> (), (native(r), coord, size, native(buffer), offset, flags));
++forward!(resolve, 19, (dst: *mut c_void, ds: u32, src: *mut c_void, ss: u32, format: u32) -> (), (native(dst), ds, native(src), ss, format));
++forward!(clear_uint, 49, (gpu: u64, cpu: u64, r: *mut c_void, values: *const u32, n: u32, rects: *const c_void) -> (), (gpu, cpu, native(r), values, n, rects));
++forward!(clear_float, 50, (gpu: u64, cpu: u64, r: *mut c_void, values: *const f32, n: u32, rects: *const c_void) -> (), (gpu, cpu, native(r), values, n, rects));
++forward!(discard, 51, (r: *mut c_void, region: *const c_void) -> (), (native(r), region));
++forward!(resolve_query, 54, (heap: *mut c_void, ty: u32, first: u32, n: u32, dst: *mut c_void, offset: u64) -> (), (heap, ty, first, n, native(dst), offset));
++forward!(predication, 55, (r: *mut c_void, offset: u64, op: u32) -> (), (native(r), offset, op));
++forward!(indirect, 59, (signature: *mut c_void, n: u32, arguments: *mut c_void, offset: u64, count: *mut c_void, count_offset: u64) -> (), (signature, n, native(arguments), offset, native(count), count_offset));
++forward!(resolve_region, 64, (dst: *mut c_void, ds: u32, x: u32, y: u32, src: *mut c_void, ss: u32, rect: *const c_void, format: u32, mode: u32) -> (), (native(dst), ds, x, y, native(src), ss, rect, format, mode));
++
++macro_rules! object_array {
++    ($name:ident, $slot:expr) => {
++        unsafe extern "system" fn $name(this: *mut c_void, n: u32, p: *const *mut c_void) -> HRESULT {
++            let f: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) -> HRESULT = std::mem::transmute(real::raw_orig_fn(this, $slot));
++            let mapped = objects(p, n);
++            f(this, n, if p.is_null() { p } else { mapped.as_ptr() })
++        }
++    };
++}
++object_array!(make_resident, 34);
++object_array!(evict, 35);
++unsafe extern "system" fn residency_priority(this: *mut c_void, n: u32, p: *const *mut c_void, priorities: *const u32) -> HRESULT {
++    let f: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void, *const u32) -> HRESULT = std::mem::transmute(real::raw_orig_fn(this, 46));
++    let mapped = objects(p, n);
++    f(this, n, if p.is_null() { p } else { mapped.as_ptr() }, priorities)
++}
++
++unsafe fn copy_location(p: *const D3D12_TEXTURE_COPY_LOCATION) -> Option<ManuallyDrop<D3D12_TEXTURE_COPY_LOCATION>> {
++    if p.is_null() { return None; }
++    let mut copy = ManuallyDrop::new(p.read());
++    let r = &mut copy.pResource as *mut _ as *mut *mut c_void;
++    *r = native(*r);
++    Some(copy)
++}
++unsafe extern "system" fn copy_texture(this: *mut c_void, dst: *const D3D12_TEXTURE_COPY_LOCATION, x: u32, y: u32, z: u32, src: *const D3D12_TEXTURE_COPY_LOCATION, region: *const D3D12_BOX) {
++    let f: unsafe extern "system" fn(*mut c_void, *const D3D12_TEXTURE_COPY_LOCATION, u32, u32, u32, *const D3D12_TEXTURE_COPY_LOCATION, *const D3D12_BOX) = std::mem::transmute(real::raw_orig_fn(this, 16));
++    let d = copy_location(dst); let s = copy_location(src);
++    f(this, d.as_ref().map_or(dst, |p| &**p), x, y, z, s.as_ref().map_or(src, |p| &**p), region)
++}
++unsafe extern "system" fn barriers(this: *mut c_void, n: u32, p: *const D3D12_RESOURCE_BARRIER) {
++    let f: unsafe extern "system" fn(*mut c_void, u32, *const D3D12_RESOURCE_BARRIER) = std::mem::transmute(real::raw_orig_fn(this, 26));
++    if p.is_null() { return f(this, n, p); }
++    let mut mapped: Vec<ManuallyDrop<D3D12_RESOURCE_BARRIER>> = (0..n as usize).map(|i| ManuallyDrop::new(p.add(i).read())).collect();
++    for b in &mut mapped {
++        match b.Type {
++            D3D12_RESOURCE_BARRIER_TYPE_TRANSITION => { let p = &mut (*b.Anonymous.Transition).pResource as *mut _ as *mut *mut c_void; *p = native(*p); }
++            D3D12_RESOURCE_BARRIER_TYPE_ALIASING => {
++                let a = &mut b.Anonymous.Aliasing;
++                let p = &mut a.pResourceBefore as *mut _ as *mut *mut c_void; *p = native(*p);
++                let p = &mut a.pResourceAfter as *mut _ as *mut *mut c_void; *p = native(*p);
++            }
++            D3D12_RESOURCE_BARRIER_TYPE_UAV => { let p = &mut (*b.Anonymous.UAV).pResource as *mut _ as *mut *mut c_void; *p = native(*p); }
++            _ => {}
++        }
++    }
++    f(this, n, mapped.as_ptr() as _)
++}
++macro_rules! atomic {
++    ($name:ident, $slot:expr) => {
++        unsafe extern "system" fn $name(this: *mut c_void, dst: *mut c_void, doff: u64, src: *mut c_void, soff: u64, n: u32, dependencies: *const *mut c_void, ranges: *const c_void) {
++            let f: unsafe extern "system" fn(*mut c_void, *mut c_void, u64, *mut c_void, u64, u32, *const *mut c_void, *const c_void) = std::mem::transmute(real::raw_orig_fn(this, $slot));
++            let mapped = objects(dependencies, n);
++            f(this, native(dst), doff, native(src), soff, n, if dependencies.is_null() { dependencies } else { mapped.as_ptr() }, ranges)
++        }
++    };
++}
++atomic!(atomic_uint, 60);
++atomic!(atomic_uint64, 61);
++
++unsafe extern "system" fn enhanced_barriers(this: *mut c_void, n: u32, groups: *const D3D12_BARRIER_GROUP) {
++    let f: unsafe extern "system" fn(*mut c_void, u32, *const D3D12_BARRIER_GROUP) = std::mem::transmute(real::raw_orig_fn(this, 80));
++    if groups.is_null() { return f(this, n, groups); }
++    let mut copies: Vec<D3D12_BARRIER_GROUP> = std::slice::from_raw_parts(groups, n as usize).to_vec();
++    let mut textures: Vec<Vec<ManuallyDrop<D3D12_TEXTURE_BARRIER>>> = Vec::new();
++    let mut buffers: Vec<Vec<ManuallyDrop<D3D12_BUFFER_BARRIER>>> = Vec::new();
++    for g in &mut copies {
++        match g.Type {
++            D3D12_BARRIER_TYPE_TEXTURE if !g.Anonymous.pTextureBarriers.is_null() => {
++                let p = g.Anonymous.pTextureBarriers;
++                let mut rows: Vec<_> = (0..g.NumBarriers as usize).map(|i| ManuallyDrop::new(p.add(i).read())).collect();
++                for r in &mut rows { let p = &mut r.pResource as *mut _ as *mut *mut c_void; *p = native(*p); }
++                g.Anonymous.pTextureBarriers = rows.as_ptr() as _; textures.push(rows);
++            }
++            D3D12_BARRIER_TYPE_BUFFER if !g.Anonymous.pBufferBarriers.is_null() => {
++                let p = g.Anonymous.pBufferBarriers;
++                let mut rows: Vec<_> = (0..g.NumBarriers as usize).map(|i| ManuallyDrop::new(p.add(i).read())).collect();
++                for r in &mut rows { let p = &mut r.pResource as *mut _ as *mut *mut c_void; *p = native(*p); }
++                g.Anonymous.pBufferBarriers = rows.as_ptr() as _; buffers.push(rows);
++            }
++            _ => {}
++        }
++    }
++    f(this, n, copies.as_ptr())
++}
+-- 
+2.54.0
+

@@ -1,0 +1,72 @@
+From e1979479ae90203eb1cfbb669b90807aaf4ab533 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 22:55:51 +0100
+Subject: [PATCH] Register Xbox allocator command-memory callbacks at slot nine
+
+---
+ crates/xcl/src/hle/d3d12x/native_proxy.rs | 24 ++++++++++++++++++++---
+ 1 file changed, 21 insertions(+), 3 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/native_proxy.rs b/crates/xcl/src/hle/d3d12x/native_proxy.rs
+index a77e858..bc0c433 100644
+--- a/crates/xcl/src/hle/d3d12x/native_proxy.rs
++++ b/crates/xcl/src/hle/d3d12x/native_proxy.rs
+@@ -20,11 +20,13 @@ struct Proxy {
+ }
+ 
+ static FENCE_VTABLE: OnceLock<[usize; 13]> = OnceLock::new();
+-static ALLOCATOR_VTABLE: OnceLock<[usize; 9]> = OnceLock::new();
++static ALLOCATOR_VTABLE: OnceLock<[usize; 10]> = OnceLock::new();
+ static DESCRIPTOR_HEAP_VTABLE: OnceLock<[usize; 11]> = OnceLock::new();
+ static RESOURCE_VTABLE: OnceLock<[usize; 17]> = OnceLock::new();
+ 
+ static PROXIES: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
++/// Xbox command-storage allocation callback and borrowed context, retained across Reset.
++static ALLOCATOR_CALLBACKS: Mutex<Option<HashMap<usize, (usize, usize)>>> = Mutex::new(None);
+ 
+ /// Unwrap a console proxy at native API boundaries; PC-only objects pass through.
+ pub(super) fn native(fence: *mut c_void) -> *mut c_void {
+@@ -67,7 +69,7 @@ pub(super) unsafe fn wrap(native: *mut c_void, kind: Kind) -> *mut c_void {
+     let allocator_vtbl = ALLOCATOR_VTABLE.get_or_init(|| [
+         query_interface as usize, add_ref as usize, release as usize,
+         get_private_data as usize, set_private_data as usize, set_private_data_interface as usize,
+-        set_name as usize, get_device as usize, reset_allocator as usize,
++        set_name as usize, get_device as usize, reset_allocator as usize, set_command_memory_callback as usize,
+     ]);
+     let resource_vtbl = RESOURCE_VTABLE.get_or_init(|| [
+         query_interface as usize, add_ref as usize, release as usize,
+@@ -149,7 +151,10 @@ unsafe extern "system" fn release(p: *mut c_void) -> u32 {
+     if refs == 0 {
+         PROXIES.lock().unwrap_or_else(|e| e.into_inner()).as_mut().unwrap().remove(&(p as usize));
+         let obj = Box::from_raw(p as *mut Proxy);
+-        if obj.kind == Kind::Allocator { super::list_x::on_allocator_release(p as usize); }
++        if obj.kind == Kind::Allocator {
++            if let Some(m) = ALLOCATOR_CALLBACKS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() { m.remove(&(p as usize)); }
++            super::list_x::on_allocator_release(p as usize);
++        }
+         drop(IUnknown::from_raw(obj.native));
+     }
+     refs
+@@ -290,6 +295,19 @@ unsafe extern "system" fn signal(p: *mut c_void, value: u64) -> HRESULT {
+ 
+ forward!(native_reset_allocator, 8, () -> HRESULT);
+ 
++/// Xbox allocator #9 registers command-memory allocation policy; native PC storage stays backend-owned.
++unsafe extern "system" fn set_command_memory_callback(p: *mut c_void, callback: usize, context: usize) {
++    {
++        let mut registered = ALLOCATOR_CALLBACKS.lock().unwrap_or_else(|e| e.into_inner());
++        let entries = registered.get_or_insert_with(HashMap::new);
++        if callback == 0 { entries.remove(&(p as usize)); } else { entries.insert(p as usize, (callback, context)); }
++    }
++    static N: AtomicU32 = AtomicU32::new(0);
++    if N.fetch_add(1, Ordering::Relaxed) < 4 {
++        crate::xlog_info!("D3D12.X: allocator {p:p} registered command-memory callback {callback:#x}, context {context:#x}");
++    }
++}
++
+ unsafe extern "system" fn reset_allocator(p: *mut c_void) -> HRESULT {
+     let hr = native_reset_allocator(p);
+     if hr >= 0 { super::console_list::allocator_reset(p); }
+-- 
+2.54.0
+

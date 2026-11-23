@@ -1,0 +1,73 @@
+From 3520ae24d6ebbcf401b6c61e97cd24733408af34 Mon Sep 17 00:00:00 2001
+From: ivall <ivallpl@gmail.com>
+Date: Mon, 23 Nov 2026 22:06:35 +0100
+Subject: [PATCH] modules: a crash report survives an address below its
+ module's base (PR #147, gefydev)
+
+describe_address subtracted the module handle from raw stack words; Wine may report a
+module whose handle lies above the address, and the subtraction panicked in the crash
+handler. module_offset falls back to the bare address.
+---
+ crates/xcl/src/modules.rs | 38 +++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 37 insertions(+), 1 deletion(-)
+
+diff --git a/crates/xcl/src/modules.rs b/crates/xcl/src/modules.rs
+index c188eb0..db2a8e4 100644
+--- a/crates/xcl/src/modules.rs
++++ b/crates/xcl/src/modules.rs
+@@ -125,6 +125,18 @@ pub fn hle_name_by_handle(h: usize) -> Option<String> {
+     g.as_ref()?.iter().find(|(_, &v)| v == h).map(|(k, _)| k.clone())
+ }
+ 
++/// `name+offset` for an address inside its module, else the bare address.
++///
++/// The addresses `describe_address` gets include raw stack words, which can be anything. Wine
++/// may report a module for one with a handle above the address: the subtraction must not panic
++/// there, or a crash report turns into a panic in the crash handler.
++fn module_offset(name: &str, base: usize, addr: usize) -> String {
++    match addr.checked_sub(base) {
++        Some(offset) => format!("{name}+{offset:#x}"),
++        None => format!("{addr:#x}"),
++    }
++}
++
+ /// "game.exe+0x1234", "KERNELBASE.dll+0x5678" or "0x...".
+ pub fn describe_address(addr: usize) -> String {
+     if let Some(b) = image_base_for_addr(addr) {
+@@ -151,8 +163,32 @@ pub fn describe_address(addr: usize) -> String {
+             let n = GetModuleFileNameW(h, buf.as_mut_ptr(), 260) as usize;
+             let full = String::from_utf16_lossy(&buf[..n]);
+             let name = full.rsplit('\\').next().unwrap_or(&full).to_string();
+-            return format!("{name}+{:#x}", addr - h as usize);
++            return module_offset(&name, h as usize, addr);
+         }
+     }
+     format!("{addr:#x}")
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn module_offset_survives_a_base_above_the_address() {
++        // What Wine answered for a stack word while reporting a crash of the retail title:
++        // the handle lay above the address (the subtraction panicked and the report was lost).
++        assert_eq!(
++            module_offset("kernelbase.dll", 0x7fff_0000_0000, 0x6f93_bbb0_e7dc),
++            "0x6f93bbb0e7dc"
++        );
++        assert_eq!(module_offset("game.exe", 0x140000000, 0x140001234), "game.exe+0x1234");
++        assert_eq!(module_offset("game.exe", 0x140000000, 0x140000000), "game.exe+0x0");
++    }
++
++    #[test]
++    fn describe_address_takes_arbitrary_stack_words() {
++        for addr in [0usize, 1, 0x1000_0000_4, 0x7fff_ffff_ffff, usize::MAX] {
++            let _ = describe_address(addr);
++        }
++    }
++}
+-- 
+2.54.0
+

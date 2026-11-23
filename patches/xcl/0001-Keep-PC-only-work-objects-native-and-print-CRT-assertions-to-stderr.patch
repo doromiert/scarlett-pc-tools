@@ -1,0 +1,46 @@
+From b1846eb863ff9c830904d211b84859876f5b3e08 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 17:56:31 +0100
+Subject: [PATCH] Keep PC-only work objects native and print CRT assertions to
+ stderr
+
+---
+ crates/xcl/src/hle/d3d12x/real.rs | 3 ++-
+ crates/xcl/src/main.rs            | 7 +++++++
+ 2 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/real.rs b/crates/xcl/src/hle/d3d12x/real.rs
+index d8c7bfd..9969665 100644
+--- a/crates/xcl/src/hle/d3d12x/real.rs
++++ b/crates/xcl/src/hle/d3d12x/real.rs
+@@ -2413,7 +2413,8 @@ macro_rules! creator {
+                     crate::xlog_info!("D3D12.X: {} for interface {asked} (not on the PC) – made as {}", $method, super::layout::guid_string(&iid));
+                 }
+             }
+-            if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
++            // Objects used only by XCL's PC-side work retain the native runtime's vtable identity.
++            if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() && !super::title_textures::is_own_work() {
+                 adopt(*ppv, $kind);
+             }
+             hr
+diff --git a/crates/xcl/src/main.rs b/crates/xcl/src/main.rs
+index 83ed102..df63f6b 100644
+--- a/crates/xcl/src/main.rs
++++ b/crates/xcl/src/main.rs
+@@ -42,6 +42,13 @@ Usage:
+ ";
+ 
+ fn main() {
++    // Unattended launch diagnostics: report CRT assertions on stderr instead of a modal dialog.
++    unsafe {
++        if let Some(p) = system_proc("ucrtbase.dll", "_set_error_mode") {
++            let set_mode: unsafe extern "C" fn(i32) -> i32 = std::mem::transmute(p);
++            set_mode(1); // _OUT_TO_STDERR
++        }
++    }
+     // keep the TLS callback from being discarded by the linker
+     unsafe { std::ptr::read_volatile(&XCL_TLS_CALLBACK) };
+ 
+-- 
+2.54.0
+

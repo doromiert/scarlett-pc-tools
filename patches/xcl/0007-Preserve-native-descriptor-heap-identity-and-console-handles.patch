@@ -1,0 +1,266 @@
+From 7c0d4bd05168657526c79df659e03e3dd20e7e63 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 22:23:37 +0100
+Subject: [PATCH] Preserve native descriptor heap identity and console handles
+
+---
+ crates/xcl/src/hle/d3d12x/list_x.rs           |  2 +-
+ crates/xcl/src/hle/d3d12x/native_proxy.rs     | 53 +++++++++++++------
+ crates/xcl/src/hle/d3d12x/real.rs             | 16 +++---
+ .../xcl/src/hle/d3d12x/resource_boundary.rs   |  9 +++-
+ 4 files changed, 57 insertions(+), 23 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/list_x.rs b/crates/xcl/src/hle/d3d12x/list_x.rs
+index 7ad4005..63c9bee 100644
+--- a/crates/xcl/src/hle/d3d12x/list_x.rs
++++ b/crates/xcl/src/hle/d3d12x/list_x.rs
+@@ -1725,7 +1725,7 @@ pub(super) unsafe fn pc_heaps(n: u32, heaps: *const usize) -> Vec<Option<ID3D12D
+         }
+     }
+     out.extend(view_heap.map(Some));
+-    out
++    out.into_iter().map(|h| h.map(|h| super::native_proxy::descriptor_heap_for_pc(&h))).collect()
+ }
+ 
+ /// console #32 SetDescriptorHeaps (PC #28)
+diff --git a/crates/xcl/src/hle/d3d12x/native_proxy.rs b/crates/xcl/src/hle/d3d12x/native_proxy.rs
+index b43fc1c..3869315 100644
+--- a/crates/xcl/src/hle/d3d12x/native_proxy.rs
++++ b/crates/xcl/src/hle/d3d12x/native_proxy.rs
+@@ -8,7 +8,7 @@ use windows::Win32::Graphics::Direct3D12::*;
+ use crate::util::{HRESULT, E_NOINTERFACE};
+ 
+ #[derive(Clone, Copy, PartialEq)]
+-pub(super) enum Kind { Fence, Allocator, Resource }
++pub(super) enum Kind { Fence, Allocator, Resource, DescriptorHeap }
+ 
+ #[repr(C)]
+ struct Proxy {
+@@ -21,6 +21,7 @@ struct Proxy {
+ 
+ static FENCE_VTABLE: OnceLock<[usize; 13]> = OnceLock::new();
+ static ALLOCATOR_VTABLE: OnceLock<[usize; 9]> = OnceLock::new();
++static DESCRIPTOR_HEAP_VTABLE: OnceLock<[usize; 11]> = OnceLock::new();
+ static RESOURCE_VTABLE: OnceLock<[usize; 17]> = OnceLock::new();
+ 
+ static PROXIES: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+@@ -50,9 +51,9 @@ pub(super) unsafe fn resource_for_pc(resource: &ID3D12Resource, site: &str) -> I
+ 
+ /// Take ownership of the reference returned by a native creator.
+ pub(super) unsafe fn wrap(native: *mut c_void, kind: Kind) -> *mut c_void {
+-    if kind == Kind::Resource {
++    if matches!(kind, Kind::Resource | Kind::DescriptorHeap) {
+         let registry = PROXIES.lock().unwrap_or_else(|e| e.into_inner());
+-        if let Some((&p, _)) = registry.as_ref().and_then(|m| m.iter().find(|&(p, &n)| n == native as usize && proxy(*p as *mut c_void).kind == Kind::Resource)) {
++        if let Some((&p, _)) = registry.as_ref().and_then(|m| m.iter().find(|&(p, &n)| n == native as usize && proxy(*p as *mut c_void).kind == kind)) {
+             return p as *mut c_void;
+         }
+     }
+@@ -76,10 +77,17 @@ pub(super) unsafe fn wrap(native: *mut c_void, kind: Kind) -> *mut c_void {
+         super::real::res_write_to_subresource as usize, read_from_subresource as usize,
+         get_heap_properties as usize, get_protected_session as usize, get_desc1 as usize,
+     ]);
+-    let vtbl = match kind { Kind::Fence => fence_vtbl.as_ptr(), Kind::Allocator => allocator_vtbl.as_ptr(), Kind::Resource => resource_vtbl.as_ptr() };
++    let heap_vtbl = DESCRIPTOR_HEAP_VTABLE.get_or_init(|| [
++        query_interface as usize, add_ref as usize, release as usize,
++        get_private_data as usize, set_private_data as usize, set_private_data_interface as usize,
++        set_name as usize, get_device as usize, get_descriptor_heap_desc as usize,
++        super::guard::make_split(super::real::heap_cpu_start_x as usize, get_cpu_handle as usize),
++        super::guard::make_split(super::real::heap_gpu_start_x as usize, get_gpu_handle as usize),
++    ]);
++    let vtbl = match kind { Kind::Fence => fence_vtbl.as_ptr(), Kind::Allocator => allocator_vtbl.as_ptr(), Kind::Resource => resource_vtbl.as_ptr(), Kind::DescriptorHeap => heap_vtbl.as_ptr() };
+     let p = Box::into_raw(Box::new(Proxy { vtbl, refs: AtomicU32::new(1), native, kind, observed: false })) as *mut c_void;
+     PROXIES.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashMap::new).insert(p as usize, native as usize);
+-    if kind == Kind::Resource { observe_resource(p); }
++    if matches!(kind, Kind::Resource | Kind::DescriptorHeap) { observe_native_lifetime(p); }
+     p
+ }
+ 
+@@ -90,7 +98,8 @@ pub(super) unsafe fn native_if_proxy(p: *mut c_void) -> Option<*mut c_void> {
+     let v = *(p as *const usize);
+     let ours = FENCE_VTABLE.get().is_some_and(|t| t.as_ptr() as usize == v)
+         || ALLOCATOR_VTABLE.get().is_some_and(|t| t.as_ptr() as usize == v)
+-        || RESOURCE_VTABLE.get().is_some_and(|t| t.as_ptr() as usize == v);
++        || RESOURCE_VTABLE.get().is_some_and(|t| t.as_ptr() as usize == v)
++        || DESCRIPTOR_HEAP_VTABLE.get().is_some_and(|t| t.as_ptr() as usize == v);
+     ours.then(|| proxy(p).native)
+ }
+ 
+@@ -103,6 +112,7 @@ unsafe extern "system" fn query_interface(p: *mut c_void, iid: *const GUID, out:
+         Kind::Fence => [ID3D12Fence::IID, ID3D12Fence1::IID].contains(&*iid),
+         Kind::Allocator => *iid == ID3D12CommandAllocator::IID,
+         Kind::Resource => [ID3D12Resource::IID, ID3D12Resource1::IID, ID3D12Resource2::IID].contains(&*iid),
++        Kind::DescriptorHeap => *iid == ID3D12DescriptorHeap::IID,
+     };
+     if !base && !specific {
+         return E_NOINTERFACE;
+@@ -119,7 +129,7 @@ unsafe extern "system" fn query_interface(p: *mut c_void, iid: *const GUID, out:
+ }
+ 
+ unsafe extern "system" fn add_ref(p: *mut c_void) -> u32 {
+-    if proxy(p).kind == Kind::Resource {
++    if matches!(proxy(p).kind, Kind::Resource | Kind::DescriptorHeap) {
+         let obj = proxy(p).native;
+         let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(obj as *const *const usize)).add(1));
+         return f(obj);
+@@ -128,11 +138,11 @@ unsafe extern "system" fn add_ref(p: *mut c_void) -> u32 {
+ }
+ 
+ unsafe extern "system" fn release(p: *mut c_void) -> u32 {
+-    if proxy(p).kind == Kind::Resource {
++    if matches!(proxy(p).kind, Kind::Resource | Kind::DescriptorHeap) {
+         let (obj, observed) = (proxy(p).native, proxy(p).observed);
+         let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(*(*(obj as *const *const usize)).add(2));
+         let n = f(obj);
+-        if n == 0 && !observed { destroy_resource_proxy(p); }
++        if n == 0 && !observed { destroy_native_proxy(p); }
+         return n;
+     }
+     let refs = proxy(p).refs.fetch_sub(1, Ordering::AcqRel) - 1;
+@@ -164,6 +174,9 @@ forward!(get_device, 7, (iid: *const GUID, out: *mut *mut c_void) -> HRESULT);
+ forward!(get_completed_value, 8, () -> u64);
+ forward!(set_event_on_completion, 9, (value: u64, event: *mut c_void) -> HRESULT);
+ forward!(native_signal, 10, (value: u64) -> HRESULT);
++forward!(get_descriptor_heap_desc, 8, (out: *mut D3D12_DESCRIPTOR_HEAP_DESC) -> ());
++forward!(get_cpu_handle, 9, (out: *mut D3D12_CPU_DESCRIPTOR_HANDLE) -> ());
++forward!(get_gpu_handle, 10, (out: *mut D3D12_GPU_DESCRIPTOR_HANDLE) -> ());
+ forward!(get_desc, 10, (out: *mut D3D12_RESOURCE_DESC) -> ());
+ forward!(get_gpu_va, 11, () -> u64);
+ forward!(read_from_subresource, 13, (data: *mut c_void, row_pitch: u32, depth_pitch: u32, subresource: u32, region: *const D3D12_BOX) -> HRESULT);
+@@ -197,28 +210,32 @@ unsafe extern "system" fn lifetime_release(p: *mut c_void) -> u32 {
+     if n == 0 {
+         let obj = Box::from_raw(p as *mut Lifetime);
+         let target = obj.proxy.load(Ordering::Acquire);
+-        if target != 0 { destroy_resource_proxy(target as *mut c_void); }
++        if target != 0 { destroy_native_proxy(target as *mut c_void); }
+     }
+     n
+ }
+ 
+-unsafe fn destroy_resource_proxy(p: *mut c_void) {
++unsafe fn destroy_native_proxy(p: *mut c_void) {
+     PROXIES.lock().unwrap_or_else(|e| e.into_inner()).as_mut().unwrap().remove(&(p as usize));
+-    super::real::forget_resource(p);
++    match proxy(p).kind {
++        Kind::Resource => super::real::forget_resource(p),
++        Kind::DescriptorHeap => super::console_heap::unregister(p as usize),
++        _ => {}
++    }
+     drop(Box::from_raw(p as *mut Proxy));
+ }
+ 
+-unsafe fn observe_resource(p: *mut c_void) {
++unsafe fn observe_native_lifetime(p: *mut c_void) {
+     static V: OnceLock<[usize; 3]> = OnceLock::new();
+     let observer = Box::into_raw(Box::new(Lifetime { vtbl: V.get_or_init(|| [lifetime_qi as usize, lifetime_add as usize, lifetime_release as usize]), refs: AtomicU32::new(1), proxy: AtomicUsize::new(0) }));
+-    // A private IUnknown dies with the native resource, including references held by the backend.
++    // A private IUnknown dies with the native object, including references held by the backend.
+     const KEY: GUID = GUID::from_u128(0xd0189bc8_9744_48dd_8e67_d2fd6b5de63a);
+     let obj = proxy(p).native;
+     let f: unsafe extern "system" fn(*mut c_void, *const GUID, *mut c_void) -> HRESULT = std::mem::transmute(*(*(obj as *const *const usize)).add(5));
+     if f(obj, &KEY, observer as *mut c_void) >= 0 {
+         (*observer).proxy.store(p as usize, Ordering::Release);
+         (*(p as *mut Proxy)).observed = true;
+-    } else { crate::xlog_warn!("D3D12.X: native resource lifetime observer unavailable; cleanup follows external Release"); }
++    } else { crate::xlog_warn!("D3D12.X: native object lifetime observer unavailable; cleanup follows external Release"); }
+     lifetime_release(observer as *mut c_void);
+ }
+ 
+@@ -240,3 +257,9 @@ unsafe extern "system" fn reset_allocator(p: *mut c_void) -> HRESULT {
+     if hr >= 0 { super::console_list::allocator_reset(p); }
+     hr
+ }
++
++/// A heap bound on a PC-only list must expose the native backend's identity.
++pub(super) unsafe fn descriptor_heap_for_pc(heap: &ID3D12DescriptorHeap) -> ID3D12DescriptorHeap {
++    let p = native(heap.as_raw());
++    ID3D12DescriptorHeap::from_raw_borrowed(&p).unwrap().clone()
++}
+diff --git a/crates/xcl/src/hle/d3d12x/real.rs b/crates/xcl/src/hle/d3d12x/real.rs
+index 639a82e..5e99e0d 100644
+--- a/crates/xcl/src/hle/d3d12x/real.rs
++++ b/crates/xcl/src/hle/d3d12x/real.rs
+@@ -927,23 +927,23 @@ fn console_slots(kind: Kind) -> Vec<(usize, usize)> {
+ /// descriptor heap #9 / #10 GetCPU / GetGPUDescriptorHandleForHeapStart: console code
+ /// takes the handle in rax (only `this` passed); the PC methods return it through a hidden
+ /// pointer
+-unsafe extern "system" fn heap_cpu_start_x(this: *mut c_void) -> u64 {
++pub(super) unsafe extern "system" fn heap_cpu_start_x(this: *mut c_void) -> u64 {
+     if let Some(p) = super::console_heap::start(this as usize) {
+         return p;
+     }
+     let f: unsafe extern "system" fn(*mut c_void, *mut u64) -> *mut u64 = std::mem::transmute(orig_fn(this, 9));
+     let mut h = 0u64;
+-    f(this, &mut h);
++    f(super::native_proxy::native(this), &mut h);
+     h
+ }
+ 
+-unsafe extern "system" fn heap_gpu_start_x(this: *mut c_void) -> u64 {
++pub(super) unsafe extern "system" fn heap_gpu_start_x(this: *mut c_void) -> u64 {
+     if let Some(p) = super::console_heap::start(this as usize) {
+         return p;
+     }
+     let f: unsafe extern "system" fn(*mut c_void, *mut u64) -> *mut u64 = std::mem::transmute(orig_fn(this, 10));
+     let mut h = 0u64;
+-    f(this, &mut h);
++    f(super::native_proxy::native(this), &mut h);
+     h
+ }
+ 
+@@ -2270,8 +2270,10 @@ fn overrides(kind: Kind) -> Vec<(&'static str, usize)> {
+ 
+ /// Slot of `method` in the class of an adopted object.
+ unsafe fn slot_of(this: *mut c_void, method: &str) -> usize {
+-    if super::native_proxy::kind(this) == Some(super::native_proxy::Kind::Resource) {
+-        return layout::slot(layout::find("ID3D12Resource2").unwrap(), method).expect("resource method");
++    match super::native_proxy::kind(this) {
++        Some(super::native_proxy::Kind::Resource) => return layout::slot(layout::find("ID3D12Resource2").unwrap(), method).expect("resource method"),
++        Some(super::native_proxy::Kind::DescriptorHeap) => return layout::slot(layout::find("ID3D12DescriptorHeap").unwrap(), method).expect("descriptor heap method"),
++        _ => {}
+     }
+     let ext = vt(this) as usize;
+     let g = CLASSES.lock().unwrap();
+@@ -2441,6 +2443,8 @@ macro_rules! creator {
+             if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() && !super::title_textures::is_own_work() {
+                 if $kind == Kind::Fence {
+                     *ppv = super::native_proxy::wrap(*ppv, super::native_proxy::Kind::Fence);
++                } else if $kind == Kind::DescriptorHeap {
++                    *ppv = super::native_proxy::wrap(*ppv, super::native_proxy::Kind::DescriptorHeap);
+                 } else if $kind == Kind::Resource {
+                     *ppv = super::native_proxy::wrap(*ppv, super::native_proxy::Kind::Resource);
+                 } else if $kind == Kind::CommandAllocator {
+diff --git a/crates/xcl/src/hle/d3d12x/resource_boundary.rs b/crates/xcl/src/hle/d3d12x/resource_boundary.rs
+index 7f998ed..d959736 100644
+--- a/crates/xcl/src/hle/d3d12x/resource_boundary.rs
++++ b/crates/xcl/src/hle/d3d12x/resource_boundary.rs
+@@ -5,7 +5,7 @@ use windows::Win32::Graphics::Direct3D12::*;
+ use super::{native_proxy::native, real::{self, Kind}};
+ use crate::util::HRESULT;
+ 
+-pub(super) fn relevant(s: usize) -> bool { matches!(s, 8 | 9 | 15..=21 | 26 | 34 | 35 | 42 | 46 | 49..=51 | 54 | 55 | 59..=61 | 64 | 80) }
++pub(super) fn relevant(s: usize) -> bool { matches!(s, 8 | 9 | 15..=21 | 26 | 28 | 34 | 35 | 42 | 46 | 49..=51 | 54 | 55 | 59..=61 | 64 | 80) }
+ 
+ pub(super) fn method(kind: Kind, s: usize) -> Option<usize> {
+     Some(match (kind, s) {
+@@ -25,6 +25,7 @@ pub(super) fn method(kind: Kind, s: usize) -> Option<usize> {
+         (Kind::CommandList | Kind::DmaList, 18) => copy_tiles as usize,
+         (Kind::CommandList | Kind::DmaList, 19) => resolve as usize,
+         (Kind::CommandList | Kind::DmaList, 26) => barriers as usize,
++        (Kind::CommandList | Kind::DmaList, 28) => set_descriptor_heaps as usize,
+         (Kind::CommandList | Kind::DmaList, 49) => clear_uint as usize,
+         (Kind::CommandList | Kind::DmaList, 50) => clear_float as usize,
+         (Kind::CommandList | Kind::DmaList, 51) => discard as usize,
+@@ -155,3 +156,9 @@ unsafe extern "system" fn enhanced_barriers(this: *mut c_void, n: u32, groups: *
+     }
+     f(this, n, copies.as_ptr())
+ }
++
++unsafe extern "system" fn set_descriptor_heaps(this: *mut c_void, n: u32, heaps: *const *mut c_void) {
++    let f: unsafe extern "system" fn(*mut c_void, u32, *const *mut c_void) = std::mem::transmute(real::raw_orig_fn(this, 28));
++    let mapped = objects(heaps, n);
++    f(this, n, if heaps.is_null() { heaps } else { mapped.as_ptr() })
++}
+-- 
+2.54.0
+

@@ -106,3 +106,6 @@ every push. Do not paste private traces or extracted content into issues or PRs.
 
 Original tools: GPL-3.0-or-later. External projects retain their own licenses;
 attributed source patches are included; external build artifacts are obtained separately.
+
+The independent [XCL setup recipe](XCL_INTEGRATION.md) and `patches/xcl/`
+are GPL-2.0-only; they remain separate from the Leonida patch series.

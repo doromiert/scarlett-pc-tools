@@ -239,6 +239,10 @@ capacity check was disabled. Repeating with register-only diagnostic XCL
 
 These runs have no automatic stop timer. The dump remains private, with writes
 redirected to an external overlay and networking disabled. The XCL implementation
-remains a separate GPL-2.0-only checkout; this repository distributes no XCL code,
-game files, frame captures, or private runtime logs. Leonida's sampled output
+remains a separate GPL-2.0-only component; the later source recipe distributes
+only attributed patches, with no game files, frame captures, or private runtime logs. Leonida's sampled output
 remains black.
+
+The independent [XCL source recipe](XCL_INTEGRATION.md) now reproduces the
+setup-tested source tree from 14 attributed patches. Its GPL-2.0-only licensing
+is explicit and separate from the Leonida implementation.

@@ -1,0 +1,97 @@
+From 0c25f67de052c8b8d7bac661669b4b658580d4ef Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 22:20:00 +0100
+Subject: [PATCH] Unwrap resources passed to PC-only tile mapping queues
+
+---
+ crates/xcl/src/hle/d3d12x/native_proxy.rs | 13 +++++++++++++
+ crates/xcl/src/hle/d3d12x/sparse.rs       |  6 ++++--
+ crates/xcl/src/hle/d3d12x/vram.rs         |  3 ++-
+ 3 files changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/native_proxy.rs b/crates/xcl/src/hle/d3d12x/native_proxy.rs
+index a7bde94..b43fc1c 100644
+--- a/crates/xcl/src/hle/d3d12x/native_proxy.rs
++++ b/crates/xcl/src/hle/d3d12x/native_proxy.rs
+@@ -35,6 +35,19 @@ pub(super) unsafe fn kind(p: *mut c_void) -> Option<Kind> {
+     (native(p) != p).then(|| proxy(p).kind)
+ }
+ 
++/// PC-only queues were made before adoption and do not have the boundary vtable hooks.
++pub(super) unsafe fn resource_for_pc(resource: &ID3D12Resource, site: &str) -> ID3D12Resource {
++    let p = native(resource.as_raw());
++    if std::env::var_os("XCL_NATIVE_OBJECT_TRACE").is_some() {
++        static N: AtomicU32 = AtomicU32::new(0);
++        if N.fetch_add(1, Ordering::Relaxed) < 32 {
++            let v = *(p as *const usize);
++            crate::xlog_info!("D3D12.X: native resource at {site}: console {:p}, native {p:p}, vtable {v:#x} ({})", resource.as_raw(), crate::modules::describe_address(v));
++        }
++    }
++    ID3D12Resource::from_raw_borrowed(&p).unwrap().clone()
++}
++
+ /// Take ownership of the reference returned by a native creator.
+ pub(super) unsafe fn wrap(native: *mut c_void, kind: Kind) -> *mut c_void {
+     if kind == Kind::Resource {
+diff --git a/crates/xcl/src/hle/d3d12x/sparse.rs b/crates/xcl/src/hle/d3d12x/sparse.rs
+index 3cf45e5..8960eae 100644
+--- a/crates/xcl/src/hle/d3d12x/sparse.rs
++++ b/crates/xcl/src/hle/d3d12x/sparse.rs
+@@ -574,6 +574,7 @@ impl State {
+         if tiles.is_empty() {
+             return;
+         }
++        let native_res = super::native_proxy::resource_for_pc(res, "sparse::map_tiles UpdateTileMappings");
+         let mut by_heap: FxHashMap<u32, Vec<(u32, u32)>> = FxHashMap::default();
+         for &(a, (h, t)) in tiles {
+             by_heap.entry(h).or_default().push((((a - res_base) / TILE) as u32, t));
+@@ -605,7 +606,7 @@ impl State {
+                 i += run as usize;
+             }
+             self.queue.UpdateTileMappings(
+-                res,
++                &native_res,
+                 coords.len() as u32,
+                 Some(coords.as_ptr()),
+                 Some(regions.as_ptr()),
+@@ -623,6 +624,7 @@ impl State {
+         if tiles.is_empty() {
+             return;
+         }
++        let native_res = super::native_proxy::resource_for_pc(res, "sparse::unmap_tiles UpdateTileMappings");
+         let mut xs: Vec<u32> = tiles.iter().map(|&a| ((a - res_base) / TILE) as u32).collect();
+         xs.sort_unstable();
+         let mut coords: Vec<D3D12_TILED_RESOURCE_COORDINATE> = Vec::with_capacity(xs.len());
+@@ -643,7 +645,7 @@ impl State {
+             i += run as usize;
+         }
+         self.queue.UpdateTileMappings(
+-            res,
++            &native_res,
+             coords.len() as u32,
+             Some(coords.as_ptr()),
+             Some(regions.as_ptr()),
+diff --git a/crates/xcl/src/hle/d3d12x/vram.rs b/crates/xcl/src/hle/d3d12x/vram.rs
+index af38af4..2fdd672 100644
+--- a/crates/xcl/src/hle/d3d12x/vram.rs
++++ b/crates/xcl/src/hle/d3d12x/vram.rs
+@@ -272,6 +272,7 @@ impl Pages {
+ 
+     /// Map every tile of `res` (`tiles[i]`: overall tile i) – one call per pool heap.
+     unsafe fn map(&mut self, res: &ID3D12Resource, tiles: &[Tile]) {
++        let native_res = super::native_proxy::resource_for_pc(res, "vram::Pages::map UpdateTileMappings");
+         let mut heaps: Vec<u32> = tiles.iter().map(|t| t.0).collect();
+         heaps.sort_unstable();
+         heaps.dedup();
+@@ -283,7 +284,7 @@ impl Pages {
+             let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
+             let region = D3D12_TILE_REGION_SIZE { NumTiles: tiles.len() as u32, UseBox: false.into(), ..Default::default() };
+             self.queue.UpdateTileMappings(
+-                res,
++                &native_res,
+                 1,
+                 Some(&coord),
+                 Some(&region),
+-- 
+2.54.0
+

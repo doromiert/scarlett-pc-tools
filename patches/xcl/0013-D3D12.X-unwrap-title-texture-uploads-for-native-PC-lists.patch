@@ -1,0 +1,49 @@
+From c72dfaad294e9ff44571be62156c86e6ac8f6166 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 23:12:04 +0100
+Subject: [PATCH] D3D12.X: unwrap title texture uploads for native PC lists
+
+---
+ crates/xcl/src/hle/d3d12x/native_proxy.rs   | 9 +++++++--
+ crates/xcl/src/hle/d3d12x/title_textures.rs | 5 ++++-
+ 2 files changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/native_proxy.rs b/crates/xcl/src/hle/d3d12x/native_proxy.rs
+index bc0c433..8f69279 100644
+--- a/crates/xcl/src/hle/d3d12x/native_proxy.rs
++++ b/crates/xcl/src/hle/d3d12x/native_proxy.rs
+@@ -42,8 +42,13 @@ pub(super) unsafe fn kind(p: *mut c_void) -> Option<Kind> {
+ pub(super) unsafe fn resource_for_pc(resource: &ID3D12Resource, site: &str) -> ID3D12Resource {
+     let p = native(resource.as_raw());
+     if std::env::var_os("XCL_NATIVE_OBJECT_TRACE").is_some() {
+-        static N: AtomicU32 = AtomicU32::new(0);
+-        if N.fetch_add(1, Ordering::Relaxed) < 32 {
++        static SITES: Mutex<Vec<String>> = Mutex::new(Vec::new());
++        let first = {
++            let mut sites = SITES.lock().unwrap_or_else(|e| e.into_inner());
++            if sites.len() >= 32 || sites.iter().any(|s| s == site) { false }
++            else { sites.push(site.into()); true }
++        };
++        if first {
+             let v = *(p as *const usize);
+             crate::xlog_info!("D3D12.X: native resource at {site}: console {:p}, native {p:p}, vtable {v:#x} ({})", resource.as_raw(), crate::modules::describe_address(v));
+         }
+diff --git a/crates/xcl/src/hle/d3d12x/title_textures.rs b/crates/xcl/src/hle/d3d12x/title_textures.rs
+index 3382694..ed28ffe 100644
+--- a/crates/xcl/src/hle/d3d12x/title_textures.rs
++++ b/crates/xcl/src/hle/d3d12x/title_textures.rs
+@@ -330,7 +330,10 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
+             if super::present::trace_frame() {
+                 note_content(va, &r, &subs);
+             }
+-            batch.push((r, subs, state, state));
++            // own_work creates an untouched PC list: its barriers and copy locations
++            // cannot consume the title-facing resource proxy.
++            let pc = super::native_proxy::resource_for_pc(&r, "title_textures::upload_all native list");
++            batch.push((pc, subs, state, state));
+         }
+         let d = device as *mut c_void;
+         let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
+-- 
+2.54.0
+

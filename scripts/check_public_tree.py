@@ -14,7 +14,7 @@ def check():
     for raw in filter(None, names):
         name = raw.decode("utf-8")
         p = PurePosixPath(name)
-        source_patch = p.suffix == ".patch" and p.parts[:2] == ("patches", "leonida")
+        source_patch = p.suffix == ".patch" and p.parts[:2] in {("patches", "leonida"), ("patches", "xcl")}
         native_source = name == "native/radv_file_userptr.c"
         if p.suffix not in ALLOWED and p.name not in SPECIAL and not source_patch and not native_source:
             errors.append(f"Unapproved tracked file type: {name}")

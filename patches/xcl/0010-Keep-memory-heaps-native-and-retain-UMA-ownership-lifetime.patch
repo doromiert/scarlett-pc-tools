@@ -1,0 +1,100 @@
+From 7d4ab21cb253f6cf37a50684dde55f991300edfc Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Mon, 23 Nov 2026 22:44:31 +0100
+Subject: [PATCH] Keep memory heaps native and retain UMA ownership lifetime
+
+---
+ crates/xcl/src/hle/d3d12x/native_proxy.rs | 19 ++++++++++++++++++
+ crates/xcl/src/hle/d3d12x/real.rs         | 24 ++++++++++++++++++-----
+ 2 files changed, 38 insertions(+), 5 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/native_proxy.rs b/crates/xcl/src/hle/d3d12x/native_proxy.rs
+index c9f16e5..1b6b60f 100644
+--- a/crates/xcl/src/hle/d3d12x/native_proxy.rs
++++ b/crates/xcl/src/hle/d3d12x/native_proxy.rs
+@@ -258,6 +258,25 @@ unsafe fn destroy_pipeline_state(pso: *mut c_void) {
+     super::real::forget_pipeline_state(pso);
+ }
+ 
++static NATIVE_HEAPS: Mutex<Option<HashSet<usize>>> = Mutex::new(None);
++
++pub(super) fn is_native_heap(heap: usize) -> bool {
++    NATIVE_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).as_ref().is_some_and(|m| m.contains(&heap))
++}
++
++/// Keep heap arguments native while releasing their owned UMA pages at native destruction.
++pub(super) unsafe fn observe_heap(heap: *mut c_void) -> HRESULT {
++    if !NATIVE_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).get_or_insert_with(HashSet::new).insert(heap as usize) { return 0; }
++    let hr = install_lifetime_observer(heap, heap, destroy_heap);
++    if hr < 0 { NATIVE_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().unwrap().remove(&(heap as usize)); }
++    hr
++}
++
++unsafe fn destroy_heap(heap: *mut c_void) {
++    NATIVE_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).as_mut().unwrap().remove(&(heap as usize));
++    super::real::forget_memory_heap(heap);
++}
++
+ unsafe extern "system" fn get_creation_flags(p: *mut c_void) -> u32 {
+     ID3D12Fence::from_raw_borrowed(&proxy(p).native).unwrap().cast::<ID3D12Fence1>()
+         .map(|f| f.GetCreationFlags().0 as u32).unwrap_or(0)
+diff --git a/crates/xcl/src/hle/d3d12x/real.rs b/crates/xcl/src/hle/d3d12x/real.rs
+index 52866a6..8259b10 100644
+--- a/crates/xcl/src/hle/d3d12x/real.rs
++++ b/crates/xcl/src/hle/d3d12x/real.rs
+@@ -2453,6 +2453,14 @@ macro_rules! creator {
+                     *ppv = super::native_proxy::wrap(*ppv, super::native_proxy::Kind::Resource);
+                 } else if $kind == Kind::CommandAllocator {
+                     *ppv = super::native_proxy::wrap(*ppv, super::native_proxy::Kind::Allocator);
++                } else if $kind == Kind::Heap {
++                    let observed = super::native_proxy::observe_heap(*ppv);
++                    if observed < 0 {
++                        let release: RefFn = std::mem::transmute(*vt(*ppv).add(2));
++                        release(*ppv);
++                        *ppv = std::ptr::null_mut();
++                        return observed;
++                    }
+                 } else {
+                     adopt(*ppv, $kind);
+                 }
+@@ -2592,8 +2600,12 @@ fn debug_pso_switch(var: &str, ps: u64) -> bool {
+     ps != 0 && std::env::var(var).is_ok_and(|v| v.split(',').filter_map(|h| u64::from_str_radix(h.trim(), 16).ok()).any(|h| h == ps))
+ }
+ 
+-/// The PC description of a heap XCL adopted (ID3D12Heap::GetDesc, slot 8).
++/// The PC description of a tracked native heap or a legacy adopted one.
+ unsafe fn pc_heap_desc(heap: usize) -> Option<D3D12_HEAP_DESC> {
++    if super::native_proxy::is_native_heap(heap) {
++        let raw = heap as *mut c_void;
++        return ID3D12Heap::from_raw_borrowed(&raw).map(|h| h.GetDesc());
++    }
+     if !is_adopted(heap as *mut c_void) {
+         return None;
+     }
+@@ -2782,17 +2794,19 @@ fn heap_block(heap: usize) -> Option<(usize, bool)> {
+ unsafe extern "system" fn mem_heap_release(this: *mut c_void) -> u32 {
+     let f: unsafe extern "system" fn(*mut c_void) -> u32 = std::mem::transmute(orig_fn(this, 2));
+     let n = f(this);
+-    if n == 0 {
++    if n == 0 { forget_memory_heap(this); }
++    n
++}
++
++pub(super) fn forget_memory_heap(this: *mut c_void) {
+         let gone = HEAP_UMA.lock().unwrap().as_mut().and_then(|m| m.remove(&(this as usize))).and_then(|e| e.block);
+         if let (Some(p), Some(u)) = (gone, crate::gpu::uma::get()) {
+             if u.is_sparse(p) {
+-                super::sparse::free(p);
++                unsafe { super::sparse::free(p) };
+             } else {
+                 u.free(p);
+             }
+         }
+-    }
+-    n
+ }
+ creator!(dev_create_fence_pc, "CreateFence", Kind::Fence, [a1, a2]);
+ 
+-- 
+2.54.0
+

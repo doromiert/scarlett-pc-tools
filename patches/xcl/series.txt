@@ -1,0 +1,14 @@
+0001-Keep-PC-only-work-objects-native-and-print-CRT-assertions-to-stderr.patch
+0002-Keep-native-fence-identity-behind-a-console-COM-proxy.patch
+0003-Preserve-native-command-allocator-identity-through-console-proxies.patch
+0004-Keep-native-resources-behind-console-proxies-and-unwrap-API-inputs.patch
+0005-modules-a-crash-report-survives-an-address-below-its-module-s-base-PR-147-gefydev.patch
+0006-Unwrap-resources-passed-to-PC-only-tile-mapping-queues.patch
+0007-Preserve-native-descriptor-heap-identity-and-console-handles.patch
+0008-Keep-root-signatures-native-while-retaining-console-layout-tracking.patch
+0009-Keep-pipeline-states-native-and-observe-metadata-lifetime.patch
+0010-Keep-memory-heaps-native-and-retain-UMA-ownership-lifetime.patch
+0011-Unwrap-fence-arguments-on-PC-queue-Signal-and-Wait-paths.patch
+0012-Register-Xbox-allocator-command-memory-callbacks-at-slot-nine.patch
+0013-D3D12.X-unwrap-title-texture-uploads-for-native-PC-lists.patch
+0014-D3D12.X-keep-command-list-identity-native-behind-title-dispatch.patch
