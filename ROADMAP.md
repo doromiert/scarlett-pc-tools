@@ -1,5 +1,12 @@
 # Requirements and acceptance criteria
 
+## PC target
+
+The requested target is Windows PC code running under Proton, with static
+conversion and reusable private caches preferred over repeated runtime work.
+See [NATIVE_PC.md](NATIVE_PC.md) for the first actual offline shader conversion
+and its limits. A standalone native port and a Proton launch remain unverified.
+
 ## Boot and render first
 
 1. Validate the locally supplied package and executable.

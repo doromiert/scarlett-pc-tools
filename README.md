@@ -8,6 +8,10 @@ executables, DLLs, archives, keys, extracted assets, shaders, or private test lo
 are included. Keep your dump, runtime checkouts, work files and reports outside
 this repository. Nothing here uploads game content or retrieves a dump.
 
+The requested direction is Windows PC code under Proton, with ahead-of-time
+conversion where practical. [NATIVE_PC.md](NATIVE_PC.md) records the first
+verified offline shader preparation and the remaining runtime dependencies.
+
 ## Install
 
 Python 3.11 or newer (tested locally with Python 3.13.15):

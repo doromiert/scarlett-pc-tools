@@ -1,5 +1,27 @@
 # Local verification, 2026-11-24
 
+## 2026-11-24: PC preparation target and actual offline conversion
+
+The user selected Windows PC code under Proton as the target. One actual console
+compute program was compiled offline into a private PC DXIL cache using the
+running integration's executable and matching DXC toolchain identity. A second
+pass reused the cached file without rewriting it. Native DXIL-to-SPIR-V
+conversion and validation passed. Runtime consumption of this prepared cache,
+whole-corpus coverage and a Proton launch remain unverified; see
+[NATIVE_PC.md](NATIVE_PC.md).
+
+The 51-patch logic has now run in the private integration and rendered the
+account picker and animated intro. A 20-second live CPU profile collected 2,866
+samples; the top 100 addresses covered 2,725 samples, including 297 in texture
+detiling. Most samples were inside the title's own code, whose hot functions
+remain unidentified. This profile does not establish critical-path timing or
+an isolated speedup over the preceding run. WASD gameplay remains unverified.
+
+The desktop frame viewer was found showing an older screen than the latest
+game frame. Its replacement's actual window capture matched a stable source
+frame pixel for pixel. Only the viewer was restarted. No controllable 3D scene
+is verified, and the clean public-series executable still has not run.
+
 ## 2026-11-24: headless keyboard movement prepared
 
 The 51-patch candidate is `4278e4f4accb2f8cb3a714b1850e0b933ecbc59a`,
