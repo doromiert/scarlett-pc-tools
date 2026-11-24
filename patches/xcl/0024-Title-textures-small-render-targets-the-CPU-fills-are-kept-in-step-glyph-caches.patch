@@ -1,0 +1,55 @@
+From a5f6f1c1adea5c36fcc5b30dec28ad9a7b7b3a43 Mon Sep 17 00:00:00 2001
+From: theaustinayers <153482135+theaustinayers@users.noreply.github.com>
+Date: Mon, 23 Nov 2026 16:05:36 -0500
+Subject: [PATCH] Title textures: small render targets the CPU fills are kept
+ in step (glyph caches)
+
+A retail title places its glyph caches as 256x256 R8 textures with ALLOW_RENDER_TARGET (two planes in the console layout) and fills them from the CPU. register() refused every multi-plane texture as the GPU's, so they were never uploaded and the menus' body text lost most of its letters. A small single-sample colour target with texels (64x64 to 1024x1024, not a depth buffer) is now registered like any texture. XCL_SYNC_SMALL_TARGETS=0 turns it off.
+
+Co-Authored-By: Claude Fable 5.2 <noreply@anthropic.com>
+(cherry picked from commit f17a5eeb91037c5bbe8a5c783d07134994e26d5e)
+---
+ crates/xcl/src/hle/d3d12x/title_textures.rs | 25 +++++++++++++++++++--
+ 1 file changed, 23 insertions(+), 2 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/title_textures.rs b/crates/xcl/src/hle/d3d12x/title_textures.rs
+index ebd093d..4e6c2a1 100644
+--- a/crates/xcl/src/hle/d3d12x/title_textures.rs
++++ b/crates/xcl/src/hle/d3d12x/title_textures.rs
+@@ -83,10 +83,31 @@ pub fn counts() -> (usize, u64) {
+ /// A texture the title placed at `va` (its console desc `desc`): kept in step with the memory.
+ pub(super) unsafe fn register(device: *mut c_void, res: *mut c_void, va: usize, desc: &[u8; 0x38], state: D3D12_RESOURCE_STATES) -> Result<(), String> {
+     let tex = xg::Texture::new(desc).map_err(|hr| format!("layout {hr:#x}"))?;
+-    // render targets and depth buffers are the GPU's (their metadata planes, empty planes)
+-    if tex.planes.len() != 1 || tex.texels().is_none() {
++    // Render targets and depth buffers are the GPU's (their metadata planes, empty planes) –
++    // except a small single-sample colour target with texels: a retail title makes its glyph
++    // caches that way (256x256 R8 with ALLOW_RENDER_TARGET, two planes) and fills them from the
++    // CPU. Left to the GPU they stayed as they were made and its menus' body text lost most of
++    // its letters. Such a target is uploaded like any texture when the CPU wrote its pages; one
++    // the title only renders to is not CPU-written and so not uploaded over.
++    // `XCL_SYNC_SMALL_TARGETS=0` turns this off.
++    let small_target = {
++        let (w, h) = (u64::from_le_bytes(desc[0x10..0x18].try_into().unwrap()), u32::from_le_bytes(desc[0x18..0x1c].try_into().unwrap()));
++        let (samples, flags) = (u32::from_le_bytes(desc[0x24..0x28].try_into().unwrap()), u32::from_le_bytes(desc[0x30..0x34].try_into().unwrap()));
++        static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++        let off = *OFF.get_or_init(|| std::env::var("XCL_SYNC_SMALL_TARGETS").is_ok_and(|v| v.trim() == "0"));
++        // (64x64 and up: 1x1 placeholders are not worth an entry; 0x2: a depth buffer)
++        !off && w <= 1024 && h <= 1024 && w * h as u64 >= 64 * 64 && samples <= 1 && flags & 0x2 == 0
++    };
++    if tex.texels().is_none() || (tex.planes.len() != 1 && !small_target) {
+         return Err("a render target / depth buffer".into());
+     }
++    if tex.planes.len() != 1 {
++        static N: AtomicU64 = AtomicU64::new(0);
++        let n = N.fetch_add(1, Ordering::Relaxed) + 1;
++        if n <= 2 || n.is_power_of_two() {
++            crate::xlog_info!("D3D12.X: a small render target at {va:#x} ({} planes) is kept in step with the title's memory – a glyph cache the CPU fills ({n} so far)", tex.planes.len());
++        }
++    }
+     if ID3D12Resource::from_raw_borrowed(&res).is_none() {
+         return Err("no resource".into());
+     }
+-- 
+2.54.0
+

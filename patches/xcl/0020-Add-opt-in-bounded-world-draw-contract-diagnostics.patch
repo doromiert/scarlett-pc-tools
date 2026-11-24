@@ -1,0 +1,266 @@
+From 324a7c93dec59a9b594455314a8dc492ad948aae Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Tue, 24 Nov 2026 00:33:05 +0100
+Subject: [PATCH] Add opt-in bounded world draw contract diagnostics
+
+---
+ crates/xcl/src/hle/d3d12x/bind.rs     |  32 ++++++--
+ crates/xcl/src/hle/d3d12x/device_x.rs |  13 ++++
+ crates/xcl/src/hle/d3d12x/real.rs     | 106 ++++++++++++++++++++++++--
+ 3 files changed, 141 insertions(+), 10 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/bind.rs b/crates/xcl/src/hle/d3d12x/bind.rs
+index ae4985a..f550e73 100644
+--- a/crates/xcl/src/hle/d3d12x/bind.rs
++++ b/crates/xcl/src/hle/d3d12x/bind.rs
+@@ -215,6 +215,10 @@ pub(super) unsafe extern "system" fn execute_indirect(this: *mut c_void, sig: us
+     type F = unsafe extern "system" fn(*mut c_void, usize, u32, usize, u64, usize, u64);
+     let pc: F = std::mem::transmute(super::real::orig_fn(this, 59));
+     let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
++    super::real::trace_world_command(pso, "execute-indirect", || format!(
++        "signature={sig:#x} max={max} args={args:#x} offset={args_off:#x} count_buffer={count_buf:#x} count_offset={count_off:#x} root_changing={}",
++        ROOT_SIGNATURES.lock().unwrap().as_ref().is_some_and(|s| s.contains(&sig))
++    ));
+     let (gfx, compute) = (super::real::is_translated_graphics(pso), super::real::is_translated_compute(pso));
+     let (args_off, count_off) = (args_off + super::real::buffer_delta(args), count_off + super::real::buffer_delta(count_buf));
+     if !gfx && !compute {
+@@ -305,7 +309,9 @@ unsafe fn draw_rects(this: *mut c_void, list: &ID3D12GraphicsCommandList, vertic
+ /// #12 DrawInstanced
+ pub(super) unsafe extern "system" fn draw_instanced(this: *mut c_void, vertices: u32, instances: u32, first_vertex: u32, first_instance: u32) {
+     DRAW_ARGS.with(|d| d.set((false, vertices, instances, first_vertex, 0)));
+-    if let Some(list) = graphics_bound(this) {
++    if let Some(list) = graphics_bound(this, "draw", || format!(
++        "vertices={vertices} instances={instances} first_vertex={first_vertex} first_instance={first_instance}"
++    )) {
+         if draw_rects(this, &list, vertices, instances, first_vertex, first_instance) {
+             return;
+         }
+@@ -321,7 +327,7 @@ thread_local! {
+ 
+ /// #13 DrawIndexedInstanced
+ pub(super) unsafe extern "system" fn draw_indexed_instanced(this: *mut c_void, indices: u32, instances: u32, first_index: u32, base_vertex: i32, first_instance: u32) {
+-    if let Some(list) = prepare_indexed_draw(this, indices, instances, first_index, base_vertex) {
++    if let Some(list) = prepare_indexed_draw_with_instance(this, indices, instances, first_index, base_vertex, Some(first_instance)) {
+         super::list_x::sync_title_buffers(this, Some((first_index, indices, base_vertex)), 0, 0, if first_instance != 0 { instances.max(2) } else { instances });
+         emit_prepared_indexed_draw(&list, indices, instances, first_index, base_vertex, first_instance);
+     }
+@@ -334,9 +340,22 @@ pub(super) unsafe fn prepare_indexed_draw(
+     instances: u32,
+     first_index: u32,
+     base_vertex: i32,
++) -> Option<ID3D12GraphicsCommandList> {
++    prepare_indexed_draw_with_instance(this, indices, instances, first_index, base_vertex, None)
++}
++
++unsafe fn prepare_indexed_draw_with_instance(
++    this: *mut c_void,
++    indices: u32,
++    instances: u32,
++    first_index: u32,
++    base_vertex: i32,
++    first_instance: Option<u32>,
+ ) -> Option<ID3D12GraphicsCommandList> {
+     DRAW_ARGS.with(|d| d.set((true, indices, instances, first_index, base_vertex)));
+-    graphics_bound(this)
++    graphics_bound(this, "draw-indexed", || format!(
++        "indices={indices} instances={instances} first_index={first_index} base_vertex={base_vertex} first_instance={first_instance:?}"
++    ))
+ }
+ 
+ /// Submit an indexed draw whose translated graphics state has already been prepared.
+@@ -354,11 +373,13 @@ pub(super) unsafe fn emit_prepared_indexed_draw(
+ /// Before a draw: with a translated pipeline its ABI root signature and the kept graphics
+ /// arguments are bound (None: the draw is skipped – a console pipeline without a
+ /// translation, or no unified memory).
+-unsafe fn graphics_bound(this: *mut c_void) -> Option<ID3D12GraphicsCommandList> {
++unsafe fn graphics_bound(this: *mut c_void, event: &'static str, details: impl FnOnce() -> String) -> Option<ID3D12GraphicsCommandList> {
+     let list = ID3D12GraphicsCommandList::from_raw_borrowed(&this)?.clone();
+     let pso = with(this, |s| s.pso);
+     // a pipeline still being built in the background is waited for (its stand-in draws nothing)
+-    if !super::real::is_translated_graphics(super::pso_async::resolve_wait(pso)) {
++    let resolved = super::pso_async::resolve_wait(pso);
++    super::real::trace_world_command(resolved, event, details);
++    if !super::real::is_translated_graphics(resolved) {
+         count(DRAWS_PC);
+         if super::present::trace_frame() {
+             // which pipelines draw without a translation (first 12 distinct)
+@@ -664,6 +685,7 @@ pub(super) unsafe extern "system" fn set_pipeline_state(this: *mut c_void, pso:
+ /// #14 Dispatch: with a translated pipeline, on XCL's ABI with the kept root arguments
+ pub(super) unsafe extern "system" fn dispatch(this: *mut c_void, x: u32, y: u32, z: u32) {
+     let pso = super::pso_async::resolve_wait(with(this, |s| s.pso));
++    super::real::trace_world_command(pso, "dispatch", || format!("groups=[{x},{y},{z}]"));
+     let Some(list) = ID3D12GraphicsCommandList::from_raw_borrowed(&this) else { return };
+     if !super::real::is_translated_compute(pso) {
+         // a console pipeline without a translation (including a background build that
+diff --git a/crates/xcl/src/hle/d3d12x/device_x.rs b/crates/xcl/src/hle/d3d12x/device_x.rs
+index b52e8b5..10af69c 100644
+--- a/crates/xcl/src/hle/d3d12x/device_x.rs
++++ b/crates/xcl/src/hle/d3d12x/device_x.rs
+@@ -992,6 +992,7 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
+     let n = u32::from_le_bytes(pc[4..8].try_into().unwrap()) as usize;
+     let args = u64::from_le_bytes(pc[8..16].try_into().unwrap()) as *const [u32; 4];
+     let mut list: Vec<[u32; 4]> = if args.is_null() || n > 64 { Vec::new() } else { (0..n).map(|i| args.add(i).read_unaligned()).collect() };
++    let console_types = real::world_draw_trace_enabled().then(|| list.iter().map(|a| a[0]).collect::<Vec<u32>>());
+     for a in list.iter_mut() {
+         if a[0] == XBOX_ARG_DISPATCH_X {
+             a[0] = D3D12_INDIRECT_ARGUMENT_TYPE_DISPATCH.0 as u32;
+@@ -1003,6 +1004,18 @@ pub(super) unsafe extern "system" fn create_command_signature_x(this: *mut c_voi
+     if hr >= 0 && !ppv.is_null() && needs_root {
+         super::bind::note_root_changing_signature(*ppv as usize);
+     }
++    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() && real::world_draw_trace_enabled() {
++        static SEEN: Mutex<Vec<usize>> = Mutex::new(Vec::new());
++        let sig = *ppv as usize;
++        let mut seen = SEEN.lock().unwrap();
++        if seen.len() < 16 && !seen.contains(&sig) {
++            seen.push(sig);
++            drop(seen);
++            let stride = u32::from_le_bytes(pc[..4].try_into().unwrap());
++            let types: Vec<u32> = list.iter().map(|a| a[0]).collect();
++            crate::xlog_info!("world draw trace: signature {sig:#x} stride={stride} console_argument_types={console_types:?} pc_argument_types={types:?} root_changing={needs_root}");
++        }
++    }
+     hr
+ }
+ 
+diff --git a/crates/xcl/src/hle/d3d12x/real.rs b/crates/xcl/src/hle/d3d12x/real.rs
+index c5b1960..97102e9 100644
+--- a/crates/xcl/src/hle/d3d12x/real.rs
++++ b/crates/xcl/src/hle/d3d12x/real.rs
+@@ -3704,6 +3704,91 @@ pub fn two_pass_count() -> usize {
+     TWO_PASS.lock().unwrap().as_ref().map_or(0, |m| m.len())
+ }
+ 
++pub(super) fn world_draw_trace_enabled() -> bool {
++    static ON: OnceLock<bool> = OnceLock::new();
++    *ON.get_or_init(|| std::env::var("XCL_WORLD_DRAW_TRACE").is_ok_and(|v| v == "1"))
++}
++
++fn trace_world_pso(pso: usize, event: &'static str, details: impl FnOnce() -> String) {
++    if !world_draw_trace_enabled() || pso == 0 {
++        return;
++    }
++    static SEEN: Mutex<Option<HashMap<usize, HashSet<&'static str>>>> = Mutex::new(None);
++    {
++        let mut g = SEEN.lock().unwrap();
++        let seen = g.get_or_insert_with(HashMap::new);
++        if !seen.contains_key(&pso) && seen.len() >= 16 {
++            return;
++        }
++        if !seen.entry(pso).or_default().insert(event) {
++            return;
++        }
++    }
++    crate::xlog_info!("world draw trace: {event} resolved PSO {pso:#x}: {}", details());
++}
++
++/// Metadata only, after the caller's existing resolve_wait; never resolve or wait here.
++pub(super) fn trace_world_command(pso: usize, event: &'static str, details: impl FnOnce() -> String) {
++    if !world_draw_trace_enabled() {
++        return;
++    }
++    let two_pass = TWO_PASS.lock().unwrap().as_ref().and_then(|m| m.get(&pso).cloned());
++    static CHECKS: AtomicU64 = AtomicU64::new(0);
++    static HITS: AtomicU64 = AtomicU64::new(0);
++    let hits = HITS.fetch_add(two_pass.is_some() as u64, Ordering::Relaxed) + two_pass.is_some() as u64;
++    let checks = CHECKS.fetch_add(1, Ordering::Relaxed) + 1;
++    if checks.is_power_of_two() || (two_pass.is_some() && hits.is_power_of_two()) {
++        crate::xlog_info!("world draw trace: command checks {checks}, two-pass hits {hits} (PSO detail cap 16)");
++    }
++    trace_world_pso(pso, event, || {
++        let class = if let Some(tp) = &two_pass {
++            format!("two-pass {} record_dwords={} mesh_groups_per_record={}", tp.kind, tp.record.record_dwords(), tp.mesh_groups_per_record)
++        } else if is_translated_graphics(pso) {
++            "translated graphics".into()
++        } else if is_translated_compute(pso) {
++            "translated compute".into()
++        } else {
++            "untranslated".into()
++        };
++        format!("{class}; {}", details())
++    });
++}
++
++fn trace_world_refused_stream(subs: &[(u32, &[u8])], base: usize, code: &[u8], sh: &crate::gpu::xbox::XboxShader) {
++    if !world_draw_trace_enabled() {
++        return;
++    }
++    let hash = crate::gpu::shader::fnv64(code);
++    static SEEN: Mutex<Vec<u64>> = Mutex::new(Vec::new());
++    {
++        let mut seen = SEEN.lock().unwrap();
++        if seen.len() >= 8 || seen.contains(&hash) {
++            return;
++        }
++        seen.push(hash);
++    }
++    let types: Vec<(u32, usize)> = subs.iter().take(64).map(|(ty, p)| {
++        let align = super::null::subobject_payload(*ty).map_or(4, |(_, a)| a);
++        (*ty, p.as_ptr() as usize - base - if align == 8 { 8 } else { 4 })
++    }).collect();
++    let slots: Vec<String> = [24u32, 25].into_iter().map(|ty| {
++        let found: Vec<String> = subs.iter().filter(|s| s.0 == ty).take(4).map(|(_, p)| {
++            let ptr = u64::from_le_bytes(p[..8].try_into().unwrap()) as usize;
++            let len = u64::from_le_bytes(p[8..16].try_into().unwrap()) as usize;
++            let status = if ptr == 0 { "null" } else if len == 0 { "empty" }
++                else if crate::gpu::shader::readable(ptr, len) { "readable" } else { "unreadable" };
++            format!("len={len} {status}")
++        }).collect();
++        format!("type{ty}={}", if found.is_empty() { "absent".into() } else { found.join(",") })
++    }).collect();
++    let variants: Vec<Vec<String>> = sh.fssm.iter().take(4).map(|f| f.stages.iter().take(4).map(|s| s.label()).collect()).collect();
++    let psv = crate::gpu::dxbc::psv(code).map(|p| (p.kind, p.numthreads, p.ms_topology, p.ms_max_vertices, p.ms_max_primitives));
++    crate::xlog_info!(
++        "world draw trace: refused MS {hash:016x}, embedded {} SM {}.{}, FSSM {variants:?}, PSV(kind,threads,topology,maxv,maxp)={psv:?}; stream types/offsets {types:?} ({} total); {}; E_INVALIDARG unchanged",
++        sh.stage, sh.shader_model.0, sh.shader_model.1, subs.len(), slots.join("; ")
++    );
++}
++
+ /// A pipeline state stream being written: subobjects aligned as D3D12 expects
+ /// (type, payload at 4 or 8, size rounded to 8).
+ #[derive(Default)]
+@@ -3833,9 +3918,12 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
+     // from then on (a black screen every run); refused, it goes on to its menus. What it
+     // expects of them is not known yet.
+     if let (None, Some(a)) = (ms_slot, as_slot) {
+-        if is_console(a) && crate::gpu::xbox::parse(a).is_some_and(|sh| sh.stage == "MS") {
+-            note_translation_error(format!("mesh pipeline with its MS {:016x} in the AS slot – refused", crate::gpu::shader::fnv64(a)));
+-            return Some(E_INVALIDARG);
++        if is_console(a) {
++            if let Some(sh) = crate::gpu::xbox::parse(a).filter(|sh| sh.stage == "MS") {
++                trace_world_refused_stream(&subs, base, a, &sh);
++                note_translation_error(format!("mesh pipeline with its MS {:016x} in the AS slot – refused", crate::gpu::shader::fnv64(a)));
++                return Some(E_INVALIDARG);
++            }
+         }
+     }
+     let ms = ms_slot?;
+@@ -3888,7 +3976,11 @@ unsafe fn translated_mesh_stream(this: *mut c_void, desc: *const c_void, riid: *
+             out.raw(*ty, payload, palign == 8);
+         }
+     }
+-    Some(finish_two_pass(this, &out, tp, rs, "MS", riid, ppv))
++    let hr = finish_two_pass(this, &out, tp, rs, "MS", riid, ppv);
++    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
++        trace_world_pso(*ppv as usize, "created-two-pass", || format!("MS source {:016x}", crate::gpu::shader::fnv64(ms)));
++    }
++    Some(hr)
+ }
+ 
+ /// A graphics PSO with a console VS + GS: the GS pipeline in two passes, as a mesh pipeline
+@@ -3959,7 +4051,11 @@ unsafe fn translated_gs_pso(this: *mut c_void, d: &D3D12_GRAPHICS_PIPELINE_STATE
+     if d.Flags.0 != 0 {
+         out.put(D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_FLAGS, &d.Flags);
+     }
+-    finish_two_pass(this, &out, tp, rs, "GS", riid, ppv)
++    let hr = finish_two_pass(this, &out, tp, rs, "GS", riid, ppv);
++    if hr >= 0 && !ppv.is_null() && !(*ppv).is_null() {
++        trace_world_pso(*ppv as usize, "created-two-pass", || format!("GS sources VS {:016x} GS {:016x}", crate::gpu::shader::fnv64(vs), crate::gpu::shader::fnv64(gs)));
++    }
++    hr
+ }
+ 
+ /// Rewrite a pipeline state stream with stand-in shaders. None if not possible.
+-- 
+2.54.0
+

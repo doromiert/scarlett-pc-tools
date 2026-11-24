@@ -1,5 +1,25 @@
 # Local verification, 2026-11-23
 
+## 2026-11-24: isolated fullscreen, still no gameplay
+
+The source-only XCL series now contains 33 patches, reproducing candidate
+`2e58f54f32a49961f4ba3f376277f4207a13e71d`, tree
+`e243c656bde257adff33a56cbb03757e925d216d`. The latest actual executable also
+included private, bounded CPU fault diagnostics; those game-specific probes are
+not published.
+
+Two actual Linux runs on a spare integrated AMD GPU rendered colored startup
+frames and loading artwork through headless CPU readback into a fullscreen
+viewer. The game could access only that GPU's render node. Both runs eventually
+self-exited with D3D12 device loss; GNOME remained running. Loading was very
+slow. The latter run exercised BC1 placeholders as well as BC5/BC7. The
+constant-buffer correction and exact DirectStorage reads did not resolve
+the GPU timeout. No playable scene or physical-controller control is verified.
+
+No game files, shaders, frames, root data, traces or binaries accompany this
+update. Simulation/render timing separation and gyro aiming remain unimplemented.
+Earlier entries below describe earlier candidates and their narrower evidence.
+
 These observations establish startup progress, not a working port. Private input
 files, traces, memory and code excerpts are not included.
 

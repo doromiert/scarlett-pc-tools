@@ -1,0 +1,109 @@
+From aefe654f2832f1bde37bcfdcf047c43e9ce0f6b8 Mon Sep 17 00:00:00 2001
+From: Logan <Logan@cattn.dev>
+Date: Mon, 23 Nov 2026 16:45:45 -0500
+Subject: [PATCH] Lazy physical pages: a thread that loses the race to commit a
+ page retries
+
+Two threads that first touch the same lazy page together both fault. The
+first commits the page and removes it from the lazy set; the second then
+finds it gone and returned EXCEPTION_CONTINUE_SEARCH, so its access ended
+the process as an unhandled access violation although the page was
+committed by then.
+
+The handler now lets the faulting instruction run again when the page is
+committed and its protection allows the access (read or write; not execute
+or guard pages). A test has 8 threads first-touch 256 lazy pages at the
+same moment: before, the test process ends with 0xc0000005 (3 of 3 runs);
+after, it passes (3 of 3).
+
+(cherry picked from commit 77905f6b50487c3af4e75b1807419280b2aba640)
+---
+ crates/xcl/src/hle/kernelx/lazy.rs | 54 ++++++++++++++++++++++++++++--
+ 1 file changed, 52 insertions(+), 2 deletions(-)
+
+diff --git a/crates/xcl/src/hle/kernelx/lazy.rs b/crates/xcl/src/hle/kernelx/lazy.rs
+index 3376735..fa750b9 100644
+--- a/crates/xcl/src/hle/kernelx/lazy.rs
++++ b/crates/xcl/src/hle/kernelx/lazy.rs
+@@ -16,7 +16,10 @@ use std::sync::{Once, RwLock};
+ 
+ use windows_sys::Win32::Foundation::{EXCEPTION_ACCESS_VIOLATION, NTSTATUS};
+ use windows_sys::Win32::System::Diagnostics::Debug::{AddVectoredExceptionHandler, EXCEPTION_POINTERS};
+-use windows_sys::Win32::System::Memory::{VirtualAlloc, MEM_COMMIT, PAGE_READWRITE};
++use windows_sys::Win32::System::Memory::{
++    VirtualAlloc, VirtualQuery, MEMORY_BASIC_INFORMATION, MEM_COMMIT, PAGE_EXECUTE_READ, PAGE_EXECUTE_READWRITE,
++    PAGE_EXECUTE_WRITECOPY, PAGE_GUARD, PAGE_READONLY, PAGE_READWRITE, PAGE_WRITECOPY,
++};
+ 
+ const PAGE: usize = 0x1_0000;
+ const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
+@@ -48,13 +51,27 @@ unsafe extern "system" fn handler(info: *mut EXCEPTION_POINTERS) -> i32 {
+     }
+     let page = r.ExceptionInformation[1] & !(PAGE - 1);
+     let lazy = LAZY.read().unwrap_or_else(|e| e.into_inner()).contains(&page);
+-    if lazy && commit(page) {
++    if lazy && commit(page) || allows(r.ExceptionInformation[0], r.ExceptionInformation[1]) {
+         EXCEPTION_CONTINUE_EXECUTION
+     } else {
+         EXCEPTION_CONTINUE_SEARCH
+     }
+ }
+ 
++unsafe fn allows(access: usize, at: usize) -> bool {
++    let mut m: MEMORY_BASIC_INFORMATION = std::mem::zeroed();
++    if VirtualQuery(at as *const c_void, &mut m, std::mem::size_of_val(&m)) == 0 || m.State != MEM_COMMIT || m.Protect & PAGE_GUARD != 0 {
++        return false;
++    }
++    let writes = PAGE_READWRITE | PAGE_WRITECOPY | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
++    let reads = writes | PAGE_READONLY | PAGE_EXECUTE_READ;
++    match access {
++        0 => m.Protect & reads != 0,
++        1 => m.Protect & writes != 0,
++        _ => false,
++    }
++}
++
+ /// `page` (reserved, 64 KiB aligned) is mapped: committed on first use.
+ pub(crate) fn mark(page: usize) {
+     install();
+@@ -106,4 +123,37 @@ mod tests {
+             VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
+         }
+     }
++
++    #[test]
++    fn threads_first_touching_one_lazy_page_together_all_go_on() {
++        const THREADS: usize = 8;
++        const PAGES: usize = 256;
++        unsafe {
++            let r = VirtualAlloc(std::ptr::null(), PAGES * PAGE, MEM_RESERVE, PAGE_READWRITE) as usize;
++            for i in 0..PAGES {
++                mark(r + i * PAGE);
++            }
++            let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
++            let handles: Vec<_> = (0..THREADS)
++                .map(|t| {
++                    let barrier = barrier.clone();
++                    std::thread::spawn(move || {
++                        for i in 0..PAGES {
++                            barrier.wait();
++                            std::ptr::write_volatile((r + i * PAGE + t * 64) as *mut u64, (i * THREADS + t) as u64);
++                        }
++                    })
++                })
++                .collect();
++            for h in handles {
++                h.join().unwrap();
++            }
++            for i in 0..PAGES {
++                for t in 0..THREADS {
++                    assert_eq!(std::ptr::read_volatile((r + i * PAGE + t * 64) as *const u64), (i * THREADS + t) as u64);
++                }
++            }
++            VirtualFree(r as *mut c_void, 0, MEM_RELEASE);
++        }
++    }
+ }
+-- 
+2.54.0
+

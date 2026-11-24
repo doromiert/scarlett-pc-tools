@@ -1,0 +1,46 @@
+From afb34847af7af7aaef309bc8703105a1342b280a Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Tue, 24 Nov 2026 01:28:27 +0100
+Subject: [PATCH] Allow observed BC1 texture placeholders in opt-in progression
+ mode
+
+---
+ crates/xcl/src/hle/dstorage.rs | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/crates/xcl/src/hle/dstorage.rs b/crates/xcl/src/hle/dstorage.rs
+index 0abe64c..4576aad 100644
+--- a/crates/xcl/src/hle/dstorage.rs
++++ b/crates/xcl/src/hle/dstorage.rs
+@@ -454,10 +454,10 @@ impl Request {
+ 
+     fn texture_placeholder(&self) -> bool {
+         static ENABLED: OnceLock<bool> = OnceLock::new();
+-        matches!(self.bcpack(), 5 | 7)
++        matches!(self.bcpack(), 1 | 5 | 7)
+             && self.swizzle() == 0
+             && self.destination_size != 0
+-            && self.destination_size % 16 == 0
++            && self.destination_size % if self.bcpack() == 1 { 8 } else { 16 } == 0
+             && (!self.zlib() || self.intermediate_size != 0)
+             && *ENABLED.get_or_init(|| std::env::var("XCL_TEXTURE_PLACEHOLDERS").as_deref() == Ok("1"))
+     }
+@@ -659,7 +659,14 @@ unsafe fn execute(r: &Request, file: Option<&FileInner>, dest_pages: Option<&[us
+         const MAGENTA_BC7: [u8; 16] = [0x20, 0xff, 0x3f, 0x00, 0xf0, 0xff, 0xff, 0xff, 0x03, 0, 0, 0, 0, 0, 0, 0];
+         // BC5 stores two independent BC4 channels: equal endpoints 128, all indices 0.
+         const NEUTRAL_BC5: [u8; 16] = [128, 128, 0, 0, 0, 0, 0, 0, 128, 128, 0, 0, 0, 0, 0, 0];
+-        let (kind, block) = if r.bcpack() == 5 { ("BC5Placeholder", &NEUTRAL_BC5) } else { ("BC7Placeholder", &MAGENTA_BC7) };
++        // BC1: RGB565 magenta endpoint, black endpoint, all indices select magenta.
++        // https://learn.microsoft.com/en-us/windows/win32/direct3d10/d3d10-graphics-programming-guide-resources-block-compression
++        const MAGENTA_BC1: [u8; 8] = [0x1f, 0xf8, 0, 0, 0, 0, 0, 0];
++        let (kind, block): (&str, &[u8]) = match r.bcpack() {
++            1 => ("BC1Placeholder", &MAGENTA_BC1),
++            5 => ("BC5Placeholder", &NEUTRAL_BC5),
++            _ => ("BC7Placeholder", &MAGENTA_BC7),
++        };
+         warn_once(kind, format_args!("XCL_TEXTURE_PLACEHOLDERS=1: substituting BC{} texture placeholders; original texture decoding remains unsupported", r.bcpack()));
+         block.repeat(n / block.len())
+     } else {
+-- 
+2.54.0
+

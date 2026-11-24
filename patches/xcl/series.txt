@@ -17,3 +17,17 @@
 0017-DirectStorage-a-destination-page-array-entry-that-is-0-at-enqueue-is-read-at-the-request-s-turn.patch
 0018-dstorage-add-opt-in-opaque-BC7-texture-placeholders.patch
 0019-Extend-opt-in-texture-placeholders-to-observed-BC5-loading-requests.patch
+0020-Add-opt-in-bounded-world-draw-contract-diagnostics.patch
+0021-Add-fail-closed-explicit-GPU-selection-for-isolated-rendering.patch
+0022-Add-opt-in-native-GPU-to-CPU-headless-frame-readback.patch
+0023-Title-textures-uploads-start-from-the-state-the-title-s-transitions-left-104-item-2.patch
+0024-Title-textures-small-render-targets-the-CPU-fills-are-kept-in-step-glyph-caches.patch
+0025-Video-memory-arenas-D32S8-and-MSAA-targets-get-heaps-of-their-own-size-let-go-when-unused.patch
+0026-D3D12.X-back-kept-in-step-title-textures-by-shared-VRAM-pages-248.patch
+0027-kernelx-GPU-visible-memory-outside-the-windows-is-write-watched-menu-text.patch
+0028-Memory-GPU-views-of-the-title-s-CPU-memory-read-the-CPU-view-intro-video.patch
+0029-Lazy-physical-pages-a-thread-that-loses-the-race-to-commit-a-page-retries.patch
+0030-D3D12.X-preserve-native-objects-across-shared-page-operations.patch
+0031-Allow-observed-BC1-texture-placeholders-in-opt-in-progression-mode.patch
+0032-D3D12.X-constant-buffer-views-are-float4-rows-stride-16-not-raw-buffers.patch
+0033-DirectStorage-EnqueueRequest-reads-its-page-array-and-file-vtable-without-sizing-regions.patch

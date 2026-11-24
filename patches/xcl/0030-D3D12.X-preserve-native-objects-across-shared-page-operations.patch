@@ -1,0 +1,48 @@
+From 81fc6ddbd7e590328213652464b503e467c68c25 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Tue, 24 Nov 2026 01:09:27 +0100
+Subject: [PATCH] D3D12.X: preserve native objects across shared-page
+ operations
+
+New shared-page unmapping queues bypass title dispatch. Unwrap resources and fences before their native calls, and keep GetResourceTiling on the native resource while tracking the title-facing identity. Existing release observers and proxy tables remain unchanged. Verified by source inspection and Windows release cross-build only; no game or GPU execution.
+---
+ crates/xcl/src/hle/d3d12x/vram.rs | 8 +++++---
+ 1 file changed, 5 insertions(+), 3 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/vram.rs b/crates/xcl/src/hle/d3d12x/vram.rs
+index ec692fd..b5b0749 100644
+--- a/crates/xcl/src/hle/d3d12x/vram.rs
++++ b/crates/xcl/src/hle/d3d12x/vram.rs
+@@ -316,8 +316,9 @@ impl Pages {
+         let coord = D3D12_TILED_RESOURCE_COORDINATE::default();
+         let region = D3D12_TILE_REGION_SIZE { NumTiles: total, UseBox: false.into(), ..Default::default() };
+         let flag = D3D12_TILE_RANGE_FLAG_NULL;
++        let native_res = super::native_proxy::resource_for_pc(res, "vram::Pages::unmap UpdateTileMappings");
+         self.queue.UpdateTileMappings(
+-            res,
++            &native_res,
+             1,
+             Some(&coord),
+             Some(&region),
+@@ -329,7 +330,7 @@ impl Pages {
+             D3D12_TILE_MAPPING_FLAG_NONE,
+         );
+         self.value += 1;
+-        let _ = self.queue.Signal(&self.fence, self.value);
++        let _ = self.queue.Signal(&super::native_proxy::fence_for_pc(&self.fence), self.value);
+     }
+ 
+     fn release_tiles(&mut self, used: Vec<usize>, used_extra: Vec<(usize, usize)>, now: std::time::Instant, immediate_cool: bool) {
+@@ -488,7 +489,8 @@ unsafe fn place_on_pages(
+     let raw = *ppv;
+     let res = ID3D12Resource::from_raw_borrowed(&raw)?;
+     let mut total = 0u32;
+-    dev.GetResourceTiling(res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
++    let native_res = super::native_proxy::resource_for_pc(res, "vram::place_on_pages GetResourceTiling");
++    dev.GetResourceTiling(&native_res, Some(&mut total), None, None, None, 0, std::ptr::null_mut());
+     let Some((used, used_extra)) = pages.bind(dev, res, va, console_bytes, total) else {
+         drop(g);
+         drop(windows::core::IUnknown::from_raw(raw));
+-- 
+2.54.0
+

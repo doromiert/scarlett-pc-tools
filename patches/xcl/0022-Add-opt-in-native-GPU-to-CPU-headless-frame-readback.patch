@@ -1,0 +1,246 @@
+From bd52ab7b5523690227c8481bf8f22d909da2c09b Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Tue, 24 Nov 2026 01:03:45 +0100
+Subject: [PATCH] Add opt-in native GPU to CPU headless frame readback
+
+---
+ crates/xcl/src/hle/d3d12x/present.rs | 130 ++++++++++++++++++++-------
+ 1 file changed, 99 insertions(+), 31 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/present.rs b/crates/xcl/src/hle/d3d12x/present.rs
+index 81a53f4..83de6fd 100644
+--- a/crates/xcl/src/hle/d3d12x/present.rs
++++ b/crates/xcl/src/hle/d3d12x/present.rs
+@@ -37,6 +37,10 @@ static RTVS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+ static LISTS: Mutex<Option<HashMap<usize, usize>>> = Mutex::new(None);
+ static CANDIDATE: Mutex<Option<(usize, usize)>> = Mutex::new(None); // (queue, resource) – resource AddRef'd
+ static PRESENTS: AtomicU64 = AtomicU64::new(0);
++/// Frames observed by the opt-in CPU-only capture path. This is deliberately separate from
++/// `PRESENTS`: no swap-chain image was shown in this mode.
++static HEADLESS_FRAMES: AtomicU64 = AtomicU64::new(0);
++static HEADLESS_CAPTURES: AtomicU64 = AtomicU64::new(0);
+ static BOUNDARIES: AtomicU64 = AtomicU64::new(0);
+ static LAST_BOUNDARY_MS: AtomicU64 = AtomicU64::new(0);
+ static HWND_RAW: AtomicIsize = AtomicIsize::new(0);
+@@ -143,6 +147,13 @@ fn enabled() -> bool {
+     !crate::state::config().present.eq_ignore_ascii_case("off")
+ }
+ 
++/// `XCL_HEADLESS=1`: keep the title's native rendering, but capture a due source image to CPU
++/// without constructing XCL's own HWND or DXGI swap chain.
++fn headless() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("XCL_HEADLESS").is_ok_and(|v| v == "1"))
++}
++
+ unsafe fn add_ref(p: usize) {
+     let f: unsafe extern "system" fn(usize) -> u32 = std::mem::transmute(*(*(p as *const *const usize)).add(1));
+     f(p);
+@@ -591,8 +602,15 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
+         return;
+     }
+     let Some(desc) = backbuffer_like(src.as_raw() as usize) else { return };
+-    let Some(fmt) = swap_format(desc.Format) else { return };
+-    let Some(hwnd) = ensure_window() else { return };
++    let headless = headless();
++    let fmt = if headless { None } else { swap_format(desc.Format) };
++    if !headless && fmt.is_none() {
++        return;
++    }
++    let hwnd = if headless { None } else { ensure_window() };
++    if !headless && hwnd.is_none() {
++        return;
++    }
+     if p.queue != queue {
+         return; // swap chain is bound to the first queue we presented from
+     }
+@@ -606,27 +624,43 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
+     }
+     p.copy_source = None;
+     p.dumps.clear();
+-    if !ensure_swapchain(p, hwnd, desc.Width as u32, desc.Height, fmt) {
++    if headless && !headless_frame_dump_due() {
+         return;
+     }
+-    let Some(sc) = p.sc.clone() else { return };
+-    let Ok(bb) = sc.GetBuffer::<ID3D12Resource>(sc.GetCurrentBackBufferIndex()) else { return };
++    let sc = if headless {
++        None
++    } else {
++        let Some(hwnd) = hwnd else { return };
++        let Some(fmt) = fmt else { return };
++        if !ensure_swapchain(p, hwnd, desc.Width as u32, desc.Height, fmt) {
++            return;
++        }
++        p.sc.clone()
++    };
++    let bb = if let Some(sc) = &sc {
++        let Ok(bb) = sc.GetBuffer::<ID3D12Resource>(sc.GetCurrentBackBufferIndex()) else { return };
++        Some(bb)
++    } else {
++        None
++    };
+     if p.alloc.Reset().is_err() || p.list.Reset(&p.alloc, None).is_err() {
+         return;
+     }
+-    let b1 = [transition(&bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
+-    p.list.ResourceBarrier(&b1);
+-    p.list.CopyResource(&bb, &src);
+-    let due = frame_dump_due();
++    if let Some(bb) = &bb {
++        let b1 = [transition(bb, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_DEST)];
++        p.list.ResourceBarrier(&b1);
++        p.list.CopyResource(bb, &src);
++    }
++    let due = if headless { true } else { frame_dump_due() };
+     let mut dumps = Vec::new();
+     if due {
+         if let Some((buffer, footprint)) = readback_copy(&p.list, &src, &desc) {
+-            dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: "frame".into() });
++            dumps.push(FrameDump { _source: src.clone(), buffer, footprint, format: desc.Format, tag: if headless { "headless_latest".into() } else { "frame".into() } });
+         }
+     }
+     // with `XCL_TRACE_FRAME`: also the render target the title binds most (its scene / UI)
+     // (and the targets the watched one's contents went on to: rt_<n>_<k>)
+-    if due && trace_frame() {
++    if !headless && due && trace_frame() {
+         let busiest = busiest_rt();
+         let followed = FOLLOWED.lock().unwrap();
+         let targets = busiest
+@@ -647,8 +681,10 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
+             dumps.push(FrameDump { _source: res, buffer, footprint, format, tag });
+         }
+     }
+-    let b2 = [transition(&bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
+-    p.list.ResourceBarrier(&b2);
++    if let Some(bb) = &bb {
++        let b2 = [transition(bb, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_PRESENT)];
++        p.list.ResourceBarrier(&b2);
++    }
+     if p.list.Close().is_err() {
+         return;
+     }
+@@ -666,18 +702,22 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
+         crate::xlog_error!("present: submit copy: {e}");
+         return;
+     }
+-    if let Err(e) = sc.Present(0, DXGI_PRESENT(0)).ok() {
+-        let e = fence::api_error(&p.dev, "Present", e);
+-        p.disabled = matches!(&e, FenceError::Removed(_));
+-        crate::xlog_error!("present: {e}");
+-        return;
++    if let Some(sc) = &sc {
++        if let Err(e) = sc.Present(0, DXGI_PRESENT(0)).ok() {
++            let e = fence::api_error(&p.dev, "Present", e);
++            p.disabled = matches!(&e, FenceError::Removed(_));
++            crate::xlog_error!("present: {e}");
++            return;
++        }
+     }
+     p.last = Instant::now();
+     if !p.dumps.is_empty() {
+         match fence::wait(&p.fence, p.value, &p.dev, Some(p.event), 2000) {
+             Ok(()) => {
+                 for dump in p.dumps.drain(..) {
+-                    write_frame(&dump.buffer, &dump.footprint, dump.format, &dump.tag);
++                    if write_frame(&dump.buffer, &dump.footprint, dump.format, &dump.tag, headless) && headless {
++                        HEADLESS_CAPTURES.fetch_add(1, Ordering::Relaxed);
++                    }
+                 }
+             }
+             Err(e) => {
+@@ -689,9 +729,11 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
+             }
+         }
+     }
+-    let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
+-    if n == 0 {
+-        crate::xlog_info!("present: first game frame shown ({}x{})", desc.Width, desc.Height);
++    if !headless {
++        let n = PRESENTS.fetch_add(1, Ordering::Relaxed);
++        if n == 0 {
++            crate::xlog_info!("present: first game frame shown ({}x{})", desc.Width, desc.Height);
++        }
+     }
+ }
+ 
+@@ -699,12 +741,24 @@ unsafe fn present_now(min_interval: Duration, frame: Option<(usize, usize)>) {
+ /// n > 1: every n-th; a title loading at a few frames a second shows few)
+ /// (`frame_<n>.bmp`, a quarter of each side; `XCL_FRAME_DUMP_FULL=1`: full size) – what the title presented, before the window.
+ fn frame_dump_due() -> bool {
++    let every = frame_dump_every();
++    every > 0 && PRESENTS.load(Ordering::Relaxed) % every == 20.min(every - 1)
++}
++
++/// Headless capture has no visible present to advance `PRESENTS`; keep cadence independent.
++fn headless_frame_dump_due() -> bool {
++    let every = frame_dump_every();
++    let n = HEADLESS_FRAMES.fetch_add(1, Ordering::Relaxed);
++    every > 0 && n % every == 20.min(every - 1)
++}
++
++fn frame_dump_every() -> u64 {
+     static EVERY: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+-    let every = *EVERY.get_or_init(|| match std::env::var("XCL_FRAME_DUMP") {
++    *EVERY.get_or_init(|| match std::env::var("XCL_FRAME_DUMP") {
++        Ok(v) if headless() => v.parse().ok().filter(|&n| n > 0).unwrap_or(120),
+         Ok(v) => v.parse().ok().filter(|&n| n > 1).unwrap_or(120),
+         Err(_) => 0,
+-    });
+-    every > 0 && PRESENTS.load(Ordering::Relaxed) % every == 20.min(every - 1)
++    })
+ }
+ 
+ /// Frames shown so far.
+@@ -824,10 +878,14 @@ fn small_float(v: u32, mantissa_bits: u32) -> f32 {
+     }
+ }
+ 
+-unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT, format: DXGI_FORMAT, tag: &str) {
++unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRINT, format: DXGI_FORMAT, tag: &str, headless: bool) -> bool {
++    if headless && rgb(format, 0).is_none() {
++        crate::xlog_error!("headless capture: {tag} format {} is not decoded; no BMP written", format.0);
++        return false;
++    }
+     let mut p: *mut c_void = std::ptr::null_mut();
+     if rb.Map(0, None, Some(&mut p)).is_err() || p.is_null() {
+-        return;
++        return false;
+     }
+     let (w, h, pitch) = (fp.Footprint.Width as usize, fp.Footprint.Height as usize, fp.Footprint.RowPitch as usize);
+     // every 4th texel of every 4th row; `XCL_FRAME_DUMP_FULL=1`: every texel (1-pixel detail)
+@@ -864,10 +922,19 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
+         bmp.resize(start + row, 0);
+     }
+     rb.Unmap(0, None);
+-    let n = PRESENTS.load(Ordering::Relaxed);
+-    let Some(boot) = crate::state::boot() else { return };
+-    let path = boot.logs_dir().join(format!("{tag}_{n}.bmp"));
+-    let _ = std::fs::write(&path, &bmp);
++    let Some(boot) = crate::state::boot() else { return false };
++    let n = if headless { HEADLESS_FRAMES.load(Ordering::Relaxed) } else { PRESENTS.load(Ordering::Relaxed) };
++    let path = if headless { boot.logs_dir().join("headless_latest.bmp") } else { boot.logs_dir().join(format!("{tag}_{n}.bmp")) };
++    let written = if headless {
++        let tmp = boot.logs_dir().join(format!(".headless_latest_{}.tmp", std::process::id()));
++        std::fs::write(&tmp, &bmp).and_then(|()| std::fs::rename(&tmp, &path)).is_ok()
++    } else {
++        std::fs::write(&path, &bmp).is_ok()
++    };
++    if !written {
++        crate::xlog_error!("present: {tag} {n} could not write {}", path.display());
++        return false;
++    }
+     crate::xlog_info!(
+         "present: {tag} {n} ({w}x{h}, format {}) written to {} – {lit} of {} samples not black{}",
+         format.0,
+@@ -878,6 +945,7 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
+     let mut top: Vec<(u32, usize)> = raw.into_iter().collect();
+     top.sort_by_key(|x| std::cmp::Reverse(x.1));
+     crate::xlog_info!("present: {tag} {n} raw texels (most common): {}", top.iter().take(6).map(|(v, c)| format!("{v:#010x}×{c}")).collect::<Vec<_>>().join(" "));
++    true
+ }
+ 
+ impl Drop for Presenter {
+-- 
+2.54.0
+

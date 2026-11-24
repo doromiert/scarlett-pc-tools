@@ -1,14 +1,15 @@
-# XCL setup bring-up on Linux
+# XCL bring-up on Linux
 
-This experimental source recipe reached the setup/account-picker UI and then
-self-crashed on a guest bounded-stream assertion. Continuing with A reached
-loading failures and a shared GPU reset that interrupted the desktop session.
+This experimental source recipe reached setup, colored startup frames and loading
+artwork. Rendering still ends in GPU timeout/device loss before verified gameplay.
+Earlier attempts on the desktop GPU interrupted GNOME; later attempts isolated
+the game on a spare integrated GPU and kept GNOME running.
 This recipe is not stable or playable.
 See [STATUS.md](STATUS.md) for the actual-run evidence and remaining blocker.
 
 ## Source and license
 
-The [19 XCL patches](patches/xcl/README.md) form an independent GPL-2.0-only
+The [33 XCL patches](patches/xcl/README.md) form an independent GPL-2.0-only
 component, separate from the GPL-3.0-or-later original tools and Leonida series.
 Keep XCL's license and third-party notices with derived source/builds.
 
@@ -23,7 +24,7 @@ done < patches/xcl/series.txt
 git -C /external/tools/xcl rev-parse 'HEAD^{tree}'
 ```
 
-The resulting candidate tree must be `7a0240d69b9929ee86448b3e86baf6bf21984913`.
+The resulting candidate tree must be `e243c656bde257adff33a56cbb03757e925d216d`.
 The setup baseline is the first 14 patches; current candidate verification is
 described in the patch-directory README.
 These are native-object identity/ABI fixes, not executable patches. The allocator
@@ -92,26 +93,39 @@ No Xbox firmware was used. The guest overflow is unresolved; this recipe contain
 no capacity increase, assertion bypass, frame-rate unlock, or gyro implementation.
 Keep dumps, overlay data, shader caches, captures and logs private.
 
-## Presentation limitation discovered during continuation
+## Isolated fullscreen continuation
 
-The tested Wine 11 DWM cloaking call is a no-op, so XCL's separate title popup
-is not hidden by that API. Its visible presenter already runs windowed; shrinking
-that window does not change internal 4K rendering. A private Wine virtual desktop
-can contain both windows, but it still shares the GPU. That configuration is
-prepared locally and has not yet been run or verified to prevent the reset.
-Do not interpret it as a proven stability fix. See the latest STATUS entry.
+Shrinking a window does not change the title's internal 4K rendering. The later
+actual runs used `XCL_HEADLESS=1` and `XCL_FRAME_DUMP=1`: native rendering and
+GPU-to-CPU readback continue, while XCL's HWND/swapchain/presentation are bypassed.
+The atomic `logs/headless_latest.bmp` contains actual rendered source pixels;
+unsupported formats produce no image. A separate fullscreen viewer displayed
+these CPU images, with no game GPU resources shared with GNOME. It was very slow.
+
+A private authenticated CPU-only Xvfb display and a device mount namespace
+exposed only the spare GPU's render node. `XCL_ADAPTER_STRICT=1` with
+`XCL_ADAPTER=RAPHAEL_MENDOCINO` required the matching native adapter; DXVK and
+VKD3D filters agreed. The measured adapter was AMD device 1002:164e, Mesa/RADV
+26.1.8. Use the actual name/node of your own spare GPU, not this machine's values.
+An adapter-name filter alone does not hide the desktop GPU. A Wine virtual
+desktop alone also still shares GPU access.
+
+The game still timed out on the spare GPU. GNOME survived both isolated runs;
+this does not establish general isolation from all host failures. The current
+headless path synchronously waits for readback and writes a BMP every captured
+frame. Asynchronous capture and physical-controller control remain unverified.
 
 ## Temporary texture placeholders
 
-`XCL_TEXTURE_PLACEHOLDERS=1` opts into valid constant BC7 and BC5 blocks for
+`XCL_TEXTURE_PLACEHOLDERS=1` opts into valid constant BC1, BC5 and BC7 blocks for
 unsupported compressed texture requests. It is default-off, explicitly trades
 texture accuracy for loading progress, and does not affect other archive data.
-BC7 uses opaque magenta; BC5 uses two channels with byte value 128. The original
+BC1 and BC7 use opaque magenta; BC5 uses two channels with byte value 128. The original
 file read, size checks, physical-page writes and failure/status reporting remain.
 Hardware swizzle and other BCPack modes are still refused.
 
 This was requested for reaching first gameplay with temporary texture artifacts.
-The actual BC7-enabled run registered A, advanced through more loading and then
-suffered a game-context GPU timeout. BC5 support has compiled but has not been
-run. Neither this switch nor the private desktop proves GPU stability or gameplay.
+Actual runs exercised BC1, BC5 and BC7 placeholders, advanced through more loading
+and then suffered game-context GPU timeouts. Neither this switch nor fullscreen
+CPU output proves GPU stability or gameplay.
 No assertion, executable instruction, simulation timing, or gyro change is included.

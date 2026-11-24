@@ -1,0 +1,62 @@
+From 0a9dd8025f4998c86223e701894150034aab1824 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Tue, 24 Nov 2026 01:03:45 +0100
+Subject: [PATCH] Add fail-closed explicit GPU selection for isolated rendering
+
+---
+ crates/xcl/src/hle/d3d12x/real.rs | 25 ++++++++++++++++++++++++-
+ 1 file changed, 24 insertions(+), 1 deletion(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/real.rs b/crates/xcl/src/hle/d3d12x/real.rs
+index 97102e9..811b591 100644
+--- a/crates/xcl/src/hle/d3d12x/real.rs
++++ b/crates/xcl/src/hle/d3d12x/real.rs
+@@ -409,14 +409,34 @@ pub fn init() -> Result<String, String> {
+         let mut device: Option<ID3D12Device> = None;
+         let mut name = String::new();
+         let sel = crate::gpu::adapter::Selector::from_env_or(&cfg.d3d12_adapter);
++        let strict = std::env::var("XCL_ADAPTER_STRICT").as_deref() == Ok("1");
++        if strict && sel == crate::gpu::adapter::Selector::Auto {
++            return Err("XCL_ADAPTER_STRICT=1 requires an explicit adapter selector".into());
++        }
+         if sel != crate::gpu::adapter::Selector::Warp {
+-            let mut list = crate::gpu::adapter::candidates(&factory, &sel);
++            let mut list = if strict {
++                crate::gpu::adapter::hardware(&factory).into_iter().enumerate()
++                    .filter(|(i, (_, desc))| sel.allows(*i, &crate::gpu::adapter::name(desc)))
++                    .map(|(_, adapter)| adapter).collect::<Vec<_>>()
++            } else {
++                crate::gpu::adapter::candidates(&factory, &sel)
++            };
+             if list.is_empty() {
++                if strict {
++                    return Err(crate::gpu::adapter::no_match(&factory, &sel));
++                }
+                 crate::xlog_warn!("D3D12: {} – using auto", crate::gpu::adapter::no_match(&factory, &sel));
+                 list = crate::gpu::adapter::candidates(&factory, &crate::gpu::adapter::Selector::Auto);
+             }
+             for (adapter, desc) in list {
+                 if let Ok(dev) = crate::gpu::agility::create_device(&adapter, D3D_FEATURE_LEVEL_12_0) {
++                    if strict {
++                        let actual = dev.GetAdapterLuid();
++                        if actual.LowPart != desc.AdapterLuid.LowPart || actual.HighPart != desc.AdapterLuid.HighPart {
++                            return Err("D3D12: native device did not match the strictly selected adapter LUID".into());
++                        }
++                        crate::xlog_info!("D3D12: strict adapter vendor={:#06x} device={:#06x}", desc.VendorId, desc.DeviceId);
++                    }
+                     device = Some(dev);
+                     name = format!("{} ({} MiB VRAM)", crate::gpu::adapter::name(&desc), desc.DedicatedVideoMemory >> 20);
+                     break;
+@@ -426,6 +446,9 @@ pub fn init() -> Result<String, String> {
+         let device = match device {
+             Some(d) => d,
+             None => {
++                if strict && sel != crate::gpu::adapter::Selector::Warp {
++                    return Err(format!("D3D12: selected adapter {sel} could not create a device; strict selection forbids fallback"));
++                }
+                 let warp: IDXGIAdapter = factory.EnumWarpAdapter().map_err(|e| format!("WARP: {e}"))?;
+                 let d = crate::gpu::agility::create_device(&warp, D3D_FEATURE_LEVEL_11_0)
+                     .map_err(|e| format!("D3D12 device (WARP): {e}"))?;
+-- 
+2.54.0
+
