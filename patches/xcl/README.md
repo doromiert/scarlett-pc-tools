@@ -8,10 +8,10 @@ combined into the Leonida implementation. See [LICENSE](LICENSE) and upstream
 attribution/third-party notices. Mail patches preserve commit authorship.
 
 Base: `eaa36b62768fe1eedb87d010a19148854c9a3952`.
-Current build candidate: `abbae09c88b7606071cd34610b9990e3c4838f0c`.
-Expected resulting Git tree: `b6c1bfeba82a07f06ff5e09868a3b32bb7c0de3d`.
+Current build candidate: `7024587dfb6367c2c8fdb3a6192da8bfa3d9106f`.
+Expected resulting Git tree: `7d436fa6696ab96b6cc6b7a91a80ed08caf1491b`.
 
-Apply all 42 patches in `series.txt` order. The applied series reproduced that
+Apply all 46 patches in `series.txt` order. The applied series reproduced that
 exact tree in a private worktree. The first 14 reproduce the earlier setup-tested
 source `0cb3173bbc47e3aa05cb288cb462005a0f16fff9` (tree
 `347aecd3e4b04a8d3b7b1c55ea6bce0a39cce78d`).
@@ -55,5 +55,20 @@ later passed the command-signature assertion after the identity correction.
 Patch 42 adds the opt-in observed eight-argument XG CopyFromSubresource layout.
 Actual execution passed the command-signature assertion and, with this setting,
 completed two texture copies before a later DXIL-to-SPIR-V compiler assertion.
-The current 42-patch tree builds and matches the expected tree above. No playable
+The current 46-patch tree builds and matches the expected tree above. No playable
 scene is verified; actual runs include additional private diagnostics.
+
+Patches 43–44 add caller-selected private shader capture and a caller-selected
+DXC `-O0` workaround. Optimized and unoptimized DXIL use separate disk namespaces;
+the translated fast caches are bypassed only for selected programs.
+The actual captured failing shader passed CPU-only SPIR-V validation at `-O0`;
+actual title validation passed the first offending shader and reached a later
+shader compiler assertion. A second captured shader passes CPU-only validation
+at `-O0`; a run selecting both is in progress. All 46 patches apply strictly from the pinned
+base and reproduce the tree above; a separate release build passed. The clean
+public binary has not run. No game-derived shader hashes or data are included.
+
+Patch 45 limits the translated-cache bypass to the selected shaders. Patch 46
+preserves upstream authorship for the swizzle-table period correction, merged
+upstream after a live loading profile identified table construction as a major
+CPU cost. Its runtime performance effect remains unmeasured.

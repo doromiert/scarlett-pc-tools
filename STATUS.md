@@ -1,5 +1,46 @@
 # Local verification, 2026-11-24
 
+## 2026-11-24: first compiler failure passed; a second isolated
+
+The 46-patch candidate is `7024587dfb6367c2c8fdb3a6192da8bfa3d9106f`,
+tree `7d436fa6696ab96b6cc6b7a91a80ed08caf1491b`. Strict application and a
+separate release build are recorded with this candidate. The clean public
+executable has not run.
+
+The actual title created the first previously failing compute pipeline with
+selected DXC `-O0` output. Its dumped DXIL exactly matched the CPU-tested form,
+and the native backend produced SPIR-V. Loading then self-exited at a different
+structurizer assertion. The second shader was matched to its archive entry
+using its HLSL cache key, without another game launch. Default DXC output was
+byte-identical to the new failure; `-O0` passed CPU-only SPIR-V validation.
+The next actual run selects both shaders. No controllable gameplay is verified.
+
+Patch 45 preserves normal translation caching for nonselected shaders. Patch 46
+includes upstream's swizzle-table period correction. The preceding real loading
+CPU profile spent substantial time constructing those tables; a speedup has
+not yet been measured. The native Vulkan backend remains unchanged, with
+assertions enabled.
+
+## 2026-11-24: selective shader compiler workaround
+
+The 44-patch candidate is `3f93d2fab9a7e1a656fee22b143c77af772a1eee`,
+tree `35b9abe456a8586f622efcb5180bf918c610bc4c`. All patches applied
+strictly from the pinned base and a separate release build passed. The clean
+public executable has not run.
+
+The next actual run reproduced the same DXIL-to-SPIR-V control-flow assertion
+and captured only the offending console compute program privately. Recompiling
+its generated HLSL at DXC `-O1` reproduced the exact failing runtime bytes and
+assertion in the pinned CPU-only compiler. `-O0` produced validated SPIR-V in
+about 1.2 seconds. Forcing XCL's fallback control flow changed nothing: that
+shader already used it.
+
+Patch 44 applies `-O0` only to caller-selected console shader hashes, with a
+separate cache namespace and no translated-cache reuse. An actual title run
+with that selector is underway; loading success and gameplay are not verified.
+A separate experimental structurizer bookkeeping patch failed validation and
+is excluded from the runtime and this repository.
+
 ## 2026-11-24: native indirect assertion passed; XG copy ABI corrected
 
 The current 42-patch candidate is `abbae09c88b7606071cd34610b9990e3c4838f0c`,

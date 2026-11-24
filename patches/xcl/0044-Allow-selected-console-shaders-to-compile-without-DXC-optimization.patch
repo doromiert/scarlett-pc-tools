@@ -1,0 +1,62 @@
+From bf787ab51ab119de55e39ef736747f5e021d2f5c Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Tue, 24 Nov 2026 04:00:04 +0100
+Subject: [PATCH] Allow selected console shaders to compile without DXC
+ optimization
+
+---
+ crates/xcl/src/gpu/recomp/dxc.rs |  5 +++++
+ crates/xcl/src/gpu/recomp/pso.rs | 14 ++++++++++++--
+ 2 files changed, 17 insertions(+), 2 deletions(-)
+
+diff --git a/crates/xcl/src/gpu/recomp/dxc.rs b/crates/xcl/src/gpu/recomp/dxc.rs
+index 0840dce..a70dd1e 100644
+--- a/crates/xcl/src/gpu/recomp/dxc.rs
++++ b/crates/xcl/src/gpu/recomp/dxc.rs
+@@ -376,6 +376,11 @@ pub fn compile_cached_in(dir: &Path, src: &str, entry: &str, profile: &str) -> R
+     compile_cached_in_with(dir, src, entry, profile, || compile(src, entry, profile, &[]))
+ }
+ 
++/// Selected compiler workarounds use a separate namespace, preserving the optimized cache.
++pub fn compile_cached_unoptimized(src: &str, entry: &str, profile: &str) -> Result<(Vec<u8>, bool), String> {
++    compile_cached_in_with(&cache_dir().join("O0"), src, entry, profile, || compile(src, entry, profile, &["-O0"]))
++}
++
+ type CacheFlight = (PathBuf, u64);
+ 
+ fn cache_flight(key: CacheFlight) -> Arc<Mutex<()>> {
+diff --git a/crates/xcl/src/gpu/recomp/pso.rs b/crates/xcl/src/gpu/recomp/pso.rs
+index b0c31a5..541fb93 100644
+--- a/crates/xcl/src/gpu/recomp/pso.rs
++++ b/crates/xcl/src/gpu/recomp/pso.rs
+@@ -260,7 +260,17 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
+     }) {
+         t.hlsl = t.hlsl.replacen("    if (!xcl_live) discard;\n    return xo;\n}", &format!("    xo.t0 = {expr};\n    return xo;\n}}"), 1);
+     }
+-    let dxil = dxc::compile_cached(&t.hlsl, "main", profile)?.0;
++    // Caller-selected console hashes only: some optimized CFGs fail the Vulkan structurizer.
++    let unoptimized = std::env::var("XCL_DXC_O0_HASHES").is_ok_and(|v| {
++        v.split(',').filter_map(|h| u64::from_str_radix(h.trim().trim_start_matches("0x"), 16).ok())
++            .any(|h| h == crate::gpu::shader::fnv64(blob))
++    });
++    let dxil = if unoptimized {
++        crate::xlog_info!("[SHADER] selected DXC -O0 workaround ({stage:?})");
++        dxc::compile_cached_unoptimized(&t.hlsl, "main", profile)?.0
++    } else {
++        dxc::compile_cached(&t.hlsl, "main", profile)?.0
++    };
+     Ok(Compiled { dxil, samplers: t.static_samplers })
+ }
+ 
+@@ -417,7 +427,7 @@ fn cached_shader(
+ }
+ 
+ fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
+-    !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY"]
++    !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_DXC_O0_HASHES"]
+         .iter()
+         .any(|name| present(name))
+         && (stage != Stage::Pixel
+-- 
+2.54.0
+

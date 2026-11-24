@@ -40,3 +40,7 @@
 0040-Distinguish-empty-title-heap-bindings-from-unknown-s.patch
 0041-Retain-native-command-signature-identity-for-indirec.patch
 0042-Add-opt-in-observed-XG-copy-argument-layout.patch
+0043-Allow-bounded-shader-capture-by-caller-supplied-hashes.patch
+0044-Allow-selected-console-shaders-to-compile-without-DXC-optimization.patch
+0045-Keep-fast-translation-caches-for-shaders-outside-the-DXC-workaround.patch
+0046-Textures-high-coordinate-tables-hold-one-period.patch

@@ -1,0 +1,39 @@
+From 54bfa272be4a2054b9363e97357e8d1ee898817f Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Tue, 24 Nov 2026 03:51:47 +0100
+Subject: [PATCH] Allow bounded shader capture by caller-supplied hashes
+
+---
+ crates/xcl/src/gpu/shader.rs | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/crates/xcl/src/gpu/shader.rs b/crates/xcl/src/gpu/shader.rs
+index ab0b43a..81b2c0a 100644
+--- a/crates/xcl/src/gpu/shader.rs
++++ b/crates/xcl/src/gpu/shader.rs
+@@ -255,7 +255,7 @@ pub fn capture(stage: &str, ptr: usize, len: usize) {
+         *st.stats.unknown_parts.entry(p.fourcc.clone()).or_default() += 1;
+     }
+     drop(g);
+-    if !dumps_enabled() {
++    if !dumps_enabled(h) {
+         let names: Vec<&str> = parts.iter().map(|p| p.fourcc.as_str()).collect();
+         crate::xlog_info!("[SHADER] {stage} {h:016x}: {} B, format {}, parts [{}]", blob.len(), kind.label(), names.join(","));
+         if kind == Kind::XboxNative {
+@@ -285,9 +285,12 @@ pub fn capture(stage: &str, ptr: usize, len: usize) {
+ /// more for that: the report's `recomp_*` counts come from it). Off by default: a retail game's
+ /// ~17 000 dumps took 4.8 GB, and translating each again took its loading threads ~0.1 s a
+ /// program at every start.
+-fn dumps_enabled() -> bool {
++fn dumps_enabled(hash: u64) -> bool {
+     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    static SELECTED: std::sync::OnceLock<Vec<u64>> = std::sync::OnceLock::new();
+     *ON.get_or_init(|| std::env::var("XCL_DUMP_SHADERS").is_ok_and(|v| v == "1"))
++        || SELECTED.get_or_init(|| std::env::var("XCL_DUMP_SHADER_HASHES").unwrap_or_default()
++            .split(',').filter_map(|s| u64::from_str_radix(s.trim().trim_start_matches("0x"), 16).ok()).collect()).contains(&hash)
+ }
+ 
+ /// Console container without dumps: its FSSM variants and instructions accounted.
+-- 
+2.54.0
+

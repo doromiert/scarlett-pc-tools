@@ -1,15 +1,16 @@
 # XCL bring-up on Linux
 
-This experimental source recipe reached setup, colored startup frames and loading
-artwork. Rendering still ends in GPU timeout/device loss before verified gameplay.
-Earlier attempts on the desktop GPU interrupted GNOME; later attempts isolated
-the game on a spare integrated GPU and kept GNOME running.
-This recipe is not stable or playable.
+This experimental source recipe reached input-responsive setup, colored startup
+frames and loading artwork. Heap-input and native-interface fixes passed earlier
+GPU and CPU failures; the latest reproduced stop is a shader compiler assertion
+during later loading. A selective compiler workaround is under actual-run
+validation. Earlier GPU resets interrupted GNOME. This recipe is not stable or
+playable.
 See [STATUS.md](STATUS.md) for the actual-run evidence and remaining blocker.
 
 ## Source and license
 
-The [42 XCL patches](patches/xcl/README.md) form an independent GPL-2.0-only
+The [46 XCL patches](patches/xcl/README.md) form an independent GPL-2.0-only
 component, separate from the GPL-3.0-or-later original tools and Leonida series.
 Keep XCL's license and third-party notices with derived source/builds.
 
@@ -24,7 +25,7 @@ done < patches/xcl/series.txt
 git -C /external/tools/xcl rev-parse 'HEAD^{tree}'
 ```
 
-The resulting candidate tree must be `b6c1bfeba82a07f06ff5e09868a3b32bb7c0de3d`.
+The resulting candidate tree must be `7d436fa6696ab96b6cc6b7a91a80ed08caf1491b`.
 The setup baseline is the first 14 patches; current candidate verification is
 described in the patch-directory README.
 These are native-object identity/ABI fixes, not executable patches. The allocator
@@ -186,3 +187,32 @@ Actual runs exercised BC1, BC5 and BC7 placeholders, advanced through more loadi
 and then suffered game-context GPU timeouts. Neither this switch nor fullscreen
 CPU output proves GPU stability or gameplay.
 No assertion, executable instruction, simulation timing, or gyro change is included.
+
+## Selective compiler diagnosis
+
+Patch 43 supports `XCL_DUMP_SHADER_HASHES=<comma-separated console hashes>` for
+bounded private capture; leave it unset normally. Captures include copyrighted
+shader programs and must stay outside this repository.
+
+Patch 44 supports `XCL_DXC_O0_HASHES=<comma-separated console hashes>`. Only those
+console programs use DXC `-O0`. Their DXIL cache lives in a separate `O0`
+namespace. The translated fast caches are bypassed for selected programs,
+so changing the selector cannot silently reuse an optimized translation.
+Normal shader optimization remains the default. Larger unoptimized programs
+can compile slowly or use more memory; this is a diagnostic workaround.
+
+One actual captured compute program reproduced the DXIL-to-SPIR-V assertion at
+DXC `-O1`, with output byte-identical to the failing runtime shader. Its `-O0`
+form compiled with SPIR-V validation enabled using the same pinned compiler
+source. Actual execution passed that shader and stopped at a different structurizer
+assertion. A second actual shader reproduced its default compiler failure and
+passed CPU-only SPIR-V validation at `-O0`; the next actual run selects both.
+No shader hashes, shader payloads,
+SPIR-V, cache files or captured frames are provided.
+
+Patch 45 retains the normal translation fast caches for programs outside the
+selector. Patch 46 includes upstream [a94e151](https://github.com/ivall/xcl/commit/a94e1511e0a5f378ff10e4daf701ebaa9da506eb):
+high-coordinate swizzle tables retain only their mathematical period, reducing
+construction work and memory while preserving modulo-indexed offsets. A live
+loading CPU profile identified table construction as a substantial cost; its
+actual performance improvement is not measured yet.

@@ -1,0 +1,56 @@
+From d684fce7ef3e16a8091ecdddf9a39287e02912a4 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Tue, 24 Nov 2026 04:09:04 +0100
+Subject: [PATCH] Keep fast translation caches for shaders outside the DXC
+ workaround
+
+---
+ crates/xcl/src/gpu/recomp/pso.rs | 17 ++++++++++-------
+ 1 file changed, 10 insertions(+), 7 deletions(-)
+
+diff --git a/crates/xcl/src/gpu/recomp/pso.rs b/crates/xcl/src/gpu/recomp/pso.rs
+index 541fb93..1f70f41 100644
+--- a/crates/xcl/src/gpu/recomp/pso.rs
++++ b/crates/xcl/src/gpu/recomp/pso.rs
+@@ -107,7 +107,7 @@ pub fn console_to_dxil_for(blob: &[u8], stage: Stage, sampler_base: u32, split_w
+ /// fills the caches without a title: the same keys as at its run).
+ pub fn console_to_dxil_in(blob: &[u8], stage: Stage, sampler_base: u32, split_wave64: bool, windows: u32) -> Result<Compiled, String> {
+     let compile_one = || compile_console_shader(blob, stage, sampler_base, windows, split_wave64);
+-    if !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
++    if unoptimized_shader(blob) || !cache_allowed(stage, |name| std::env::var_os(name).is_some()) {
+         return compile_one();
+     }
+     static CACHE: OnceLock<Mutex<ShaderCache>> = OnceLock::new();
+@@ -261,11 +261,7 @@ fn compile_console_shader(blob: &[u8], stage: Stage, sampler_base: u32, windows:
+         t.hlsl = t.hlsl.replacen("    if (!xcl_live) discard;\n    return xo;\n}", &format!("    xo.t0 = {expr};\n    return xo;\n}}"), 1);
+     }
+     // Caller-selected console hashes only: some optimized CFGs fail the Vulkan structurizer.
+-    let unoptimized = std::env::var("XCL_DXC_O0_HASHES").is_ok_and(|v| {
+-        v.split(',').filter_map(|h| u64::from_str_radix(h.trim().trim_start_matches("0x"), 16).ok())
+-            .any(|h| h == crate::gpu::shader::fnv64(blob))
+-    });
+-    let dxil = if unoptimized {
++    let dxil = if unoptimized_shader(blob) {
+         crate::xlog_info!("[SHADER] selected DXC -O0 workaround ({stage:?})");
+         dxc::compile_cached_unoptimized(&t.hlsl, "main", profile)?.0
+     } else {
+@@ -426,8 +422,15 @@ fn cached_shader(
+     Ok(shader)
+ }
+ 
++fn unoptimized_shader(blob: &[u8]) -> bool {
++    static SELECTED: OnceLock<Vec<u64>> = OnceLock::new();
++    let selected = SELECTED.get_or_init(|| std::env::var("XCL_DXC_O0_HASHES").unwrap_or_default()
++        .split(',').filter_map(|h| u64::from_str_radix(h.trim().trim_start_matches("0x"), 16).ok()).collect());
++    !selected.is_empty() && selected.contains(&crate::gpu::shader::fnv64(blob))
++}
++
+ fn cache_allowed(stage: Stage, present: impl Fn(&str) -> bool) -> bool {
+-    !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY", "XCL_DXC_O0_HASHES"]
++    !["XCL_RECOMP_NO_STRUCTURED", "XCL_RECOMP_WHY"]
+         .iter()
+         .any(|name| present(name))
+         && (stage != Stage::Pixel
+-- 
+2.54.0
+
