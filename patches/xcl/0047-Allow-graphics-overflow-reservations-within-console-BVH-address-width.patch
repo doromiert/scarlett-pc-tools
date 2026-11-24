@@ -1,0 +1,93 @@
+From 389eba4591846963f3aec131b893c01e0a5c8b9a Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Tue, 24 Nov 2026 04:20:54 +0100
+Subject: [PATCH] Allow graphics overflow reservations within the console BVH
+ address width
+
+---
+ crates/xcl/src/hle/kernelx.rs | 42 ++++++++++++++++++++++++++++++++---
+ 1 file changed, 39 insertions(+), 3 deletions(-)
+
+diff --git a/crates/xcl/src/hle/kernelx.rs b/crates/xcl/src/hle/kernelx.rs
+index 3d7b8e2..da9473f 100644
+--- a/crates/xcl/src/hle/kernelx.rs
++++ b/crates/xcl/src/hle/kernelx.rs
+@@ -288,12 +288,14 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t:
+             trace_mem("VirtualAlloc (graphics reserve, UMA)", 0, size, t as u64, p, q as usize);
+             return q as *mut c_void;
+         }
+-        let q = mem::VirtualAlloc(addr, size, mem::MEM_RESERVE | MEM_WRITE_WATCH, sanitize_protect(p));
++        let q = graphics_virtual_alloc(size, mem::MEM_RESERVE | MEM_WRITE_WATCH, sanitize_protect(p));
++        trace_mem("VirtualAlloc (graphics reserve, host)", 0, size, t as u64, p, q as usize);
+         if !q.is_null() {
+             GRAPHICS_RESERVATIONS.lock().unwrap().insert(q as usize, size);
+             GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+             return q;
+         }
++        if graphics_40bit() { return q; }
+     }
+     // the title's GPU heaps (committed with a PAGE_GRAPHICS_* protection, write-combined: memory
+     // the CPU writes and the GPU reads, as a PC game's upload heaps): in the coherent window, which
+@@ -329,8 +331,13 @@ pub unsafe extern "system" fn VirtualAlloc(addr: *const c_void, size: usize, t:
+             trace_mem("VirtualAlloc (GPU-visible, write-watched)", addr as usize, size, t as u64, p, q as usize);
+             return q;
+         }
++        if graphics_40bit() { return q; }
+     }
+-    let q = mem::VirtualAlloc(addr, size, sanitize_alloc_type(t), sanitize_protect(p));
++    let q = if addr.is_null() && (t & MEM_GRAPHICS != 0 || p & PAGE_GRAPHICS_ANY != 0) && graphics_40bit() {
++        graphics_virtual_alloc(size, sanitize_alloc_type(t), sanitize_protect(p))
++    } else {
++        mem::VirtualAlloc(addr, size, sanitize_alloc_type(t), sanitize_protect(p))
++    };
+     trace_mem("VirtualAlloc", addr as usize, size, t as u64, p, q as usize);
+     q
+ }
+@@ -346,7 +353,7 @@ fn gpu_visible_fallback(addr: *const c_void, t: u32, p: u32) -> bool {
+ /// reservations (whose ranges `title_textures` watches; `VirtualFree` forgets it). Null if
+ /// Windows refuses it.
+ unsafe fn reserve_watched(size: usize, t: u32, p: u32) -> *mut c_void {
+-    let q = mem::VirtualAlloc(std::ptr::null(), size, sanitize_alloc_type(t) | MEM_WRITE_WATCH, sanitize_protect(p));
++    let q = graphics_virtual_alloc(size, sanitize_alloc_type(t) | MEM_WRITE_WATCH, sanitize_protect(p));
+     if !q.is_null() {
+         GRAPHICS_RESERVATIONS.lock().unwrap().insert(q as usize, size);
+         GRAPHICS_RESERVATIONS_GEN.fetch_add(1, Ordering::Release);
+@@ -354,6 +361,35 @@ unsafe fn reserve_watched(size: usize, t: u32, p: u32) -> *mut c_void {
+     q
+ }
+ 
++fn graphics_40bit() -> bool {
++    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    *ON.get_or_init(|| std::env::var("XCL_GRAPHICS_40BIT").is_ok_and(|v| v == "1"))
++}
++
++/// Xbox BVH addresses are 40 bits; plain host fallback allocations may exceed that.
++unsafe fn graphics_virtual_alloc(size: usize, t: u32, p: u32) -> *mut c_void {
++    if !graphics_40bit() {
++        return mem::VirtualAlloc(std::ptr::null(), size, t, p);
++    }
++    // Keep overflow reservations outside the normal 16..32 GiB UMA windows.
++    let mut requirements = mem::MEM_ADDRESS_REQUIREMENTS {
++        LowestStartingAddress: (64usize << 30) as *mut c_void,
++        HighestEndingAddress: ((1usize << 40) - 1) as *mut c_void,
++        Alignment: crate::gpu::uma::GRAIN,
++    };
++    let mut parameter = mem::MEM_EXTENDED_PARAMETER {
++        Anonymous1: mem::MEM_EXTENDED_PARAMETER_0 { _bitfield: mem::MemExtendedParameterAddressRequirements as u64 },
++        Anonymous2: mem::MEM_EXTENDED_PARAMETER_1 { Pointer: &mut requirements as *mut _ as *mut c_void },
++    };
++    let q = mem::VirtualAlloc2(std::ptr::null_mut(), std::ptr::null(), size.checked_next_multiple_of(0x1000).unwrap_or(0), t, p, &mut parameter, 1);
++    if q.is_null() {
++        let error = fnd::GetLastError();
++        crate::xlog_warn!("kernelx: 40-bit graphics allocation failed: {size:#x} bytes, flags {t:#x}, protection {p:#x}, error {error}");
++        fnd::SetLastError(error);
++    }
++    q
++}
++
+ /// PAGE_GRAPHICS_NOACCESS … PAGE_GRAPHICS_NOCACHE (0x800 – 0x40000): the console's protection of
+ /// GPU-visible memory
+ const PAGE_GRAPHICS_ANY: u32 = 0x7_F800;
+-- 
+2.54.0
+

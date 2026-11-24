@@ -44,3 +44,4 @@
 0044-Allow-selected-console-shaders-to-compile-without-DXC-optimization.patch
 0045-Keep-fast-translation-caches-for-shaders-outside-the-DXC-workaround.patch
 0046-Textures-high-coordinate-tables-hold-one-period.patch
+0047-Allow-graphics-overflow-reservations-within-console-BVH-address-width.patch

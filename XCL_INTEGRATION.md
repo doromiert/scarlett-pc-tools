@@ -1,16 +1,16 @@
 # XCL bring-up on Linux
 
 This experimental source recipe reached input-responsive setup, colored startup
-frames and loading artwork. Heap-input and native-interface fixes passed earlier
-GPU and CPU failures; the latest reproduced stop is a shader compiler assertion
-during later loading. A selective compiler workaround is under actual-run
-validation. Earlier GPU resets interrupted GNOME. This recipe is not stable or
-playable.
+frames and loading artwork. Selected compiler workarounds passed two shader
+assertions. Constraining graphics overflow allocations to the console builder's
+address width passed its next failure; the subsequent actual run ended in the
+title's own error path. Earlier GPU resets interrupted GNOME. This recipe is
+not stable or playable.
 See [STATUS.md](STATUS.md) for the actual-run evidence and remaining blocker.
 
 ## Source and license
 
-The [46 XCL patches](patches/xcl/README.md) form an independent GPL-2.0-only
+The [47 XCL patches](patches/xcl/README.md) form an independent GPL-2.0-only
 component, separate from the GPL-3.0-or-later original tools and Leonida series.
 Keep XCL's license and third-party notices with derived source/builds.
 
@@ -25,7 +25,7 @@ done < patches/xcl/series.txt
 git -C /external/tools/xcl rev-parse 'HEAD^{tree}'
 ```
 
-The resulting candidate tree must be `7d436fa6696ab96b6cc6b7a91a80ed08caf1491b`.
+The resulting candidate tree must be `d27bf499a208c9826a10c52a36be90370f421bd3`.
 The setup baseline is the first 14 patches; current candidate verification is
 described in the patch-directory README.
 These are native-object identity/ABI fixes, not executable patches. The allocator
@@ -216,3 +216,21 @@ high-coordinate swizzle tables retain only their mathematical period, reducing
 construction work and memory while preserving modulo-indexed offsets. A live
 loading CPU profile identified table construction as a substantial cost; its
 actual performance improvement is not measured yet.
+
+## Graphics allocation address width
+
+Patch 47 adds the default-off `XCL_GRAPHICS_40BIT=1` option. Graphics allocations
+that overflow XCL's unified-memory windows use Windows
+[VirtualAlloc2 address requirements](https://learn.microsoft.com/en-us/windows/win32/api/memoryapi/nf-memoryapi-virtualalloc2)
+within 64 GiB through 1 TiB, keeping their complete address ranges below the
+console BVH builder's 40-bit limit. Allocation failure is propagated instead of
+retrying at an incompatible high address. Requested fixed addresses retain
+their existing behavior.
+
+The actual title made its large overflow reservations in that range, reported
+no constrained-allocation failure, and passed the prior BVH address-width error.
+It later deliberately faulted in its own error path. Three unfinished shader
+compilations did not complete within bounded CPU-only reproductions; whether
+that caused the title's later failure is under investigation. Low addresses
+alone do not make external buffers visible through the translated shader ABI.
+No ray-tracing correctness or playable output is claimed.

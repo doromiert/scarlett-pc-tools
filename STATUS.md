@@ -1,5 +1,21 @@
 # Local verification, 2026-11-24
 
+## 2026-11-24: BVH address-width check passed
+
+The 47-patch candidate is `458a69bb508ca0de1033d52cc4342a28e54d3dfc`,
+tree `d27bf499a208c9826a10c52a36be90370f421bd3`. All patches applied strictly
+from the pinned base, reproduced that tree, and passed a separate release build.
+The clean public executable has not run; actual execution includes private
+bounded diagnostics.
+
+An actual run selecting both compiler workarounds passed both earlier shader
+assertions, then failed when the console BVH builder rejected a destination
+address above 40 bits. With patch 47's allocation option enabled, the next run
+made its large overflow graphics reservations below 1 TiB and passed that error.
+It later deliberately faulted in its own error path. Three shader compilations
+were unfinished at exit and did not complete in bounded CPU-only reproductions;
+causality remains unproven. Controllable, rendered gameplay is not verified.
+
 ## 2026-11-24: first compiler failure passed; a second isolated
 
 The 46-patch candidate is `7024587dfb6367c2c8fdb3a6192da8bfa3d9106f`,
