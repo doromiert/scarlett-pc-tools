@@ -1,4 +1,24 @@
-# Local verification, 2026-11-23
+# Local verification, 2026-11-24
+
+## 2026-11-24: loading passed the earlier GPU hang
+
+The 41-patch source recipe reproduces candidate
+`ea1bfec08e28a1b6139323a5e85032e4002f1de6`, tree
+`f0357ea75e642be3a6e4bf097efac00e1a74c53b`. Strict patch application and a
+separate release build passed; the clean public executable has not itself run.
+
+Actual GPU breadcrumbs narrowed the loading hang to a fullscreen material draw.
+The translated pixel shader needed both resource-heap and sampler-heap inputs;
+those registers were zero with the earlier sampler-only experiment. With
+`XCL_BINDLESS_HEAP_INPUTS=1`, an actual run supplied both declared heap addresses,
+passed the previously failing shader family and continued into later passes.
+About 9.6 GB of target pages were backed before a different native
+command-signature vtable assertion ended the process. That run reported no GPU
+device loss. This does not establish general GPU stability or playable output.
+
+Patch 41 preserves native command-signature identity at creation. Its actual-run
+validation is in progress. Texture accuracy, intro performance, timing separation
+and gyro aiming remain unresolved; controllable gameplay is not verified.
 
 ## 2026-11-24: input-responsive setup and later loading failures
 

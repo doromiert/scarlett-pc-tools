@@ -8,10 +8,10 @@ combined into the Leonida implementation. See [LICENSE](LICENSE) and upstream
 attribution/third-party notices. Mail patches preserve commit authorship.
 
 Base: `eaa36b62768fe1eedb87d010a19148854c9a3952`.
-Current build candidate: `75cee47c8f40d8ffbd73095f035625c74b4cd593`.
-Expected resulting Git tree: `6377e9ea4fe75dc91ea4517fc8660900e1efa17b`.
+Current build candidate: `ea1bfec08e28a1b6139323a5e85032e4002f1de6`.
+Expected resulting Git tree: `f0357ea75e642be3a6e4bf097efac00e1a74c53b`.
 
-Apply all 38 patches in `series.txt` order. The applied series reproduced that
+Apply all 41 patches in `series.txt` order. The applied series reproduced that
 exact tree in a private worktree. The first 14 reproduce the earlier setup-tested
 source `0cb3173bbc47e3aa05cb288cb462005a0f16fff9` (tree
 `347aecd3e4b04a8d3b7b1c55ea6bce0a39cce78d`).
@@ -45,3 +45,10 @@ reproduces the expected tree. Actual execution used this logic with additional
 private diagnostics; the clean public build has not been run against the title.
 Setup is rendered and responds to input, but heavy loading still causes a GPU
 queue timeout/reset. No playable scene is verified.
+
+Patches 39–41 add a root-flag-directed graphics heap-input experiment, preserve
+the original console heap bindings including explicit unbinding, and retain
+native command-signature identity for ExecuteIndirect. Actual execution with
+additional private diagnostics passed the earlier fullscreen-draw hang and
+stopped later at the command-signature assertion; validation of the last fix is
+in progress. The clean 41-patch tree builds and reproduces the tree above.

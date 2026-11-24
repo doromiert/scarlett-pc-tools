@@ -36,3 +36,6 @@
 0036-Sample-headless-pixel-diagnostics-without-dropping-v.patch
 0037-Pass-native-staging-resources-to-sparse-PC-copy-list.patch
 0038-Match-observed-Wait64BitValueX-flags-argument.patch
+0039-Supply-declared-bindless-graphics-heap-inputs-experi.patch
+0040-Distinguish-empty-title-heap-bindings-from-unknown-s.patch
+0041-Retain-native-command-signature-identity-for-indirec.patch

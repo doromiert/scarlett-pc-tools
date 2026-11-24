@@ -9,7 +9,7 @@ See [STATUS.md](STATUS.md) for the actual-run evidence and remaining blocker.
 
 ## Source and license
 
-The [38 XCL patches](patches/xcl/README.md) form an independent GPL-2.0-only
+The [41 XCL patches](patches/xcl/README.md) form an independent GPL-2.0-only
 component, separate from the GPL-3.0-or-later original tools and Leonida series.
 Keep XCL's license and third-party notices with derived source/builds.
 
@@ -24,7 +24,7 @@ done < patches/xcl/series.txt
 git -C /external/tools/xcl rev-parse 'HEAD^{tree}'
 ```
 
-The resulting candidate tree must be `6377e9ea4fe75dc91ea4517fc8660900e1efa17b`.
+The resulting candidate tree must be `f0357ea75e642be3a6e4bf097efac00e1a74c53b`.
 The setup baseline is the first 14 patches; current candidate verification is
 described in the patch-directory README.
 These are native-object identity/ABI fixes, not executable patches. The allocator
@@ -128,12 +128,27 @@ encountered a graphics-queue timeout during heavy loading.
 
 ## Sampler-input experiment and synchronization correction
 
+`XCL_BINDLESS_HEAP_INPUTS=1` is the newer graphics experiment. For wholly inline
+root arguments, it appends the resource and/or sampler heap shadow addresses
+declared by root-signature flags `0x400` and `0x800`, in that order. It checks
+register capacity, heap identity and memory-window bounds. Original console
+heaps are retained separately from the native shared heap used for PC binding.
+Explicitly empty bindings remain empty. Compute and spilled layouts are not
+covered by this experiment.
+
+In an actual loading run, this supplied the missing inputs of the fullscreen
+material shader and passed the earlier GPU hang. Execution continued through
+later shader passes before a native command-signature assertion. The candidate
+also preserves that object's native vtable; validation of this last correction
+is still in progress. No controllable scene has been verified.
+
 `XCL_SAMPLER_BASE_SGPR=11` enables the sampler-input experiment used in the actual
 setup run. It appends the currently bound sampler heap's runtime address only
 when that register is the first unused inline register and the heap is
 unambiguous in memory window 0. It does not replace explicit root arguments.
 This is default-off and is not a general register-placement rule for every
 shader, root signature, stage or spilling combination.
+The newer bindless experiment takes precedence when both settings are supplied.
 
 With that input, setup rendered and responded to keyboard input. The final 600
 captured setup frames before a user-requested suspension averaged 29.1 FPS;

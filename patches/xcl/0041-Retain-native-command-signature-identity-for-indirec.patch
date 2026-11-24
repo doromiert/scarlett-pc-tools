@@ -1,0 +1,27 @@
+From ea1bfec08e28a1b6139323a5e85032e4002f1de6 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Tue, 24 Nov 2026 03:18:25 +0100
+Subject: [PATCH 41/41] Retain native command signature identity for indirect
+ execution
+
+---
+ crates/xcl/src/hle/d3d12x/real.rs | 3 +++
+ 1 file changed, 3 insertions(+)
+
+diff --git a/crates/xcl/src/hle/d3d12x/real.rs b/crates/xcl/src/hle/d3d12x/real.rs
+index 57437bd..d1fe690 100644
+--- a/crates/xcl/src/hle/d3d12x/real.rs
++++ b/crates/xcl/src/hle/d3d12x/real.rs
+@@ -2487,6 +2487,9 @@ macro_rules! creator {
+                         *ppv = std::ptr::null_mut();
+                         return observed;
+                     }
++                } else if $kind == Kind::CommandSignature {
++                    // No console extensions are needed. ExecuteIndirect consumes
++                    // this native object and checks its original vtable identity.
+                 } else {
+                     adopt(*ppv, $kind);
+                 }
+-- 
+2.54.0
+

@@ -1,0 +1,139 @@
+From a0066cc9b25185e720e805968d61a080efb1f585 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Tue, 24 Nov 2026 03:15:25 +0100
+Subject: [PATCH 39/41] Supply declared bindless graphics heap inputs
+ experimentally
+
+---
+ crates/xcl/src/hle/d3d12x/bind.rs         | 29 ++++++++++++++++++++++-
+ crates/xcl/src/hle/d3d12x/console_heap.rs |  6 ++++-
+ crates/xcl/src/hle/d3d12x/console_list.rs |  3 ++-
+ crates/xcl/src/hle/d3d12x/list_x.rs       | 13 ++++++++--
+ 4 files changed, 46 insertions(+), 5 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/bind.rs b/crates/xcl/src/hle/d3d12x/bind.rs
+index 64cbfb0..af22d72 100644
+--- a/crates/xcl/src/hle/d3d12x/bind.rs
++++ b/crates/xcl/src/hle/d3d12x/bind.rs
+@@ -847,8 +847,35 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
+     // Default-off ABI experiment. The explicitly requested register must be the
+     // first unused inline register, so no supplied title root argument is replaced.
+     // The heap and address are derived from current bindings, never fixed payloads.
++    static BINDLESS_INPUTS: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
++    let bindless_inputs = *BINDLESS_INPUTS.get_or_init(|| std::env::var("XCL_BINDLESS_HEAP_INPUTS").as_deref() == Ok("1"));
++    if gfx && bindless_inputs {
++        if let Some(layout) = layout.as_ref().filter(|l| l.inline_gfx == l.size && args.len() >= l.size as usize && io.len() == 8 + l.inline_gfx as usize / 4 && l.flags & 0xc00 != 0) {
++            let inputs: Option<Vec<u32>> = [(0x400, false, 32usize), (0x800, true, 16)]
++                .into_iter().filter(|(flag, _, _)| layout.flags & flag != 0)
++                .map(|(_, sampler, stride)| {
++                    let (shadow, count) = super::list_x::bound_heap_shadow(this, sampler)?;
++                    let (base, size) = u.window(0);
++                    let offset = shadow.checked_sub(base)?;
++                    (offset.checked_add((count as usize).checked_mul(stride)?)? <= size)
++                        .then(|| u32::try_from(offset).ok()).flatten()
++                }).collect();
++            if let Some(inputs) = inputs.filter(|v| io.len() + v.len() <= 32) {
++                static N: AtomicU64 = AtomicU64::new(0);
++                if N.fetch_add(1, Ordering::Relaxed) < 16 {
++                    crate::xlog_info!("experimental bindless ABI: root flags {:#x}, s{} receives resource/sampler offsets {inputs:x?}", layout.flags, io.len());
++                }
++                io.extend(inputs);
++            } else {
++                static N: AtomicU64 = AtomicU64::new(0);
++                if N.fetch_add(1, Ordering::Relaxed) < 8 {
++                    crate::xlog_warn!("experimental bindless ABI: root flags {:#x} at s{} lack unambiguous in-window bound heap inputs", layout.flags, io.len());
++                }
++            }
++        }
++    }
+     static SAMPLER_SLOT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+-    if gfx {
++    if gfx && !bindless_inputs {
+         if let Some(slot) = *SAMPLER_SLOT.get_or_init(|| std::env::var("XCL_SAMPLER_BASE_SGPR").ok().and_then(|v| v.parse().ok())) {
+             if slot == io.len() && (8..32).contains(&slot) {
+                 if let Some((shadow, count)) = super::list_x::bound_sampler_shadow(this) {
+diff --git a/crates/xcl/src/hle/d3d12x/console_heap.rs b/crates/xcl/src/hle/d3d12x/console_heap.rs
+index 7cc97f8..90fa7ea 100644
+--- a/crates/xcl/src/hle/d3d12x/console_heap.rs
++++ b/crates/xcl/src/hle/d3d12x/console_heap.rs
+@@ -304,8 +304,12 @@ pub fn start(obj: usize) -> Option<u64> {
+ /// Read-only identity lookup: the CPU shadow of a sampler heap already bound on a PC list.
+ /// Drop the heap lock before normalizing native identities to preserve lock ordering.
+ pub(super) fn sampler_shadow_for_pc(obj: usize) -> Option<(usize, u32)> {
++    heap_shadow_for_pc(obj, true)
++}
++
++pub(super) fn heap_shadow_for_pc(obj: usize, sampler: bool) -> Option<(usize, u32)> {
+     let native = super::native_proxy::native(obj as *mut std::ffi::c_void) as usize;
+-    let heaps: Vec<_> = HEAPS.lock().unwrap().iter().filter(|h| h.sampler)
++    let heaps: Vec<_> = HEAPS.lock().unwrap().iter().filter(|h| h.sampler == sampler && h.visible)
+         .map(|h| (h.obj, h.shadow, h.n)).collect();
+     heaps.into_iter().find_map(|(id, shadow, n)|
+         (super::native_proxy::native(id as *mut std::ffi::c_void) as usize == native).then_some((shadow, n)))
+diff --git a/crates/xcl/src/hle/d3d12x/console_list.rs b/crates/xcl/src/hle/d3d12x/console_list.rs
+index 51bdb2f..87be7ac 100644
+--- a/crates/xcl/src/hle/d3d12x/console_list.rs
++++ b/crates/xcl/src/hle/d3d12x/console_list.rs
+@@ -71,6 +71,7 @@ pub enum Param {
+ #[derive(Debug, Default)]
+ pub struct Layout {
+     pub params: Vec<Param>,
++    pub flags: u32,
+     pub size: u32,
+     pub inline: u32,
+     pub inline_gfx: u32,
+@@ -95,7 +96,7 @@ pub fn layout_from_blob(blob: &[u8]) -> Option<Layout> {
+     };
+     let r = |o: usize| rts0.get(o..o + 4).map(|b| u32::from_le_bytes(b.try_into().unwrap()));
+     let (n, poff) = (r(4)? as usize, r(8)? as usize);
+-    let mut l = Layout::default();
++    let mut l = Layout { flags: r(20)?, ..Default::default() };
+     // the parameters go into user SGPRs in order while each fits whole; from the first one
+     // that does not, the rest go to the table (packed from its start) – as the console's
+     // compiler expects them (HANDOFF: root argument binding)
+diff --git a/crates/xcl/src/hle/d3d12x/list_x.rs b/crates/xcl/src/hle/d3d12x/list_x.rs
+index 27f1676..c4f77d7 100644
+--- a/crates/xcl/src/hle/d3d12x/list_x.rs
++++ b/crates/xcl/src/hle/d3d12x/list_x.rs
+@@ -246,6 +246,9 @@ struct RenderTargets {
+ #[derive(Default, Clone)]
+ struct Bindings {
+     heaps: Vec<usize>,
++    /// Original console heaps, before PC binding replaces view heaps with the
++    /// shared native heap. Shader ABI addresses must name these console shadows.
++    title_heaps: Vec<usize>,
+     topology: Option<u32>,
+     viewports: Vec<D3D12_VIEWPORT>,
+     scissors: Vec<windows::Win32::Foundation::RECT>,
+@@ -275,13 +278,17 @@ pub(super) fn pc_va_of(va: u64) -> u64 {
+ 
+ fn retained_heaps(list: *mut c_void) -> Vec<usize> {
+     LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize)))
+-        .map(|s| s.bindings.heaps.clone()).unwrap_or_default()
++        .map(|s| if s.bindings.title_heaps.is_empty() { s.bindings.heaps.clone() } else { s.bindings.title_heaps.clone() }).unwrap_or_default()
+ }
+ 
+ /// Only an unambiguous, already-bound sampler heap can supply an experimental base.
+ pub(super) fn bound_sampler_shadow(list: *mut c_void) -> Option<(usize, u32)> {
++    bound_heap_shadow(list, true)
++}
++
++pub(super) fn bound_heap_shadow(list: *mut c_void, sampler: bool) -> Option<(usize, u32)> {
+     let mut heaps: Vec<_> = retained_heaps(list).into_iter()
+-        .filter_map(super::console_heap::sampler_shadow_for_pc).filter(|(_, n)| *n != 0).collect();
++        .filter_map(|heap| super::console_heap::heap_shadow_for_pc(heap, sampler)).filter(|(_, n)| *n != 0).collect();
+     heaps.sort_unstable();heaps.dedup();
+     (heaps.len() == 1).then(|| heaps[0])
+ }
+@@ -1751,6 +1758,8 @@ pub(super) unsafe fn pc_heaps(n: u32, heaps: *const usize) -> Vec<Option<ID3D12D
+ pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n: u32, heaps: *const usize) {
+     const PC_SET_DESCRIPTOR_HEAPS: usize = 28;
+     let f = pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, PC_SET_DESCRIPTOR_HEAPS);
++    let given = if heaps.is_null() { Vec::new() } else { std::slice::from_raw_parts(heaps, n as usize).to_vec() };
++    with_bindings(this, |b| b.title_heaps = given);
+     if heaps.is_null() || super::console_heap::global_heap().is_none() {
+         if !heaps.is_null() {
+             let given = std::slice::from_raw_parts(heaps, n as usize).to_vec();
+-- 
+2.54.0
+

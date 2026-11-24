@@ -1,0 +1,52 @@
+From 26ff027f863d616690824d1b744e9d8ff099db6a Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Tue, 24 Nov 2026 03:13:53 +0100
+Subject: [PATCH 40/41] Distinguish empty title heap bindings from unknown
+ state
+
+(cherry picked from commit 360d32d46d931e51f0d83f85b62b2f87d87b6566)
+---
+ crates/xcl/src/hle/d3d12x/list_x.rs | 12 +++++-------
+ 1 file changed, 5 insertions(+), 7 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/list_x.rs b/crates/xcl/src/hle/d3d12x/list_x.rs
+index c4f77d7..44e521f 100644
+--- a/crates/xcl/src/hle/d3d12x/list_x.rs
++++ b/crates/xcl/src/hle/d3d12x/list_x.rs
+@@ -248,7 +248,7 @@ struct Bindings {
+     heaps: Vec<usize>,
+     /// Original console heaps, before PC binding replaces view heaps with the
+     /// shared native heap. Shader ABI addresses must name these console shadows.
+-    title_heaps: Vec<usize>,
++    title_heaps: Option<Vec<usize>>,
+     topology: Option<u32>,
+     viewports: Vec<D3D12_VIEWPORT>,
+     scissors: Vec<windows::Win32::Foundation::RECT>,
+@@ -278,7 +278,7 @@ pub(super) fn pc_va_of(va: u64) -> u64 {
+ 
+ fn retained_heaps(list: *mut c_void) -> Vec<usize> {
+     LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize)))
+-        .map(|s| if s.bindings.title_heaps.is_empty() { s.bindings.heaps.clone() } else { s.bindings.title_heaps.clone() }).unwrap_or_default()
++        .map(|s| s.bindings.title_heaps.as_ref().unwrap_or(&s.bindings.heaps).clone()).unwrap_or_default()
+ }
+ 
+ /// Only an unambiguous, already-bound sampler heap can supply an experimental base.
+@@ -1759,12 +1759,10 @@ pub(super) unsafe extern "system" fn set_descriptor_heaps_x(this: *mut c_void, n
+     const PC_SET_DESCRIPTOR_HEAPS: usize = 28;
+     let f = pc::<unsafe extern "system" fn(*mut c_void, u32, *const usize)>(this, PC_SET_DESCRIPTOR_HEAPS);
+     let given = if heaps.is_null() { Vec::new() } else { std::slice::from_raw_parts(heaps, n as usize).to_vec() };
+-    with_bindings(this, |b| b.title_heaps = given);
++    with_bindings(this, |b| b.title_heaps = Some(given));
+     if heaps.is_null() || super::console_heap::global_heap().is_none() {
+-        if !heaps.is_null() {
+-            let given = std::slice::from_raw_parts(heaps, n as usize).to_vec();
+-            with_bindings(this, |b| b.heaps = given);
+-        }
++        let given = if heaps.is_null() { Vec::new() } else { std::slice::from_raw_parts(heaps, n as usize).to_vec() };
++        with_bindings(this, |b| b.heaps = given);
+         return f(this, n, heaps);
+     }
+     let h = pc_heaps(n, heaps);
+-- 
+2.54.0
+
