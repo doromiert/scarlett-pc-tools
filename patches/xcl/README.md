@@ -8,10 +8,10 @@ combined into the Leonida implementation. See [LICENSE](LICENSE) and upstream
 attribution/third-party notices. Mail patches preserve commit authorship.
 
 Base: `eaa36b62768fe1eedb87d010a19148854c9a3952`.
-Current build candidate: `4278e4f4accb2f8cb3a714b1850e0b933ecbc59a`.
-Expected resulting Git tree: `8a610cf36e05b773170fcbc323f7daee78ca2b95`.
+Current build candidate: `73bbf6d69e4ea82f4dca7a922fa51721f320acb4`.
+Expected resulting Git tree: `f9aa02de3d0d1860fdea1b2701f596e37797b071`.
 
-Apply all 51 patches in `series.txt` order. The applied series reproduced that
+Apply all 53 patches in `series.txt` order. The applied series reproduced that
 exact tree in a private worktree. The first 14 reproduce the earlier setup-tested
 source `0cb3173bbc47e3aa05cb288cb462005a0f16fff9` (tree
 `347aecd3e4b04a8d3b7b1c55ea6bce0a39cce78d`).
@@ -27,7 +27,7 @@ at shared-page operations, opt-in BC1 placeholders, float4 constant-buffer
 descriptors, and exact bounded DirectStorage memory reads. Upstream authorship is
 preserved. Private game-specific fault instrumentation is excluded.
 
-An actual Linux run with this candidate plus private CPU diagnostics rendered
+An earlier actual Linux integration plus private CPU diagnostics rendered
 colored startup frames and loading artwork on a spare integrated GPU, then
 self-exited after a GPU timeout/device loss. The desktop GPU was inaccessible to
 the game; GNOME survived. This is failure isolation, not a stability or gameplay
@@ -64,7 +64,7 @@ the translated fast caches are bypassed only for selected programs.
 The actual captured failing shader passed CPU-only SPIR-V validation at `-O0`;
 actual title validation passed the first offending shader and reached a later
 shader compiler assertion. A second captured shader passes CPU-only validation
-at `-O0`; a run selecting both is in progress. All 51 patches apply strictly from the pinned
+at `-O0`; a run selecting both is in progress. All 53 patches apply strictly from the pinned
 base and reproduce the tree above; a separate release build passed. The clean
 public binary has not run. No game-derived shader hashes or data are included.
 
@@ -77,15 +77,15 @@ Patch 47 adds opt-in 40-bit graphics-overflow reservations using VirtualAlloc2
 address requirements. Actual allocations fit the bound and the previous BVH
 address-width failure disappeared; a later title error remains under
 investigation. It does not extend translated GPU visibility beyond UMA.
-All 51 patches apply strictly to the pinned base and the resulting source builds.
+All 53 patches apply strictly to the pinned base and the resulting source builds.
 
 Patch 48 retains native query-heap identity, clearing an assertion exposed by the
 larger coherent-memory configuration in an actual run. That run rendered the
 local account picker but advanced extremely slowly. Patches 49–50 preserve
 upstream's detile column/row precomputation and whole-row linear copy paths,
-matching a leading live CPU hotspot. They have not been activated in the running
-process. All 51 patches apply strictly and the source builds; neither their
-actual performance effect nor controllable gameplay is verified.
+matching a leading live CPU hotspot. They have since run in the private
+integration. All 53 patches apply strictly and the source builds; an isolated
+speedup from patches 49–50 and controllable gameplay remain unverified.
 
 Patch 51 lets keyboard movement use a foreground window owned by the title's
 process when the headless renderer has not created XCL's presentation window.
@@ -93,4 +93,13 @@ The existing keyboard/mouse configuration gate and normal attached-window path
 remain in force. Raw mouse capture still requires an attached window and message
 handler. Source inspection identified the missing movement-window binding; the
 live run independently accepted a D-pad keyboard press, and a longer A press was
-followed by intro frames. The movement fallback builds but has not been run.
+followed by intro frames. The fallback has since accepted the mapped Y key in an
+actual headless run; controllable WASD gameplay remains unverified.
+
+Patch 52 incorporates upstream's unchanged-content check before texture detiling
+and upload. Patch 53 discards remembered content after upload failures. They
+apply strictly and build in the separate clean candidate. An actual private
+integration improved median captured intro output from 6.41 to 3.83 seconds per
+frame in successive samples, still far too slow for use. Gameplay and visual
+correctness remain unverified. `XCL_TEXTURE_SKIP_UNCHANGED=0` disables the
+optimization.

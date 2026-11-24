@@ -1,0 +1,83 @@
+From 73bbf6d69e4ea82f4dca7a922fa51721f320acb4 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Tue, 24 Nov 2026 09:54:47 +0100
+Subject: [PATCH] Discard unchanged-texture cache entries when uploads fail
+
+---
+ crates/xcl/src/hle/d3d12x/title_textures.rs | 24 +++++++++++++++++++--
+ 1 file changed, 22 insertions(+), 2 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/title_textures.rs b/crates/xcl/src/hle/d3d12x/title_textures.rs
+index aacfd82..ee40845 100644
+--- a/crates/xcl/src/hle/d3d12x/title_textures.rs
++++ b/crates/xcl/src/hle/d3d12x/title_textures.rs
+@@ -782,6 +782,14 @@ fn same_as_last_upload(res: usize, h: u64) -> bool {
+     LAST_CONTENT.lock().unwrap().insert(res, h) == Some(h)
+ }
+ 
++/// Failed copies must not make a later refresh believe these bytes reached the GPU.
++fn invalidate_content(resources: &[usize]) {
++    let mut last = LAST_CONTENT.lock().unwrap();
++    for res in resources {
++        last.remove(res);
++    }
++}
++
+ /// A 64-bit hash of `b` for "the same bytes as before" (four lanes of multiply-rotate over
+ /// 8-byte words: gigabytes a second; not for anything adversarial).
+ fn content_hash(b: &[u8]) -> u64 {
+@@ -815,6 +823,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
+     let mut todo = todo.into_iter().peekable();
+     while todo.peek().is_some() {
+         let mut batch = Vec::new();
++        let mut remembered = Vec::new();
+         let mut bytes = 0usize;
+         let mut device = 0usize;
+         while let Some((_, (dev, _, tex, _))) = todo.peek() {
+@@ -835,6 +844,7 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
+                     }
+                     continue;
+                 }
++                remembered.push(r.as_raw() as usize);
+             }
+             device = dev;
+             bytes += tex.size() as usize;
+@@ -848,10 +858,14 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
+             batch.push((pc, subs, states));
+         }
+         let d = device as *mut c_void;
+-        let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else { continue };
++        let Some(dev) = ID3D12Device::from_raw_borrowed(&d) else {
++            invalidate_content(&remembered);
++            continue;
++        };
+         let queue = match upload_queue(dev, device) {
+             Ok(q) => q,
+             Err(e) => {
++                invalidate_content(&remembered);
+                 warn(&e);
+                 continue;
+             }
+@@ -861,12 +875,18 @@ unsafe fn upload_all(todo: Vec<(ID3D12Resource, Upload)>) {
+             texture::upload_batch(dev, &queue, &batch)
+         }) {
+             Ok(failed) => {
++                if !failed.is_empty() {
++                    invalidate_content(&remembered);
++                }
+                 for (_, e) in failed {
+                     warn(&e);
+                 }
+                 UPLOADS.fetch_add(batch.len() as u64, Ordering::Relaxed);
+             }
+-            Err(e) => warn(&e),
++            Err(e) => {
++                invalidate_content(&remembered);
++                warn(&e);
++            }
+         }
+     }
+ }
+-- 
+2.54.0
+

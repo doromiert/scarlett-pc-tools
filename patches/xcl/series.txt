@@ -49,3 +49,5 @@
 0049-Textures-detiling-a-mip-level-computes-column-and-row-parts-once.patch
 0050-Textures-linear-levels-are-detiled-a-row-at-a-time.patch
 0051-Allow-keyboard-movement-on-the-title-window-without-XCL-presentation.patch
+0052-Skip-title-texture-uploads-when-their-content-is-unchanged.patch
+0053-Invalidate-unchanged-texture-content-after-failed-upload.patch

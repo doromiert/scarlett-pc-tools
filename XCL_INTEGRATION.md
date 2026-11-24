@@ -11,7 +11,7 @@ See [STATUS.md](STATUS.md) for the actual-run evidence and remaining blocker.
 
 ## Source and license
 
-The [51 XCL patches](patches/xcl/README.md) form an independent GPL-2.0-only
+The [53 XCL patches](patches/xcl/README.md) form an independent GPL-2.0-only
 component, separate from the GPL-3.0-or-later original tools and Leonida series.
 Keep XCL's license and third-party notices with derived source/builds.
 
@@ -26,7 +26,7 @@ done < patches/xcl/series.txt
 git -C /external/tools/xcl rev-parse 'HEAD^{tree}'
 ```
 
-The resulting candidate tree must be `8a610cf36e05b773170fcbc323f7daee78ca2b95`.
+The resulting candidate tree must be `f9aa02de3d0d1860fdea1b2701f596e37797b071`.
 The setup baseline is the first 14 patches; current candidate verification is
 described in the patch-directory README.
 These are native-object identity/ABI fixes, not executable patches. The allocator
@@ -266,4 +266,25 @@ The existing keyboard/mouse configuration gate and normal attached-window path
 remain in force. Raw mouse capture still requires an attached window and message
 handler. Source inspection identified the missing movement-window binding; the
 live run independently accepted a D-pad keyboard press, and a longer A press was
-followed by intro frames. The movement fallback builds but has not been run.
+followed by intro frames. The fallback has since accepted the mapped Y key in an
+actual headless run; controllable WASD gameplay remains unverified.
+
+## Avoid repeating unchanged texture conversions
+
+Patch 52 incorporates upstream's content check before detiling and uploading a
+CPU-backed texture again. Write-watch reports dirty pages, including neighboring
+writes and rewrites of identical bytes. An unchanged texture's content can retain
+its earlier GPU copy. Releasing or re-registering a texture invalidates that
+record. `XCL_TEXTURE_SKIP_UNCHANGED=0` restores the earlier upload behavior.
+
+Patch 53 invalidates remembered content after a device, queue, batch or individual
+upload failure, so a failed copy cannot suppress a later upload. The changes
+preserve source authorship and use no game-specific data.
+
+All 53 patches reproduce the pinned tree, and a separate release build passed.
+The previous actual intro produced a frame about every 6.4 seconds over a
+40-second sample. The new private integration logged thousands of skipped
+uploads and produced a median interval of 3.83 seconds in a subsequent intro
+sample, about 1.67 times faster output. These samples cover the same sequence,
+not identical individual frames; visual correctness and gameplay remain
+unverified. The output is still far too slow to use.

@@ -1,5 +1,27 @@
 # Local verification, 2026-11-24
 
+## 2026-11-24: unchanged-texture uploads improve intro output
+
+The 53-patch candidate is `73bbf6d69e4ea82f4dca7a922fa51721f320acb4`,
+tree `f9aa02de3d0d1860fdea1b2701f596e37797b071`. All source patches applied
+without a three-way fallback, reproduced that tree, and passed a separate release
+build. The clean public executable has not been run.
+
+An actual private integration with this logic skipped thousands of unchanged
+texture uploads. Successive 40-second samples of the intro's CPU-captured output
+had median frame intervals of 6.406 seconds before and 3.831 seconds after:
+approximately 0.156 to 0.261 FPS, or 1.67 times faster output. The samples cover
+the same intro sequence, not identical individual video frames; this is not a
+controlled whole-game benchmark. The result is still unusably slow and does not
+establish controllable gameplay, simulation speed or visual correctness.
+
+Patch 52 incorporates upstream's content check before detiling/uploading an
+unchanged texture; patch 53 invalidates that record after upload failures. The
+actual run also detected the physical controller through XInput and accepted
+A/Y input. Further profiling remains necessary: game-side job-queue polling
+dominates CPU samples, while render-side resource allocation and queue waits
+remain under investigation.
+
 ## 2026-11-24: PC preparation target and actual offline conversion
 
 The user selected Windows PC code under Proton as the target. One actual console
