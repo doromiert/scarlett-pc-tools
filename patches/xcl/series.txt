@@ -39,3 +39,4 @@
 0039-Supply-declared-bindless-graphics-heap-inputs-experi.patch
 0040-Distinguish-empty-title-heap-bindings-from-unknown-s.patch
 0041-Retain-native-command-signature-identity-for-indirec.patch
+0042-Add-opt-in-observed-XG-copy-argument-layout.patch

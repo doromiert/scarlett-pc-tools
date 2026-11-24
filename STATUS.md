@@ -1,5 +1,24 @@
 # Local verification, 2026-11-24
 
+## 2026-11-24: native indirect assertion passed; XG copy ABI corrected
+
+The current 42-patch candidate is `abbae09c88b7606071cd34610b9990e3c4838f0c`,
+tree `b6c1bfeba82a07f06ff5e09868a3b32bb7c0de3d`. Strict application and a
+separate release build passed. The clean public binary has not itself run.
+
+An actual run with native command signatures passed the previous vtable
+assertion and stopped later in XG texture readback. Caller inspection proved an
+extra DWORD precedes the source pointer in that caller's CopyFromSubresource
+layout. The legacy hook instead consumed pointer bits as a row pitch and wrote
+outside the destination. The opt-in wrapper in patch 42 matches the observed
+argument order; nonzero extra arguments remain unsupported.
+
+With `XCL_XG_COPY_FLAGS=1`, the next actual run completed two copies with normal
+row/slice pitches (2048/262144 and 256/8192). It later exited at a DXIL-to-SPIR-V
+control-flow-structurizer assertion. The failing shader has been isolated
+privately for investigation. Neither controllable gameplay nor full graphics
+stability is verified.
+
 ## 2026-11-24: loading passed the earlier GPU hang
 
 The 41-patch source recipe reproduces candidate

@@ -9,7 +9,7 @@ See [STATUS.md](STATUS.md) for the actual-run evidence and remaining blocker.
 
 ## Source and license
 
-The [41 XCL patches](patches/xcl/README.md) form an independent GPL-2.0-only
+The [42 XCL patches](patches/xcl/README.md) form an independent GPL-2.0-only
 component, separate from the GPL-3.0-or-later original tools and Leonida series.
 Keep XCL's license and third-party notices with derived source/builds.
 
@@ -24,7 +24,7 @@ done < patches/xcl/series.txt
 git -C /external/tools/xcl rev-parse 'HEAD^{tree}'
 ```
 
-The resulting candidate tree must be `f0357ea75e642be3a6e4bf097efac00e1a74c53b`.
+The resulting candidate tree must be `b6c1bfeba82a07f06ff5e09868a3b32bb7c0de3d`.
 The setup baseline is the first 14 patches; current candidate verification is
 described in the patch-directory README.
 These are native-object identity/ABI fixes, not executable patches. The allocator
@@ -140,7 +140,8 @@ In an actual loading run, this supplied the missing inputs of the fullscreen
 material shader and passed the earlier GPU hang. Execution continued through
 later shader passes before a native command-signature assertion. The candidate
 also preserves that object's native vtable; validation of this last correction
-is still in progress. No controllable scene has been verified.
+passed that assertion in a later run, which stopped at an independent XG copy
+argument mismatch. No controllable scene has been verified.
 
 `XCL_SAMPLER_BASE_SGPR=11` enables the sampler-input experiment used in the actual
 setup run. It appends the currently bound sampler heap's runtime address only
@@ -162,6 +163,14 @@ full-width comparisons and existing synchronization logic. A subsequent actual
 run no longer reported the earlier repeated two-second waits, loaded further,
 and eventually lost the graphics device. Wait32 is unchanged pending evidence.
 These corrections do not establish gameplay or general GPU stability.
+
+`XCL_XG_COPY_FLAGS=1` selects the observed eight-argument CopyFromSubresource
+layout: an extra DWORD precedes the source pointer. Only an extra value of zero
+is supported; its other semantics are unknown. The legacy seven-argument layout
+remains the default, and CopyIntoSubresource is unchanged. An actual run
+completed two corrected copies before encountering a later DXIL-to-SPIR-V
+compiler assertion. This setting is a compatibility experiment, not a universal
+XG ABI rule.
 
 ## Temporary texture placeholders
 

@@ -8,10 +8,10 @@ combined into the Leonida implementation. See [LICENSE](LICENSE) and upstream
 attribution/third-party notices. Mail patches preserve commit authorship.
 
 Base: `eaa36b62768fe1eedb87d010a19148854c9a3952`.
-Current build candidate: `ea1bfec08e28a1b6139323a5e85032e4002f1de6`.
-Expected resulting Git tree: `f0357ea75e642be3a6e4bf097efac00e1a74c53b`.
+Current build candidate: `abbae09c88b7606071cd34610b9990e3c4838f0c`.
+Expected resulting Git tree: `b6c1bfeba82a07f06ff5e09868a3b32bb7c0de3d`.
 
-Apply all 41 patches in `series.txt` order. The applied series reproduced that
+Apply all 42 patches in `series.txt` order. The applied series reproduced that
 exact tree in a private worktree. The first 14 reproduce the earlier setup-tested
 source `0cb3173bbc47e3aa05cb288cb462005a0f16fff9` (tree
 `347aecd3e4b04a8d3b7b1c55ea6bce0a39cce78d`).
@@ -50,5 +50,10 @@ Patches 39–41 add a root-flag-directed graphics heap-input experiment, preserv
 the original console heap bindings including explicit unbinding, and retain
 native command-signature identity for ExecuteIndirect. Actual execution with
 additional private diagnostics passed the earlier fullscreen-draw hang and
-stopped later at the command-signature assertion; validation of the last fix is
-in progress. The clean 41-patch tree builds and reproduces the tree above.
+later passed the command-signature assertion after the identity correction.
+
+Patch 42 adds the opt-in observed eight-argument XG CopyFromSubresource layout.
+Actual execution passed the command-signature assertion and, with this setting,
+completed two texture copies before a later DXIL-to-SPIR-V compiler assertion.
+The current 42-patch tree builds and matches the expected tree above. No playable
+scene is verified; actual runs include additional private diagnostics.
