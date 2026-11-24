@@ -1,5 +1,18 @@
 # Local verification, 2026-11-24
 
+## 2026-11-24: headless keyboard movement prepared
+
+The 51-patch candidate is `4278e4f4accb2f8cb3a714b1850e0b933ecbc59a`,
+tree `8a610cf36e05b773170fcbc323f7daee78ca2b95`. Strict source reproduction and
+a separate release build passed; actual activation remains pending.
+
+Further live validation showed that keyboard D-pad input reached GameInput, and
+a long A press was followed by intro frames. No gameplay is verified. Headless
+mode bypasses creation of XCL's own presentation window, leaving the movement
+mapper's window unset. Patch 51 falls back to a foreground window owned by the
+title process for keyboard movement. Raw mouse input still requires an attached
+window. The fallback and prior detile optimizations have not run in the title.
+
 ## 2026-11-24: native queries passed; detile optimization built
 
 The 50-patch candidate is `2338001782caab218a5334b3e540ed71f1956135`,

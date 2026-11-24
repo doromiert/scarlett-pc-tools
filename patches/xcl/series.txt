@@ -48,3 +48,4 @@
 0048-Retain-native-query-heap-identity-for-query-recording.patch
 0049-Textures-detiling-a-mip-level-computes-column-and-row-parts-once.patch
 0050-Textures-linear-levels-are-detiled-a-row-at-a-time.patch
+0051-Allow-keyboard-movement-on-the-title-window-without-XCL-presentation.patch

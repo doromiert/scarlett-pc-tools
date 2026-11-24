@@ -1,0 +1,38 @@
+From 4698cf87e1663ef77cd9eb6c4bab1170a0e3ac27 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Tue, 24 Nov 2026 05:10:11 +0100
+Subject: [PATCH] Allow keyboard movement on the title window without an XCL
+ presentation window
+
+---
+ crates/xcl/src/hle/kbm.rs | 14 ++++++++++++--
+ 1 file changed, 12 insertions(+), 2 deletions(-)
+
+diff --git a/crates/xcl/src/hle/kbm.rs b/crates/xcl/src/hle/kbm.rs
+index efaa480..350a5fa 100644
+--- a/crates/xcl/src/hle/kbm.rs
++++ b/crates/xcl/src/hle/kbm.rs
+@@ -367,8 +367,18 @@ pub fn apply(s: &mut GamepadState) {
+     if !enabled() {
+         return;
+     }
+-    let hwnd = WINDOW.load(Ordering::Acquire);
+-    let focused = hwnd != 0 && unsafe { GetForegroundWindow() } as isize == hwnd;
++    let mut hwnd = WINDOW.load(Ordering::Acquire);
++    let foreground = unsafe { GetForegroundWindow() };
++    // Headless rendering has no XCL window: the title's foreground window still takes keys.
++    // Raw mouse input continues to require an attached window and its message handler.
++    if hwnd == 0 && !foreground.is_null() {
++        let mut pid = 0;
++        unsafe { GetWindowThreadProcessId(foreground, &mut pid) };
++        if pid == std::process::id() {
++            hwnd = foreground as isize;
++        }
++    }
++    let focused = hwnd != 0 && foreground as isize == hwnd;
+     if !focused {
+         // Alt+Tab, another window: the cursor is free, nothing is pressed
+         // SAFETY: `hold_cursor(..., false)` only releases the cursor clip when captured.
+-- 
+2.54.0
+

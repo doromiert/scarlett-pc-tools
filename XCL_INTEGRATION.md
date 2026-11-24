@@ -11,7 +11,7 @@ See [STATUS.md](STATUS.md) for the actual-run evidence and remaining blocker.
 
 ## Source and license
 
-The [50 XCL patches](patches/xcl/README.md) form an independent GPL-2.0-only
+The [51 XCL patches](patches/xcl/README.md) form an independent GPL-2.0-only
 component, separate from the GPL-3.0-or-later original tools and Leonida series.
 Keep XCL's license and third-party notices with derived source/builds.
 
@@ -26,7 +26,7 @@ done < patches/xcl/series.txt
 git -C /external/tools/xcl rev-parse 'HEAD^{tree}'
 ```
 
-The resulting candidate tree must be `56ea123db872c97d9c15eb3c0af14269dab2265e`.
+The resulting candidate tree must be `8a610cf36e05b773170fcbc323f7daee78ca2b95`.
 The setup baseline is the first 14 patches; current candidate verification is
 described in the patch-directory README.
 These are native-object identity/ABI fixes, not executable patches. The allocator
@@ -259,3 +259,11 @@ Three further unfinished default-optimized compute shaders each exceeded a
 byte-for-byte from generated HLSL at DXC `-O3`; `-O0` passed SPIR-V validation in
 about 0.2 seconds each. The current run selects all five privately identified
 programs. Their full runtime effect is still under validation.
+
+Patch 51 lets keyboard movement use a foreground window owned by the title's
+process when the headless renderer has not created XCL's presentation window.
+The existing keyboard/mouse configuration gate and normal attached-window path
+remain in force. Raw mouse capture still requires an attached window and message
+handler. Source inspection identified the missing movement-window binding; the
+live run independently accepted a D-pad keyboard press, and a longer A press was
+followed by intro frames. The movement fallback builds but has not been run.
