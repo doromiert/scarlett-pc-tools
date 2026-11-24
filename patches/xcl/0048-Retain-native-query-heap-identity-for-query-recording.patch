@@ -1,0 +1,29 @@
+From 26d7ed9b28701c1aad4575791a32add9ed609df6 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Tue, 24 Nov 2026 04:39:54 +0100
+Subject: [PATCH] Retain native query heap identity for query recording
+
+---
+ crates/xcl/src/hle/d3d12x/real.rs | 6 +++---
+ 1 file changed, 3 insertions(+), 3 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/real.rs b/crates/xcl/src/hle/d3d12x/real.rs
+index 276d940..bdd766c 100644
+--- a/crates/xcl/src/hle/d3d12x/real.rs
++++ b/crates/xcl/src/hle/d3d12x/real.rs
+@@ -2487,9 +2487,9 @@ macro_rules! creator {
+                         *ppv = std::ptr::null_mut();
+                         return observed;
+                     }
+-                } else if $kind == Kind::CommandSignature {
+-                    // No console extensions are needed. ExecuteIndirect consumes
+-                    // this native object and checks its original vtable identity.
++                } else if $kind == Kind::CommandSignature || $kind == Kind::QueryHeap {
++                    // No console extensions are needed. Native command recording
++                    // consumes these objects and checks their original vtable identity.
+                 } else {
+                     adopt(*ppv, $kind);
+                 }
+-- 
+2.54.0
+

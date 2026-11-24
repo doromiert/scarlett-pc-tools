@@ -1,0 +1,95 @@
+From 1f282c737b5637b58de4847cacde208d23504ed7 Mon Sep 17 00:00:00 2001
+From: emirduran707 <emirduran707@gmail.com>
+Date: Tue, 24 Nov 2026 01:44:21 +0100
+Subject: [PATCH] Textures: linear levels are detiled a row at a time
+
+Chain::detile_level computed the address of every element and copied it
+on its own. A linear level (mode 0) keeps each row's elements contiguous,
+so its rows are now copied whole; which elements are copied when the
+source is cut short is unchanged. Swizzled modes, a base swizzle and
+levels in a mip tail keep the per-row form of the previous commit.
+
+A retail title's intro video is three linear R8 planes per frame
+(3840x2160 and two 1920x1080), uploaded on every frame through the
+kept-in-step title textures: release, one plane 56.9 ms -> 1.2 ms and
+14.4 ms -> 0.3 ms, about 85 ms -> 2 ms a frame. The video played at
+3.5 fps on an RX 9060 XT with the element-by-element form.
+
+Test: linear levels give the same bytes by rows as by elements, for
+every element size, padded rows, every mip and a cut-short source.
+
+From #440 (be722a7), placed in front of the per-row loop of this PR.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ crates/xcl/src/gpu/tiling.rs | 47 ++++++++++++++++++++++++++++++++++++
+ 1 file changed, 47 insertions(+)
+
+diff --git a/crates/xcl/src/gpu/tiling.rs b/crates/xcl/src/gpu/tiling.rs
+index 12d19d9..15f0871 100644
+--- a/crates/xcl/src/gpu/tiling.rs
++++ b/crates/xcl/src/gpu/tiling.rs
+@@ -399,6 +399,19 @@ impl Chain {
+         let t = &self.layout;
+         let e = 1usize << t.elem_log2;
+         let mut out = vec![0u8; l.width * l.height * e];
++        if t.mode == 0 && t.base_xor == 0 && l.origin == (0, 0) {
++            // linear: a row's elements are contiguous, so it is copied whole (the elements that
++            // are all in `src`, as below) – a video plane of 3840×2160 is 2160 copies, not 8 M
++            let row = l.width * e;
++            for y in 0..l.height {
++                let o = self.element_at(&l, 0, y, slice);
++                let n = src.len().saturating_sub(o).min(row) / e * e;
++                if n > 0 {
++                    out[y * row..][..n].copy_from_slice(&src[o..o + n]);
++                }
++            }
++            return out;
++        }
+         // `element_at` (`Layout::offset_z`) split: what depends on x alone once per level, what
+         // depends on y (and the slice) once per row – per element only two lookups and an XOR.
+         // Element by element it was most of a retail game's render thread while it streamed
+@@ -464,6 +477,40 @@ mod tests {
+         v
+     }
+ 
++    /// Linear levels are copied a row at a time: the same bytes as element by element, for every
++    /// element size, padded rows, every mip and a source cut short (inside a row and inside an
++    /// element).
++    #[test]
++    fn linear_levels_detile_by_rows_as_by_elements() {
++        let by_elements = |c: &Chain, src: &[u8], i: usize| {
++            let l = c.levels[i];
++            let e = 1usize << c.layout.elem_log2;
++            let mut out = vec![0u8; l.width * l.height * e];
++            for y in 0..l.height {
++                for x in 0..l.width {
++                    let o = c.element_at(&l, x, y, 0);
++                    if let Some(s) = src.get(o..o + e) {
++                        out[(y * l.width + x) * e..][..e].copy_from_slice(s);
++                    }
++                }
++            }
++            out
++        };
++        for e in 0..5u32 {
++            for (w, h, mips) in [(3840u32, 4u32, 1u32), (1920, 3, 1), (77, 13, 4), (1, 1, 1), (300, 200, 9)] {
++                let c = Chain::new(Layout::new(0, e, PipeConfig { pipes_log2: 0, pkrs_log2: 0 }).unwrap(), w, h, 1, mips);
++                let full: Vec<u8> = (0..c.slice_bytes).map(|k| (k * 7 + 3) as u8 | 1).collect();
++                for cut in [full.len(), full.len() / 2 + 1, 5, 0] {
++                    let src = &full[..cut];
++                    for i in 0..c.levels.len() {
++                        assert_eq!(c.detile_level(src, i, 0), by_elements(&c, src, i), "e{e} {w}x{h} level {i} src {cut} B");
++                    }
++                }
++            }
++        }
++    }
++
++
+     /// `detile_level` (offsets split by row and column) gives the bytes element-by-element
+     /// `element_at` does: every mode, element size and pipe configuration, every level (mip
+     /// tails too), a base swizzle and a slice, and a source cut short (bytes past it read as 0).
+-- 
+2.54.0
+

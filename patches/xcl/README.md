@@ -8,10 +8,10 @@ combined into the Leonida implementation. See [LICENSE](LICENSE) and upstream
 attribution/third-party notices. Mail patches preserve commit authorship.
 
 Base: `eaa36b62768fe1eedb87d010a19148854c9a3952`.
-Current build candidate: `458a69bb508ca0de1033d52cc4342a28e54d3dfc`.
-Expected resulting Git tree: `d27bf499a208c9826a10c52a36be90370f421bd3`.
+Current build candidate: `2338001782caab218a5334b3e540ed71f1956135`.
+Expected resulting Git tree: `56ea123db872c97d9c15eb3c0af14269dab2265e`.
 
-Apply all 47 patches in `series.txt` order. The applied series reproduced that
+Apply all 50 patches in `series.txt` order. The applied series reproduced that
 exact tree in a private worktree. The first 14 reproduce the earlier setup-tested
 source `0cb3173bbc47e3aa05cb288cb462005a0f16fff9` (tree
 `347aecd3e4b04a8d3b7b1c55ea6bce0a39cce78d`).
@@ -55,7 +55,7 @@ later passed the command-signature assertion after the identity correction.
 Patch 42 adds the opt-in observed eight-argument XG CopyFromSubresource layout.
 Actual execution passed the command-signature assertion and, with this setting,
 completed two texture copies before a later DXIL-to-SPIR-V compiler assertion.
-The current 47-patch tree builds and matches the expected tree above. No playable
+The current 50-patch tree builds and matches the expected tree above. No playable
 scene is verified; actual runs include additional private diagnostics.
 
 Patches 43–44 add caller-selected private shader capture and a caller-selected
@@ -64,7 +64,7 @@ the translated fast caches are bypassed only for selected programs.
 The actual captured failing shader passed CPU-only SPIR-V validation at `-O0`;
 actual title validation passed the first offending shader and reached a later
 shader compiler assertion. A second captured shader passes CPU-only validation
-at `-O0`; a run selecting both is in progress. All 47 patches apply strictly from the pinned
+at `-O0`; a run selecting both is in progress. All 50 patches apply strictly from the pinned
 base and reproduce the tree above; a separate release build passed. The clean
 public binary has not run. No game-derived shader hashes or data are included.
 
@@ -77,4 +77,12 @@ Patch 47 adds opt-in 40-bit graphics-overflow reservations using VirtualAlloc2
 address requirements. Actual allocations fit the bound and the previous BVH
 address-width failure disappeared; a later title error remains under
 investigation. It does not extend translated GPU visibility beyond UMA.
-All 47 patches apply strictly to the pinned base and the resulting source builds.
+All 50 patches apply strictly to the pinned base and the resulting source builds.
+
+Patch 48 retains native query-heap identity, clearing an assertion exposed by the
+larger coherent-memory configuration in an actual run. That run rendered the
+local account picker but advanced extremely slowly. Patches 49–50 preserve
+upstream's detile column/row precomputation and whole-row linear copy paths,
+matching a leading live CPU hotspot. They have not been activated in the running
+process. All 50 patches apply strictly and the source builds; neither their
+actual performance effect nor controllable gameplay is verified.

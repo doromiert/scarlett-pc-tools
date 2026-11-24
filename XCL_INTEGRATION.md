@@ -2,15 +2,16 @@
 
 This experimental source recipe reached input-responsive setup, colored startup
 frames and loading artwork. Selected compiler workarounds passed two shader
-assertions. Constraining graphics overflow allocations to the console builder's
-address width passed its next failure; the subsequent actual run ended in the
-title's own error path. Earlier GPU resets interrupted GNOME. This recipe is
-not stable or playable.
+assertions. Address-width and query-heap identity corrections passed later
+failures. A larger coherent-memory configuration currently advances very slowly;
+its live CPU profile identifies texture detiling as a major cost. Two upstream
+optimizations are built but await actual execution. Earlier GPU resets interrupted
+GNOME. This recipe is not stable or playable.
 See [STATUS.md](STATUS.md) for the actual-run evidence and remaining blocker.
 
 ## Source and license
 
-The [47 XCL patches](patches/xcl/README.md) form an independent GPL-2.0-only
+The [50 XCL patches](patches/xcl/README.md) form an independent GPL-2.0-only
 component, separate from the GPL-3.0-or-later original tools and Leonida series.
 Keep XCL's license and third-party notices with derived source/builds.
 
@@ -25,7 +26,7 @@ done < patches/xcl/series.txt
 git -C /external/tools/xcl rev-parse 'HEAD^{tree}'
 ```
 
-The resulting candidate tree must be `d27bf499a208c9826a10c52a36be90370f421bd3`.
+The resulting candidate tree must be `56ea123db872c97d9c15eb3c0af14269dab2265e`.
 The setup baseline is the first 14 patches; current candidate verification is
 described in the patch-directory README.
 These are native-object identity/ABI fixes, not executable patches. The allocator
@@ -234,3 +235,27 @@ compilations did not complete within bounded CPU-only reproductions; whether
 that caused the title's later failure is under investigation. Low addresses
 alone do not make external buffers visible through the translated shader ABI.
 No ray-tracing correctness or playable output is claimed.
+
+## Coherent memory and texture detiling
+
+Use a persistent private data directory so XCL retains its
+`cache/uma_coherent.txt` sizing hint between runs. Isolated attempts that copied
+only saves lost that hint and repeatedly used a 512 MiB coherent window, despite
+about 4.5 GiB of graphics allocation requests. `XCL_COHERENT_MB=4096` explicitly
+requests the supported maximum, clamped below 4 GiB. This increases memory usage
+and cannot fit every requested allocation; buffers outside UMA still need
+separate handling. It is an experiment, not a universally safe preset.
+
+The actual larger-window attempt exposed a native query-heap vtable assertion.
+Patch 48 retains the original query-heap identity; a subsequent actual run passed
+that stop and rendered the local account picker, but progressed extremely slowly.
+About 60% of a live CPU sample was in per-element texture-address calculations
+and detiling. Patches 49–50 preserve upstream's column/row precomputation and
+whole-row linear copies. They build and reproduce the expected source tree;
+their actual speedup and rendered-gameplay effect are not verified yet.
+
+Three further unfinished default-optimized compute shaders each exceeded a
+30–40 second bounded CPU compiler attempt. Their actual DXIL was reproduced
+byte-for-byte from generated HLSL at DXC `-O3`; `-O0` passed SPIR-V validation in
+about 0.2 seconds each. The current run selects all five privately identified
+programs. Their full runtime effect is still under validation.

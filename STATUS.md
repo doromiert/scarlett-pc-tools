@@ -1,5 +1,28 @@
 # Local verification, 2026-11-24
 
+## 2026-11-24: native queries passed; detile optimization built
+
+The 50-patch candidate is `2338001782caab218a5334b3e540ed71f1956135`,
+tree `56ea123db872c97d9c15eb3c0af14269dab2265e`. Strict application from the
+pinned base and a separate release build passed. The clean public executable
+has not run.
+
+Three additional unfinished default-optimized compute shaders reproduced slow
+CPU compilation, with byte-identical DXC `-O3` output. Each `-O0` form passed
+SPIR-V validation in about 0.2 seconds. The next actual configuration selects
+all five affected programs and expands the coherent window from 512 MiB to the
+supported maximum below 4 GiB. The isolated launcher had lost the sizing hint
+between runs; these are still experimental settings.
+
+The larger-window attempt exposed a query-heap vtable assertion before the intro.
+Patch 48 preserves native query-heap identity, following the command-signature
+correction. Actual execution with that change passed the assertion and rendered
+the local account picker. It remains alive and extremely slow. A live CPU sample
+spent about 60% in texture offset calculations and detiling. Patches 49–50 add
+upstream's equivalent column/row precomputation and whole-row linear copies;
+their actual performance validation is pending. Controllable gameplay remains
+unverified. No synthetic game tests were run for these changes.
+
 ## 2026-11-24: BVH address-width check passed
 
 The 47-patch candidate is `458a69bb508ca0de1033d52cc4342a28e54d3dfc`,
