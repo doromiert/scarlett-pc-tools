@@ -31,3 +31,8 @@
 0031-Allow-observed-BC1-texture-placeholders-in-opt-in-progression-mode.patch
 0032-D3D12.X-constant-buffer-views-are-float4-rows-stride-16-not-raw-buffers.patch
 0033-DirectStorage-EnqueueRequest-reads-its-page-array-and-file-vtable-without-sizing-regions.patch
+0034-Add-opt-in-appended-sampler-heap-input-experiment.patch
+0035-Allow-display-resolution-headless-captures.patch
+0036-Sample-headless-pixel-diagnostics-without-dropping-v.patch
+0037-Pass-native-staging-resources-to-sparse-PC-copy-list.patch
+0038-Match-observed-Wait64BitValueX-flags-argument.patch

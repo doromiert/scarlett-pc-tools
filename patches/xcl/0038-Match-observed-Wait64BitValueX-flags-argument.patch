@@ -1,0 +1,28 @@
+From 75cee47c8f40d8ffbd73095f035625c74b4cd593 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Tue, 24 Nov 2026 02:44:00 +0100
+Subject: [PATCH 38/38] Match observed Wait64BitValueX flags argument
+
+(cherry picked from commit f0b544898f82cd264b1e1bd9062728714cfa5f63)
+---
+ crates/xcl/src/hle/d3d12x/list_x.rs | 7 ++++---
+ 1 file changed, 4 insertions(+), 3 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/list_x.rs b/crates/xcl/src/hle/d3d12x/list_x.rs
+index 1c59b28..27f1676 100644
+--- a/crates/xcl/src/hle/d3d12x/list_x.rs
++++ b/crates/xcl/src/hle/d3d12x/list_x.rs
+@@ -1194,9 +1194,10 @@ pub(super) unsafe extern "system" fn wait32_x(this: *mut c_void, va: u64, compar
+     wait_memory(this, va, 4, comparison, value as u64, mask as u64, "Wait32BitValueX");
+ }
+ 
+-/// command list #72 Wait64BitValueX(address, comparison, value, mask, flags)
+-pub(super) unsafe extern "system" fn wait64_x(this: *mut c_void, va: u64, comparison: u32, value: u64, mask: u64, _flags: u32) {
+-    wait_memory(this, va, 8, comparison, value, mask, "Wait64BitValueX");
++/// command list #72 Wait64BitValueX(address, comparison, value, flags).
++/// The caller writes a DWORD of flags in the fifth argument slot, not a QWORD mask.
++pub(super) unsafe extern "system" fn wait64_x(this: *mut c_void, va: u64, comparison: u32, value: u64, _flags: u32) {
++    wait_memory(this, va, 8, comparison, value, u64::MAX, "Wait64BitValueX");
+ }
+ 
+ /// command list #88 Write32BitValueTopOfPipeX(address, value, flags)

@@ -1,5 +1,30 @@
 # Local verification, 2026-11-23
 
+## 2026-11-24: input-responsive setup and later loading failures
+
+The 38-patch source recipe reproduces candidate
+`75cee47c8f40d8ffbd73095f035625c74b4cd593`, tree
+`6377e9ea4fe75dc91ea4517fc8660900e1efa17b`. Strict application and a separate
+release build passed. The clean public executable has not itself been run;
+actual runs included additional private diagnostics.
+
+The opt-in sampler input allowed repeated draws beyond the earlier failing
+setup path. Navigation, text size, subtitles and brightness screens responded
+to input. Actual setup capture averaged about 29 FPS after a slow intro. Later
+captures were verified at 1920×1080. No scene with controllable gameplay is
+verified.
+
+Completing setup exposed a native CopyBufferRegion resource-vtable assertion.
+A diagnostic identified a console proxy passed by sparse-memory readback;
+normalizing staging resources at the native boundary passed that call later.
+An independently observed Wait64 argument mismatch caused repeated two-second
+waits. Correcting the argument layout removed those warnings in the next actual
+run, which streamed further before an RX graphics-queue timeout/reset.
+
+GPU-command tracing is the current investigation. Texture accuracy, simulation
+timing separation and gyro aiming remain unresolved. All game files, generated
+shaders, captures, memory snapshots and traces remain outside this repository.
+
 ## 2026-11-24: isolated fullscreen, still no gameplay
 
 The source-only XCL series now contains 33 patches, reproducing candidate

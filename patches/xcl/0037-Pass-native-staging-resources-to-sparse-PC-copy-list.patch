@@ -1,0 +1,61 @@
+From d383b3c0de75be7f73a5008337c4709ce4e94453 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Tue, 24 Nov 2026 02:35:25 +0100
+Subject: [PATCH 37/38] Pass native staging resources to sparse PC copy lists
+
+(cherry picked from commit a96a78cfcc3f5ac1f04f920338869dcc1b103cd0)
+---
+ crates/xcl/src/hle/d3d12x/sparse.rs | 12 ++++++++----
+ 1 file changed, 8 insertions(+), 4 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/sparse.rs b/crates/xcl/src/hle/d3d12x/sparse.rs
+index 287f8d2..782ee34 100644
+--- a/crates/xcl/src/hle/d3d12x/sparse.rs
++++ b/crates/xcl/src/hle/d3d12x/sparse.rs
+@@ -897,6 +897,10 @@ impl State {
+     /// `sent` hashes. Caller has already ordered `self.queue` after any GPU writes if needed.
+     unsafe fn readback_ranges(&mut self, ranges: &[(usize, usize)]) {
+         let Some((rb, p)) = self.readback_buf() else { return };
++        // This lazy allocation can occur after the title device starts returning console
++        // proxies. The internal PC list requires native resource identity; keep the cached
++        // proxy alive and normalize only the reference used by this submission.
++        let rb = super::native_proxy::resource_for_pc(&rb, "sparse readback destination");
+         let mut pending: Vec<(usize, usize, usize)> = Vec::new(); // (va, rb_off, chunk)
+         let mut used = 0usize;
+         let mut open = false;
+@@ -981,7 +985,7 @@ impl State {
+         }
+         let slot_idx = self.begin_slot();
+         let mut last_wi: Option<usize> = None;
+-        let zero_buf = self.zero_buf.as_ref().unwrap();
++        let zero_buf = super::native_proxy::resource_for_pc(self.zero_buf.as_ref().unwrap(), "sparse zero source");
+         let list = &self.slots[slot_idx].list;
+         for &(a, n) in runs {
+             let mut done = 0usize;
+@@ -1000,7 +1004,7 @@ impl State {
+                 let b = self.windows[wi].0;
+                 let to_win_end = (b + crate::gpu::uma::WINDOW) - cur;
+                 let chunk = (n - done).min(ZERO_BUF).min(to_win_end);
+-                list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, zero_buf, 0, chunk as u64);
++                list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, &zero_buf, 0, chunk as u64);
+                 done += chunk;
+             }
+         }
+@@ -1014,6 +1018,7 @@ impl State {
+             return;
+         }
+         let Some(p) = self.staging_ptr() else { return };
++        let staging_res = super::native_proxy::resource_for_pc(&self.staging.as_ref().unwrap().0, "sparse upload source");
+         let mut open_slot: Option<usize> = None;
+         let mut last_wi: Option<usize> = None;
+         for &(a, n) in runs {
+@@ -1057,8 +1062,7 @@ impl State {
+                 };
+                 let dst_off = (aligned as usize) % STAGING;
+                 std::ptr::copy_nonoverlapping(cur as *const u8, p.add(dst_off), chunk);
+-                let staging_res = &self.staging.as_ref().unwrap().0;
+-                self.slots[slot_idx].list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, staging_res, dst_off as u64, chunk as u64);
++                self.slots[slot_idx].list.CopyBufferRegion(&self.windows[wi].1, (cur - b) as u64, &staging_res, dst_off as u64, chunk as u64);
+                 self.ring_write = aligned + chunk as u64;
+                 done += chunk;
+             }

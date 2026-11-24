@@ -1,0 +1,77 @@
+From 8dc0766470ca3aafd98211982bd18d3e34e692d2 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Tue, 24 Nov 2026 02:27:07 +0100
+Subject: [PATCH 36/38] Sample headless pixel diagnostics without dropping
+ viewer frames
+
+(cherry picked from commit 26540b6864c8dc6cb23a51dac8106ece25d0d742)
+---
+ crates/xcl/src/hle/d3d12x/present.rs | 30 ++++++++++++++++------------
+ 1 file changed, 17 insertions(+), 13 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/present.rs b/crates/xcl/src/hle/d3d12x/present.rs
+index 02c62ba..481e746 100644
+--- a/crates/xcl/src/hle/d3d12x/present.rs
++++ b/crates/xcl/src/hle/d3d12x/present.rs
+@@ -899,6 +899,9 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
+         }
+     };
+     let (ow, oh) = ((w / step).max(1), (h / step).max(1));
++    let n = if headless { HEADLESS_FRAMES.load(Ordering::Relaxed) } else { PRESENTS.load(Ordering::Relaxed) };
++    // A live viewer needs every image, not a full pixel histogram and sort every frame.
++    let diagnostics = !headless || n == 1 || n % 300 == 0 || std::env::var("XCL_FRAME_DUMP_STATS").as_deref() == Ok("1");
+     let row = (ow * 3).div_ceil(4) * 4;
+     let mut bmp = Vec::with_capacity(54 + row * oh);
+     let size = (54 + row * oh) as u32;
+@@ -917,12 +920,12 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
+         let start = bmp.len();
+         for x in 0..ow {
+             let t = ((p as *const u8).add(fp.Offset as usize + step * y * pitch + 4 * step * x) as *const u32).read_unaligned();
+-            *raw.entry(t).or_default() += 1;
++            if diagnostics { *raw.entry(t).or_default() += 1; }
+             let c = rgb(format, t).unwrap_or_else(|| {
+                 decoded = false;
+                 [0; 3]
+             });
+-            if c.iter().map(|&v| v as u32).sum::<u32>() > 30 {
++            if diagnostics && c.iter().map(|&v| v as u32).sum::<u32>() > 30 {
+                 lit += 1;
+             }
+             bmp.extend_from_slice(&[c[2], c[1], c[0]]);
+@@ -931,7 +934,6 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
+     }
+     rb.Unmap(0, None);
+     let Some(boot) = crate::state::boot() else { return false };
+-    let n = if headless { HEADLESS_FRAMES.load(Ordering::Relaxed) } else { PRESENTS.load(Ordering::Relaxed) };
+     let path = if headless { boot.logs_dir().join("headless_latest.bmp") } else { boot.logs_dir().join(format!("{tag}_{n}.bmp")) };
+     let written = if headless {
+         let tmp = boot.logs_dir().join(format!(".headless_latest_{}.tmp", std::process::id()));
+@@ -943,16 +945,18 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
+         crate::xlog_error!("present: {tag} {n} could not write {}", path.display());
+         return false;
+     }
+-    crate::xlog_info!(
+-        "present: {tag} {n} ({w}x{h}, format {}) written to {} – {lit} of {} samples not black{}",
+-        format.0,
+-        path.display(),
+-        ow * oh,
+-        if decoded { "" } else { " (format not decoded)" }
+-    );
+-    let mut top: Vec<(u32, usize)> = raw.into_iter().collect();
+-    top.sort_by_key(|x| std::cmp::Reverse(x.1));
+-    crate::xlog_info!("present: {tag} {n} raw texels (most common): {}", top.iter().take(6).map(|(v, c)| format!("{v:#010x}×{c}")).collect::<Vec<_>>().join(" "));
++    if diagnostics {
++        crate::xlog_info!(
++            "present: {tag} {n} ({w}x{h}, format {}) written to {} – {lit} of {} samples not black{}",
++            format.0,
++            path.display(),
++            ow * oh,
++            if decoded { "" } else { " (format not decoded)" }
++        );
++        let mut top: Vec<(u32, usize)> = raw.into_iter().collect();
++        top.sort_by_key(|x| std::cmp::Reverse(x.1));
++        crate::xlog_info!("present: {tag} {n} raw texels (most common): {}", top.iter().take(6).map(|(v, c)| format!("{v:#010x}×{c}")).collect::<Vec<_>>().join(" "));
++    }
+     true
+ }
+ 

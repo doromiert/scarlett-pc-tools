@@ -1,0 +1,89 @@
+From f2ff2c886346e65d5ceed050a2d64df48c42f3c7 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Tue, 24 Nov 2026 02:48:22 +0100
+Subject: [PATCH 34/38] Add opt-in appended sampler heap input experiment
+
+---
+ crates/xcl/src/hle/d3d12x/bind.rs         | 22 ++++++++++++++++++++++
+ crates/xcl/src/hle/d3d12x/console_heap.rs | 10 ++++++++++
+ crates/xcl/src/hle/d3d12x/list_x.rs       | 13 +++++++++++++
+ 3 files changed, 45 insertions(+)
+
+diff --git a/crates/xcl/src/hle/d3d12x/bind.rs b/crates/xcl/src/hle/d3d12x/bind.rs
+index f550e73..64cbfb0 100644
+--- a/crates/xcl/src/hle/d3d12x/bind.rs
++++ b/crates/xcl/src/hle/d3d12x/bind.rs
+@@ -844,6 +844,28 @@ unsafe fn bind_abi(this: *mut c_void, list: &ID3D12GraphicsCommandList, pso: usi
+         Some(l) => console_list::user_data(l, &args, table_at as u64),
+         None => vec![table_at as u32, (table_at >> 32) as u32],
+     };
++    // Default-off ABI experiment. The explicitly requested register must be the
++    // first unused inline register, so no supplied title root argument is replaced.
++    // The heap and address are derived from current bindings, never fixed payloads.
++    static SAMPLER_SLOT: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
++    if gfx {
++        if let Some(slot) = *SAMPLER_SLOT.get_or_init(|| std::env::var("XCL_SAMPLER_BASE_SGPR").ok().and_then(|v| v.parse().ok())) {
++            if slot == io.len() && (8..32).contains(&slot) {
++                if let Some((shadow, count)) = super::list_x::bound_sampler_shadow(this) {
++                    let (base, size) = u.window(0);
++                    if let Some(offset) = shadow.checked_sub(base).filter(|offset| offset.checked_add(count as usize * 16).is_some_and(|end| end <= size)) {
++                        if let Ok(offset) = u32::try_from(offset) {
++                            io.push(offset);
++                            static N: AtomicU64 = AtomicU64::new(0);
++                            if N.fetch_add(1, Ordering::Relaxed) < 4 {
++                                crate::xlog_info!("experimental sampler ABI: unused s{slot} receives bound sampler shadow offset {offset:#x} ({count} descriptors)");
++                            }
++                        }
++                    }
++                }
++            }
++        }
++    }
+     io.resize(crate::gpu::recomp::KERNEL_SGPRS, 0);
+     let io_at = copy(&io.iter().flat_map(|w| w.to_le_bytes()).collect::<Vec<u8>>())?;
+     let res_at = copy(&[0u8; 256])?;
+diff --git a/crates/xcl/src/hle/d3d12x/console_heap.rs b/crates/xcl/src/hle/d3d12x/console_heap.rs
+index 176973e..7cc97f8 100644
+--- a/crates/xcl/src/hle/d3d12x/console_heap.rs
++++ b/crates/xcl/src/hle/d3d12x/console_heap.rs
+@@ -301,6 +301,16 @@ pub fn start(obj: usize) -> Option<u64> {
+     HEAPS.lock().unwrap().iter().find(|h| h.obj == obj).map(|h| h.shadow as u64)
+ }
+ 
++/// Read-only identity lookup: the CPU shadow of a sampler heap already bound on a PC list.
++/// Drop the heap lock before normalizing native identities to preserve lock ordering.
++pub(super) fn sampler_shadow_for_pc(obj: usize) -> Option<(usize, u32)> {
++    let native = super::native_proxy::native(obj as *mut std::ffi::c_void) as usize;
++    let heaps: Vec<_> = HEAPS.lock().unwrap().iter().filter(|h| h.sampler)
++        .map(|h| (h.obj, h.shadow, h.n)).collect();
++    heaps.into_iter().find_map(|(id, shadow, n)|
++        (super::native_proxy::native(id as *mut std::ffi::c_void) as usize == native).then_some((shadow, n)))
++}
++
+ /// A console slot: where its descriptor goes and its PC descriptors.
+ #[derive(Clone, Copy, Debug)]
+ pub struct Slot {
+diff --git a/crates/xcl/src/hle/d3d12x/list_x.rs b/crates/xcl/src/hle/d3d12x/list_x.rs
+index e27cb0e..1c59b28 100644
+--- a/crates/xcl/src/hle/d3d12x/list_x.rs
++++ b/crates/xcl/src/hle/d3d12x/list_x.rs
+@@ -273,6 +273,19 @@ pub(super) fn pc_va_of(va: u64) -> u64 {
+     pc_va(va)
+ }
+ 
++fn retained_heaps(list: *mut c_void) -> Vec<usize> {
++    LISTS.lock().unwrap().as_ref().and_then(|m| m.get(&(list as usize)))
++        .map(|s| s.bindings.heaps.clone()).unwrap_or_default()
++}
++
++/// Only an unambiguous, already-bound sampler heap can supply an experimental base.
++pub(super) fn bound_sampler_shadow(list: *mut c_void) -> Option<(usize, u32)> {
++    let mut heaps: Vec<_> = retained_heaps(list).into_iter()
++        .filter_map(super::console_heap::sampler_shadow_for_pc).filter(|(_, n)| *n != 0).collect();
++    heaps.sort_unstable();heaps.dedup();
++    (heaps.len() == 1).then(|| heaps[0])
++}
++
+ /// `XCL_TRACE_FRAME`: the fixed-function state a list last set (topology, first viewport and
+ /// scissor, render targets) as text.
+ pub(super) fn state_summary(list: *mut c_void) -> String {

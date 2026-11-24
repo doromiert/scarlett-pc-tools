@@ -1,0 +1,33 @@
+From fae060e1274d5cbb1aa659a15c66f004b95733d3 Mon Sep 17 00:00:00 2001
+From: doromiert <doromiert@gmail.com>
+Date: Tue, 24 Nov 2026 02:23:25 +0100
+Subject: [PATCH 35/38] Allow display-resolution headless captures
+
+(cherry picked from commit cf545caa731ebc61d4a791f58c73a5c0ec8ae53b)
+---
+ crates/xcl/src/hle/d3d12x/present.rs | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/crates/xcl/src/hle/d3d12x/present.rs b/crates/xcl/src/hle/d3d12x/present.rs
+index 83de6fd..02c62ba 100644
+--- a/crates/xcl/src/hle/d3d12x/present.rs
++++ b/crates/xcl/src/hle/d3d12x/present.rs
+@@ -888,8 +888,16 @@ unsafe fn write_frame(rb: &ID3D12Resource, fp: &D3D12_PLACED_SUBRESOURCE_FOOTPRI
+         return false;
+     }
+     let (w, h, pitch) = (fp.Footprint.Width as usize, fp.Footprint.Height as usize, fp.Footprint.RowPitch as usize);
+-    // every 4th texel of every 4th row; `XCL_FRAME_DUMP_FULL=1`: every texel (1-pixel detail)
+-    let step = if std::env::var_os("XCL_FRAME_DUMP_FULL").is_some() { 1 } else { 4 };
++    // Sample every 4th texel by default; step 2 preserves 1080p detail from a 4K source.
++    let step = if std::env::var_os("XCL_FRAME_DUMP_FULL").is_some() {
++        1
++    } else {
++        match std::env::var("XCL_FRAME_DUMP_STEP").as_deref() {
++            Ok("1") => 1,
++            Ok("2") => 2,
++            _ => 4,
++        }
++    };
+     let (ow, oh) = ((w / step).max(1), (h / step).max(1));
+     let row = (ow * 3).div_ceil(4) * 4;
+     let mut bmp = Vec::with_capacity(54 + row * oh);

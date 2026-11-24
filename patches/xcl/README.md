@@ -8,10 +8,10 @@ combined into the Leonida implementation. See [LICENSE](LICENSE) and upstream
 attribution/third-party notices. Mail patches preserve commit authorship.
 
 Base: `eaa36b62768fe1eedb87d010a19148854c9a3952`.
-Current build candidate: `2e58f54f32a49961f4ba3f376277f4207a13e71d`.
-Expected resulting Git tree: `e243c656bde257adff33a56cbb03757e925d216d`.
+Current build candidate: `75cee47c8f40d8ffbd73095f035625c74b4cd593`.
+Expected resulting Git tree: `6377e9ea4fe75dc91ea4517fc8660900e1efa17b`.
 
-Apply all 33 patches in `series.txt` order. The applied series reproduced that
+Apply all 38 patches in `series.txt` order. The applied series reproduced that
 exact tree in a private worktree. The first 14 reproduce the earlier setup-tested
 source `0cb3173bbc47e3aa05cb288cb462005a0f16fff9` (tree
 `347aecd3e4b04a8d3b7b1c55ea6bce0a39cce78d`).
@@ -36,3 +36,12 @@ claim. Fullscreen CPU output was very slow.
 No game files, translated shaders, captured payloads or binary artifacts are
 distributed here. See [XCL_INTEGRATION.md](../../XCL_INTEGRATION.md) for exact
 dependencies, settings, failure evidence and limitations.
+
+Patches 34–38 add an explicitly configured sampler-heap input experiment,
+display-resolution CPU capture, sampled live-capture diagnostics, native staging
+resource identity at sparse-copy boundaries, and the observed five-argument
+Wait64BitValueX ABI. The clean source tree builds and strict patch application
+reproduces the expected tree. Actual execution used this logic with additional
+private diagnostics; the clean public build has not been run against the title.
+Setup is rendered and responds to input, but heavy loading still causes a GPU
+queue timeout/reset. No playable scene is verified.

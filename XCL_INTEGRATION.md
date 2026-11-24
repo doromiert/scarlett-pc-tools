@@ -9,7 +9,7 @@ See [STATUS.md](STATUS.md) for the actual-run evidence and remaining blocker.
 
 ## Source and license
 
-The [33 XCL patches](patches/xcl/README.md) form an independent GPL-2.0-only
+The [38 XCL patches](patches/xcl/README.md) form an independent GPL-2.0-only
 component, separate from the GPL-3.0-or-later original tools and Leonida series.
 Keep XCL's license and third-party notices with derived source/builds.
 
@@ -24,7 +24,7 @@ done < patches/xcl/series.txt
 git -C /external/tools/xcl rev-parse 'HEAD^{tree}'
 ```
 
-The resulting candidate tree must be `e243c656bde257adff33a56cbb03757e925d216d`.
+The resulting candidate tree must be `6377e9ea4fe75dc91ea4517fc8660900e1efa17b`.
 The setup baseline is the first 14 patches; current candidate verification is
 described in the patch-directory README.
 These are native-object identity/ABI fixes, not executable patches. The allocator
@@ -114,6 +114,39 @@ The game still timed out on the spare GPU. GNOME survived both isolated runs;
 this does not establish general isolation from all host failures. The current
 headless path synchronously waits for readback and writes a BMP every captured
 frame. Asynchronous capture and physical-controller control remain unverified.
+
+`XCL_FRAME_DUMP_STEP=2` produces 1920×1080 captures from the observed 3840×2160
+source. Allowed steps are 1, 2 and 4; default is 4. The older
+`XCL_FRAME_DUMP_FULL` override selects step 1. Headless images are still produced
+every selected frame, while expensive pixel histograms are normally sampled;
+`XCL_FRAME_DUMP_STATS=1` restores exhaustive diagnostic statistics.
+
+The fullscreen ffplay viewer has its own keyboard shortcuts: Space or P pauses
+video playback while the game continues. A frozen viewer therefore does not
+establish a frozen game. The later actual 1080p run used the RX 6900 XT and still
+encountered a graphics-queue timeout during heavy loading.
+
+## Sampler-input experiment and synchronization correction
+
+`XCL_SAMPLER_BASE_SGPR=11` enables the sampler-input experiment used in the actual
+setup run. It appends the currently bound sampler heap's runtime address only
+when that register is the first unused inline register and the heap is
+unambiguous in memory window 0. It does not replace explicit root arguments.
+This is default-off and is not a general register-placement rule for every
+shader, root signature, stage or spilling combination.
+
+With that input, setup rendered and responded to keyboard input. The final 600
+captured setup frames before a user-requested suspension averaged 29.1 FPS;
+the intro was about 4 FPS. Resuming that same process and finishing setup exposed
+a separate resource-interface assertion during sparse-memory readback. The
+native staging-resource correction passed that exact boundary in a later run.
+
+Wait64BitValueX was also decoded with an extra mask argument: actual callers
+provide a 32-bit flags argument in that position. The corrected hook retains
+full-width comparisons and existing synchronization logic. A subsequent actual
+run no longer reported the earlier repeated two-second waits, loaded further,
+and eventually lost the graphics device. Wait32 is unchanged pending evidence.
+These corrections do not establish gameplay or general GPU stability.
 
 ## Temporary texture placeholders
 
