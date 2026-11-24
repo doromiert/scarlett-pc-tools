@@ -1,5 +1,50 @@
 # Local verification, 2026-11-24
 
+## Current private integration: Proton, preparation and memory-window failures
+
+The actual title has now run under **Proton 11.0-3** on the RX 6900 XT with
+Mesa/RADV 26.1.8 and a private diagnostic VKD3D-Proton 3.1 build. Startup,
+account selection and animated loading artwork are verified. **No rendered,
+controllable gameplay is verified.** These later results use a newer private
+integration; the public 53-patch recipe below has not acquired all its changes.
+
+In that integration, preserving coherent write-watch history and hashing its
+committed source memory directly reduced successive loading capture intervals
+from about 0.59 seconds to about 0.18 seconds. Those are real capture samples
+from different runs, not a whole-game benchmark. Later streaming can be much
+slower. GPU waits, resource allocation and shader builds remain material costs.
+
+The controller path initially lacked SDL2 in its isolated runtime. Supplying the
+matching SDL2 library to the child process restored actual XInput slot detection;
+controller vibration was also observed. This does not verify analog gameplay.
+
+Upstream BCPack decoding has delivered BC1, BC3, BC5, BC6H and BC7 texture data
+in actual runs without reported decoder failures. That does not establish every
+texture's visual correctness. Shader scheduling, structured-loop translation,
+allocator-recording preservation and reusable upload buffers have also been
+integrated privately; they have not established playability.
+
+A sandbox check found the inherited Mesa shader-cache directory read-only.
+The launcher now uses writable private driver-cache directories and preserves
+them between attempts. Before one actual launch, 249 captured compute programs
+created native driver pipelines successfully, with zero refusals or malformed
+cache entries. Two individually captured programs that reproduced translator
+assertions passed native SPIR-V validation after selective unoptimized DXC
+compilation. Preparation is real, but it is not proof of correct rendering.
+
+The last completed game run ended with a different guest invalid-pointer read
+after loading, rather than the earlier wait-watchdog termination. The next
+candidate includes upstream memory-window bounds/carry corrections and optional
+descriptor-heap window access. Two actual problematic programs have compiled
+and created native pipelines with that layout. Preparing the observed archive
+subset found another translator assertion; its exact program has now passed
+selective unoptimized compilation and native pipeline creation separately.
+The candidate has not yet reached a playable scene.
+
+All archives, binaries, translated shaders, cache contents, captures and raw
+traces remain private. Simulation-speed separation and gyro aiming remain open.
+
+
 ## 2026-11-24: unchanged-texture uploads improve intro output
 
 The 53-patch candidate is `73bbf6d69e4ea82f4dca7a922fa51721f320acb4`,

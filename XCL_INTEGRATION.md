@@ -1,5 +1,11 @@
 # XCL bring-up on Linux
 
+> The source recipe here is the public 53-patch checkpoint. Later private
+> integrations have run under Proton 11.0-3 and advanced preparation and loading
+> diagnostics; their changes are not all present in this recipe. Read the current
+> [verification status](STATUS.md) before treating historical settings below as
+> the active configuration. No playable scene is verified.
+
 This experimental source recipe reached input-responsive setup, colored startup
 frames and loading artwork. Selected compiler workarounds passed two shader
 assertions. Address-width and query-heap identity corrections passed later

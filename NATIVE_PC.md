@@ -6,6 +6,24 @@ playable scene yet. The current experimental runtime runs the supplied x86-64
 CPU instructions directly; its Xbox services, graphics interfaces and memory
 behavior still need compatibility implementations. This is not CPU emulation.
 
+## Current preparation evidence
+
+A newer private integration has run the actual executable under Proton 11.0-3.
+It created native driver pipelines for 249 captured compute programs before
+launch, with zero refusals. Actual setup and loading artwork are verified;
+controllable rendered gameplay is not. The 53-patch public recipe is an older
+checkpoint and does not include all this integration's source changes.
+
+The sandbox must permit driver-cache writes. An inherited host Mesa cache path
+was read-only in the tested device namespace. Use a private writable Unix path
+for `MESA_SHADER_CACHE_DIR` and a private Wine-visible directory for
+`VKD3D_SHADER_CACHE_PATH`; preserve those directories across compatible runs.
+The DXIL translation cache alone does not replace the driver's pipeline cache.
+Never put any of these generated caches in this repository.
+
+The following first-program experiment is historical; it is retained to describe
+its narrower validation and preparation settings.
+
 ## Verified first preparation step
 
 One privately supplied console compute program was compiled offline by the same
@@ -59,6 +77,7 @@ converted and cached, with content and layout determining reuse; render targets
 and CPU/GPU-modified resources must retain coherent runtime behavior. Baking
 static assets does not replace the Xbox service and memory implementations.
 
-The current launch was performed with Wine 11.0. A Proton launch has not been
-validated. Generated PC assets, bytecode, shader caches and any eventual prepared
-game folder remain private; this repository publishes source and instructions.
+The later private integration has launched under Proton 11.0-3. Its driver-cache
+fix and pipeline preparation do not establish a completed PC port or gameplay.
+Generated PC assets, bytecode, shader caches and any eventual prepared game
+folder remain private; this repository publishes source and instructions.
